@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "ts_parser",
+    "ts_checker",
+    "ts_compiler",
+    "ts_cli"
+]
+resolver = "2"
+
+[workspace.dependencies]
+nom = "7.1.3"
+z3 = "0.12.1"
+anyhow = "1.0"
