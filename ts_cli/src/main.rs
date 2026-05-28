@@ -10,7 +10,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use serde_json::Value;
-use ts_checker::SafetyChecker;
+use ts_checker::PolicyEngine;
 use z3::{Config, Context};
 use signal_hook::{consts::SIGHUP, iterator::Signals};
 use hmac::{Hmac, Mac, KeyInit};
@@ -158,7 +158,7 @@ fn handle_client_connection(
 
                     let config = Config::new();
                     let ctx = Context::new(&config);
-                    let mut checker = SafetyChecker::new(&ctx);
+                    let mut checker = PolicyEngine::new(&ctx);
                     let _ = checker.register_bounded_geometry();
 
                     match checker.execute_totality_audit(live_privilege, live_risk, ceiling) {

@@ -1,0 +1,15 @@
+# Jinn Guard Enterprise Policy Specification
+global_safety_ceiling: 95.0
+
+agent_nodes:
+  - id: "fabric_swarm_production_01"
+    privilege_tier: 2
+    max_sequence_quota: 5
+    allowed_intents:
+      - "model_inference"
+      - "mathematical_computation"
+    # Declarative Invariants mathematically verified via Z3 SMT-solving
+    invariants:
+      - "spending_ceiling_usd <= 150.00"
+      - "network_isolation_enforced == true"
+      - "privilege_escalation_depth < 3"
