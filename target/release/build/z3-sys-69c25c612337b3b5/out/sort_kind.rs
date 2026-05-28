@@ -16,7 +16,5 @@ pub enum Z3_sort_kind {
     Z3_ROUNDING_MODE_SORT = 10,
     Z3_SEQ_SORT = 11,
     Z3_RE_SORT = 12,
-    Z3_CHAR_SORT = 13,
-    Z3_TYPE_VAR = 14,
     Z3_UNKNOWN_SORT = 1000,
 }
