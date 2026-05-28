@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+pub mod ebpf_monitor;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
