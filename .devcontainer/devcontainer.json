@@ -1,0 +1,22 @@
+{
+  "name": "Jinn Guard Rust Sandbox",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "jinnguard-sandbox",
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "bash scripts/sandbox_bootstrap.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "ms-python.python"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.check.command": "clippy",
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}

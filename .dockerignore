@@ -1,0 +1,12 @@
+.git
+.github
+target
+**/target
+release
+*.log
+*.tmp
+.DS_Store
+bpf/*.o
+bpf/*.bc
+bpf/lsm/*.o
+bpf/vmlinux.h

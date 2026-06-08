@@ -1,0 +1,23 @@
+# Locked agent runtime for Step 2 mandatory mediation.
+# This image is intentionally small: no shell, no curl/wget/nc, non-root user.
+FROM python:3.12-slim-bookworm
+
+ARG AGENT_UID=10001
+ARG AGENT_GID=1000
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    JINN_GUARD_SOCKET=/run/jinnguard/jinnguard.sock \
+    JINNGUARD_SOCKET=/run/jinnguard/jinnguard.sock \
+    JINN_AGENT_ID=locked_agent_dev_01 \
+    PYTHONPATH=/workspace/jinnguard_py
+
+RUN groupadd --gid "${AGENT_GID}" agent \
+    && useradd --uid "${AGENT_UID}" --gid "${AGENT_GID}" --no-create-home --shell /usr/sbin/nologin agent \
+    && rm -f /bin/sh /usr/bin/sh /bin/dash /usr/bin/dash /bin/bash /usr/bin/bash \
+    && rm -f /usr/bin/curl /usr/bin/wget /bin/nc /usr/bin/nc || true
+
+WORKDIR /workspace
+USER ${AGENT_UID}:${AGENT_GID}
+
+CMD ["python3", "examples/step2_mandatory_mediation_demo.py"]

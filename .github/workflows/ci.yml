@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Release build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libz3-dev keyutils
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-release-
+
+      - name: Build release
+        run: cargo build --release 2>&1
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts_cli-release-${{ github.sha }}
+          path: target/release/ts_cli
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Test suite (unit + integration)
+  # ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libz3-dev keyutils
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-test-
+            ${{ runner.os }}-cargo-target-release-
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ts_cli-release-${{ github.sha }}
+          path: target/release/
+
+      - name: Mark binary executable
+        run: chmod +x target/release/ts_cli
+
+      - name: Run all tests
+        env:
+          JINNGUARD_TEST_BINARY: ${{ github.workspace }}/target/release/ts_cli
+        run: cargo test --workspace 2>&1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 3: Benchmark compilation check
+  # ─────────────────────────────────────────────────────────────────────────────
+  bench:
+    name: Bench (compile check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libz3-dev keyutils
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-bench-
+
+      - name: Compile benchmarks (no-run)
+        run: cargo bench --no-run 2>&1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 4: Clippy (deny warnings)
+  # ─────────────────────────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libz3-dev keyutils
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Install clippy
+        run: rustup component add clippy
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings 2>&1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 5: Rustfmt check
+  # ─────────────────────────────────────────────────────────────────────────────
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check 2>&1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 6: eBPF build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-ebpf:
+    name: Build eBPF object
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang, llvm, libbpf-dev
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) || \
+          sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic
+
+      - name: Build eBPF object
+        run: make -C bpf
+        continue-on-error: true  # eBPF build may fail on older kernels; warn, don't block
+
+      - name: Upload eBPF artifact
+        if: success() || steps.build-ebpf.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinnguard_ebpf-${{ github.sha }}
+          path: bpf/jinnguard_ebpf.o
+          if-no-files-found: warn

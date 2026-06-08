@@ -1,0 +1,8 @@
+[toolchain]
+# Use the latest stable toolchain available to rustup/official Rust images.
+# Pin this to a concrete version later if release reproducibility matters more
+# than automatically receiving compiler fixes.
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu"]

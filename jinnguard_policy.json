@@ -1,3 +1,4 @@
 {
-    "upper_safety_boundary": 75.0
+    "upper_safety_boundary": 75.0,
+    "minimum_trust_score": 25.0
 }

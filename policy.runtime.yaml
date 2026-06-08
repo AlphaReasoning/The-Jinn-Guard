@@ -1,0 +1,19 @@
+# Compatibility alias for the Step 2 runtime policy.
+global_safety_ceiling: 95.0
+deny_anonymous_agents: true
+
+runtime_policy:
+  deny_root_peers: true
+  allowed_peer_uids:
+    - 10001
+  require_brokered_execution: true
+  require_sandbox_namespace: false
+
+agent_nodes:
+  - id: "locked_agent_dev_01"
+    privilege_tier: 1
+    max_sequence_quota: 100
+    allowed_intents:
+      - "execute_shell"
+      - "write_file"
+      - "network_request"

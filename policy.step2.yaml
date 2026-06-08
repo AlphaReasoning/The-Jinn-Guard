@@ -1,0 +1,26 @@
+# Step 2 runtime policy: mandatory broker mediation for locked agents.
+global_safety_ceiling: 95.0
+deny_anonymous_agents: true
+
+runtime_policy:
+  # The locked agent runtime runs as UID 10001 and shared GID 1000. It can
+  # connect to the broker socket but cannot write to the socket directory.
+  deny_root_peers: true
+  allowed_peer_uids:
+    - 10001
+  # Any proposal that names a proposed_action must use execute=true, which
+  # closes the old verdict-only advisory path for dangerous capabilities.
+  require_brokered_execution: true
+  # Disabled by default because /proc peer PID visibility varies across Docker
+  # and rootless runtimes. Enable on hosts where the daemon can observe peer
+  # namespaces directly.
+  require_sandbox_namespace: false
+
+agent_nodes:
+  - id: "locked_agent_dev_01"
+    privilege_tier: 1
+    max_sequence_quota: 100
+    allowed_intents:
+      - "execute_shell"
+      - "write_file"
+      - "network_request"

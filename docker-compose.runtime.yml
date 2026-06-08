@@ -1,0 +1,82 @@
+services:
+  jinnguard-broker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jinnguard-rust-sandbox:local
+    working_dir: /workspace
+    user: "root"
+    environment:
+      CARGO_TARGET_DIR: /workspace/target
+      JINN_GUARD_SECRET: dev-only-change-me
+      JINN_GUARD_SOCKET: /run/jinnguard/jinnguard.sock
+      JINNGUARD_SOCKET: /run/jinnguard/jinnguard.sock
+      JINN_GUARD_POLICY: /workspace/policy.runtime.yaml
+      JINN_GUARD_AUDIT: /tmp/jinnguard-runtime-audit.log
+      JINN_GUARD_LINEAGE: /tmp/jinnguard-runtime-lineage.json
+      JINN_GUARD_SOCKET_MODE: "0770"
+      JINN_GUARD_MCP_PORT: "4860"
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/home/jinnguard/.cargo/registry
+      - cargo-git:/home/jinnguard/.cargo/git
+      - cargo-target:/workspace/target
+      - jinnguard-runtime:/run/jinnguard
+    command: >-
+      bash -lc "mkdir -p /run/jinnguard /workspace/target /home/jinnguard/.cargo/registry /home/jinnguard/.cargo/git
+      && chown -R 1000:1000 /run/jinnguard /workspace/target /home/jinnguard/.cargo
+      && chmod 0750 /run/jinnguard
+      && exec sudo -E -u jinnguard ./scripts/runtime_daemon.sh"
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/jinnguard/jinnguard.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 180
+      start_period: 5s
+
+  locked-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT_UID: 10001
+        AGENT_GID: 1000
+    image: jinnguard-locked-agent:local
+    depends_on:
+      jinnguard-broker:
+        condition: service_healthy
+    network_mode: "none"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./sandbox/agent-seccomp.json
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    user: "10001:1000"
+    working_dir: /workspace
+    environment:
+      JINN_GUARD_SECRET: dev-only-change-me
+      JINN_GUARD_SOCKET: /run/jinnguard/jinnguard.sock
+      JINNGUARD_SOCKET: /run/jinnguard/jinnguard.sock
+      JINN_AGENT_ID: locked_agent_dev_01
+      JINNGUARD_AGENT_ID: locked_agent_dev_01
+      JINN_GUARD_AGENT_ID: locked_agent_dev_01
+      PYTHONPATH: /workspace/jinnguard_py
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/workspace:ro
+      - jinnguard-runtime:/run/jinnguard
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    command: ["python3", "examples/step2_mandatory_mediation_demo.py"]
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  jinnguard-runtime:

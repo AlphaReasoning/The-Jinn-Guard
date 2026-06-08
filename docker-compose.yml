@@ -1,0 +1,31 @@
+services:
+  jinnguard-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jinnguard-rust-sandbox:local
+    working_dir: /workspace
+    environment:
+      CARGO_TARGET_DIR: /workspace/target
+      JINN_GUARD_SECRET: dev-secret-not-for-production
+      JINN_GUARD_SOCKET: /tmp/jinnguard-runtime/jinnguard.sock
+      JINNGUARD_SOCKET: /tmp/jinnguard-runtime/jinnguard.sock
+      JINN_GUARD_MCP_PORT: "4850"
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/home/jinnguard/.cargo/registry
+      - cargo-git:/home/jinnguard/.cargo/git
+      - cargo-target:/workspace/target
+      - jinnguard-runtime:/tmp/jinnguard-runtime
+    ports:
+      - "${JINN_GUARD_MCP_PORT:-4850}:4850"
+    command: bash
+    tty: true
+    stdin_open: true
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  jinnguard-runtime:

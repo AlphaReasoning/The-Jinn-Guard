@@ -49,11 +49,38 @@ def execute_fabric_pipeline(token: IntentToken, privilege_lane: float, forced_ra
         "signature": signature
     }
 
+    import struct
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect('/tmp/jinnguard.sock')
-        s.sendall(json.dumps(wire_envelope).encode('utf-8'))
-        response = s.recv(1024).decode('utf-8').strip()
+        
+        serialized = json.dumps(wire_envelope, separators=(",", ":"))
+        data = serialized.encode("utf-8")
+        header = struct.pack(">IB", len(data), 1)
+        s.sendall(header + data)
+
+        # Read response header
+        resp_header = b''
+        while len(resp_header) < 5:
+            chunk = s.recv(5 - len(resp_header))
+            if not chunk:
+                break
+            resp_header += chunk
+        
+        if len(resp_header) < 5:
+            print("   ⚠️  Fabric linkage integration error: Truncated response header")
+            return None
+            
+        resp_len, resp_ver = struct.unpack(">IB", resp_header)
+        
+        resp_data = b''
+        while len(resp_data) < resp_len:
+            chunk = s.recv(resp_len - len(resp_data))
+            if not chunk:
+                break
+            resp_data += chunk
+            
+        response = resp_data.decode('utf-8').strip()
         s.close()
         
         if "ALLOW" in response:

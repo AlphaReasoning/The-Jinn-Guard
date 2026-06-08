@@ -1,49 +1,61 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashSet;
-use z3::ast::Int;
+use std::collections::HashMap;
+use z3::ast::{Ast, Int, Real};
 use z3::{Context, Solver};
 
 pub struct PolicyEngine<'a> {
+    ctx: &'a Context,
     solver: Solver<'a>,
-    nonce_cache: HashSet<u64>,
+    nonce_cache: std::collections::HashSet<u64>,
 }
 
 impl<'a> PolicyEngine<'a> {
     pub fn new(ctx_ref: &'a Context) -> Self {
         let solver = Solver::new(ctx_ref);
-        
+
         Self {
+            ctx: ctx_ref,
             solver,
-            nonce_cache: HashSet::new(),
+            nonce_cache: std::collections::HashSet::new(),
         }
     }
 
     /// Backward-Compatible Alias for the Topology Mapping Layer
     pub fn register_bounded_geometry(&self) -> Result<()> {
-        println!("📐 [TOPOLOGY ENGINE] Bounded geometry coordinates mapped to formal constraint scope.");
+        println!(
+            "📐 [TOPOLOGY ENGINE] Bounded geometry coordinates mapped to formal constraint scope."
+        );
         Ok(())
     }
 
-    /// Backward-Compatible Alias Consuming f64 Primitives Natively
-    pub fn execute_totality_audit(&self, current_risk: f64, action_weight: f64, ceiling: f64) -> Result<()> {
-        // Coerce floating-point scalars into discrete fixed-precision integers for the SMT context
-        self.verify_state_transition(current_risk as i64, action_weight as i64, ceiling as i64)
+    /// Verifies that the daemon-derived risk score remains inside the policy ceiling.
+    pub fn execute_totality_audit(&self, assessed_risk: f64, ceiling: f64) -> Result<()> {
+        self.verify_state_transition(0, assessed_risk.ceil() as i64, ceiling.floor() as i64)
     }
 
     /// Remediation 2: Deep Anti-Replay Nonce & Sequence Validation Durability
     pub fn validate_sequence(&mut self, nonce: u64, sequence_id: u32) -> Result<()> {
         if self.nonce_cache.contains(&nonce) {
-            return Err(anyhow!("SECURITY_BREACH: Replay attack detected. Nonce allocation exhausted."));
+            return Err(anyhow!(
+                "SECURITY_BREACH: Replay attack detected. Nonce allocation exhausted."
+            ));
         }
         self.nonce_cache.insert(nonce);
         if sequence_id == 0 {
-            return Err(anyhow!("MALFORMED_STREAM: Invalid initial sequence index primitive."));
+            return Err(anyhow!(
+                "MALFORMED_STREAM: Invalid initial sequence index primitive."
+            ));
         }
         Ok(())
     }
 
     /// Remediation 1: Expanding Scalar Arithmetic into Deep Temporal State Verification
-    pub fn verify_state_transition(&self, current_risk: i64, action_weight: i64, ceiling: i64) -> Result<()> {
+    pub fn verify_state_transition(
+        &self,
+        current_risk: i64,
+        action_weight: i64,
+        ceiling: i64,
+    ) -> Result<()> {
         self.solver.reset();
 
         let ctx = self.solver.get_context();
@@ -57,10 +69,166 @@ impl<'a> PolicyEngine<'a> {
 
         match self.solver.check() {
             z3::SatResult::Sat => {
-                println!("✅ [Z3 PROVER] Inductive safety step mathematically locked. Path cleared.");
+                println!(
+                    "\u{2705} [Z3 PROVER] Inductive safety step mathematically locked. Path cleared."
+                );
                 Ok(())
             }
-            _ => Err(anyhow!("SIGNAL: REFUSED_DEGRADED_ENTROPY_THRESHOLD_BREACH. Safety proof failed.")),
+            _ => Err(anyhow!(
+                "SIGNAL: REFUSED_DEGRADED_ENTROPY_THRESHOLD_BREACH. Safety proof failed."
+            )),
+        }
+    }
+
+    /// Phase 2.2 — Verify declarative policy invariants expressed as constraint strings.
+    ///
+    /// Each invariant is a simple infix expression of the form:
+    ///   `<variable> <op> <literal>`
+    /// where `<op>` is one of `<=`, `>=`, `<`, `>`, `==`.
+    ///
+    /// Variables are resolved from `context_vars`.  Variables not present in the
+    /// map are skipped and the constraint is treated as vacuously satisfied so
+    /// that missing telemetry never causes a spurious deny.
+    pub fn verify_policy_invariants(
+        &self,
+        invariants: &[String],
+        context_vars: &HashMap<String, f64>,
+    ) -> Result<()> {
+        self.solver.reset();
+        let ctx = self.ctx;
+
+        let mut constrained = false;
+
+        for invariant in invariants {
+            // Parse `lhs op rhs`.
+            let (lhs, op, rhs_str) = parse_invariant(invariant).ok_or_else(|| {
+                anyhow!("Cannot parse invariant expression: '{}'", invariant)
+            })?;
+
+            // Resolve LHS variable; skip if unknown (vacuous).
+            let lhs_val = match context_vars.get(lhs) {
+                Some(&v) => v,
+                None => {
+                    println!("[Z3] invariant var '{}' not in context — skipping", lhs);
+                    continue;
+                }
+            };
+
+            let rhs_val: f64 = rhs_str
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("Cannot parse RHS literal '{}' in invariant", rhs_str))?;
+
+            let lhs_z3 = Real::from_real(ctx, (lhs_val * 1_000_000.0) as i32, 1_000_000);
+            let rhs_z3 = Real::from_real(ctx, (rhs_val * 1_000_000.0) as i32, 1_000_000);
+
+            let constraint = match op {
+                "<=" => lhs_z3.le(&rhs_z3),
+                ">=" => lhs_z3.ge(&rhs_z3),
+                "<"  => lhs_z3.lt(&rhs_z3),
+                ">"  => lhs_z3.gt(&rhs_z3),
+                "==" => lhs_z3._eq(&rhs_z3),
+                other => return Err(anyhow!("Unsupported operator '{}' in invariant", other)),
+            };
+
+            self.solver.assert(&constraint);
+            constrained = true;
+        }
+
+        if !constrained {
+            // No verifiable constraints — pass through.
+            return Ok(());
+        }
+
+        match self.solver.check() {
+            z3::SatResult::Sat => {
+                println!("\u{2705} [Z3 INVARIANTS] All policy invariants satisfied.");
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "POLICY_INVARIANT_VIOLATED: One or more Z3 invariants are unsatisfiable."
+            )),
         }
     }
 }
+
+/// Parse a simple `lhs op rhs` invariant string.
+/// Returns `(lhs_var, operator, rhs_literal)` or `None` on parse failure.
+fn parse_invariant(s: &str) -> Option<(&str, &str, &str)> {
+    for op in &["<=", ">=", "==", "<", ">"] {
+        if let Some(pos) = s.find(op) {
+            let lhs = s[..pos].trim();
+            let rhs = s[pos + op.len()..].trim();
+            if !lhs.is_empty() && !rhs.is_empty() {
+                return Some((lhs, op, rhs));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invariants_satisfied_pass() {
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+
+        let invariants = vec![
+            "spending_ceiling_usd <= 150.00".to_string(),
+            "privilege_escalation_depth < 3".to_string(),
+        ];
+        let context_vars: HashMap<String, f64> = [
+            ("spending_ceiling_usd".to_string(), 75.0),
+            ("privilege_escalation_depth".to_string(), 1.0),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(engine.verify_policy_invariants(&invariants, &context_vars).is_ok());
+    }
+
+    #[test]
+    fn invariants_violated_fail() {
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+
+        let invariants = vec![
+            "spending_ceiling_usd <= 150.00".to_string(),
+        ];
+        let context_vars: HashMap<String, f64> = [
+            ("spending_ceiling_usd".to_string(), 200.0),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(engine.verify_policy_invariants(&invariants, &context_vars).is_err());
+    }
+
+    #[test]
+    fn invariants_unknown_var_vacuously_satisfied() {
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+
+        let invariants = vec!["unknown_metric <= 100.0".to_string()];
+        let context_vars: HashMap<String, f64> = HashMap::new();
+
+        // Unknown variable should be skipped (vacuously pass).
+        assert!(engine.verify_policy_invariants(&invariants, &context_vars).is_ok());
+    }
+
+    #[test]
+    fn invariants_empty_list_pass() {
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+
+        assert!(engine.verify_policy_invariants(&[], &HashMap::new()).is_ok());
+    }
+}
+

@@ -1,8 +1,6 @@
 [workspace]
 members = [
-    "ts_parser",
     "ts_checker",
-    "ts_compiler",
     "ts_cli"
 ]
 resolver = "2"

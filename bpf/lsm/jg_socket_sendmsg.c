@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// bpf/lsm/jg_socket_sendmsg.c — Jinn Guard LSM hook for socket_sendmsg
+
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include "jg_common.h"
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);
+} requests SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct jg_verdict_payload);
+} verdicts SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
+} ipv4_denylist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} runtime_controls SEC(".maps");
+
+
+SEC("lsm.s/socket_sendmsg")
+int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int size) {
+    int audit_only = jg_audit_only_enabled(&runtime_controls);
+    int sock_type = 0;
+    struct sockaddr *address = 0;
+    __u16 family = 0;
+
+    bpf_core_read(&sock_type, sizeof(sock_type), &sock->type);
+    if (sock_type != SOCK_DGRAM) {
+        return 0;
+    }
+
+    bpf_core_read(&address, sizeof(address), &msg->msg_name);
+    if (address == NULL) {
+        return 0;
+    }
+    bpf_core_read(&family, sizeof(family), &address->sa_family);
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+    __u64 cookie = pid_tgid ^ bpf_ktime_get_ns();
+
+    struct jg_request *req = bpf_ringbuf_reserve(&requests, sizeof(*req), 0);
+    if (!req) {
+        return audit_only ? 0 : -JG_EPERM;
+    }
+    __builtin_memset(req, 0, sizeof(*req));
+
+    req->cookie = cookie;
+    req->pid = pid;
+    req->type = REQ_SENDMSG;
+    req->family = family;
+    int denied = 0;
+
+    switch (family) {
+    case AF_INET: {
+        struct sockaddr_in *sa = (struct sockaddr_in *)address;
+        bpf_core_read(&req->dest.v4.addr, sizeof(req->dest.v4.addr), &sa->sin_addr.s_addr);
+        bpf_core_read(&req->dest.v4.port, sizeof(req->dest.v4.port), &sa->sin_port);
+        __u8 *entry = bpf_map_lookup_elem(&ipv4_denylist, &req->dest.v4.addr);
+        if (entry && *entry) {
+            denied = 1;
+        }
+        break;
+    }
+    case AF_INET6: {
+        struct sockaddr_in6 *sa = (struct sockaddr_in6 *)address;
+        bpf_core_read(&req->dest.v6.addr, sizeof(req->dest.v6.addr), &sa->sin6_addr);
+        bpf_core_read(&req->dest.v6.port, sizeof(req->dest.v6.port), &sa->sin6_port);
+        break;
+    }
+    default:
+        bpf_ringbuf_discard(req, 0);
+        return 0;
+    }
+
+    bpf_ringbuf_submit(req, 0);
+    return audit_only ? 0 : (denied ? -JG_EPERM : 0);
+}
+
+char LICENSE_socket_sendmsg[] SEC("license") = "GPL";

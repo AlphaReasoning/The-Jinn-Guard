@@ -1,0 +1,15 @@
+build_debug.log
+*.log
+*.zip
+*.rlib
+*.pyc
+__pycache__/
+bpf/*.o
+bpf/*.bc
+bpf/lsm/*.o
+bpf/vmlinux.h
+target/
+release/
+validation/
+.devcontainer/.cache/
+.cargo/.package-cache/

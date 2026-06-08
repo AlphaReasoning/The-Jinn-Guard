@@ -5,5 +5,4 @@ edition = "2021"
 
 [dependencies]
 z3 = { workspace = true }
-ts_parser = { path = "../ts_parser" }
 anyhow = { workspace = true }

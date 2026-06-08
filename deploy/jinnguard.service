@@ -1,0 +1,57 @@
+[Unit]
+Description=Jinn Guard — Enterprise Semantic Firewall Daemon
+Documentation=https://github.com/AlphaReasoning/The-Jinn-Guard
+After=network.target local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=jinnguard
+Group=jinnguard
+Environment=JINNGUARD_ENTERPRISE=1
+Environment=JINNGUARD_SECRET_FILE=/etc/jinnguard/secret
+
+RuntimeDirectory=jinnguard
+RuntimeDirectoryMode=0750
+
+ExecStart=/usr/sbin/jinnguard \
+    --socket-path=/run/jinnguard/jinnguard.sock \
+    --lineage-file=/var/lib/jinnguard/lineage.json \
+    --audit-log=/var/log/jinnguard/audit.log \
+    --policy-file=/etc/jinnguard/policy.yaml
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jinnguard
+
+# Capabilities required for eBPF telemetry (when kernel_telemetry feature is active)
+AmbientCapabilities=CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+ReadWritePaths=/run/jinnguard /var/lib/jinnguard /var/log/jinnguard
+ReadOnlyPaths=/etc/jinnguard
+
+# Performance
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target
