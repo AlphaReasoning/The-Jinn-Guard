@@ -101,9 +101,8 @@ impl<'a> PolicyEngine<'a> {
 
         for invariant in invariants {
             // Parse `lhs op rhs`.
-            let (lhs, op, rhs_str) = parse_invariant(invariant).ok_or_else(|| {
-                anyhow!("Cannot parse invariant expression: '{}'", invariant)
-            })?;
+            let (lhs, op, rhs_str) = parse_invariant(invariant)
+                .ok_or_else(|| anyhow!("Cannot parse invariant expression: '{}'", invariant))?;
 
             // Resolve LHS variable; skip if unknown (vacuous).
             let lhs_val = match context_vars.get(lhs) {
@@ -125,8 +124,8 @@ impl<'a> PolicyEngine<'a> {
             let constraint = match op {
                 "<=" => lhs_z3.le(&rhs_z3),
                 ">=" => lhs_z3.ge(&rhs_z3),
-                "<"  => lhs_z3.lt(&rhs_z3),
-                ">"  => lhs_z3.gt(&rhs_z3),
+                "<" => lhs_z3.lt(&rhs_z3),
+                ">" => lhs_z3.gt(&rhs_z3),
                 "==" => lhs_z3._eq(&rhs_z3),
                 other => return Err(anyhow!("Unsupported operator '{}' in invariant", other)),
             };
@@ -188,7 +187,9 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert!(engine.verify_policy_invariants(&invariants, &context_vars).is_ok());
+        assert!(engine
+            .verify_policy_invariants(&invariants, &context_vars)
+            .is_ok());
     }
 
     #[test]
@@ -197,16 +198,14 @@ mod tests {
         let ctx = Context::new(&config);
         let engine = PolicyEngine::new(&ctx);
 
-        let invariants = vec![
-            "spending_ceiling_usd <= 150.00".to_string(),
-        ];
-        let context_vars: HashMap<String, f64> = [
-            ("spending_ceiling_usd".to_string(), 200.0),
-        ]
-        .into_iter()
-        .collect();
+        let invariants = vec!["spending_ceiling_usd <= 150.00".to_string()];
+        let context_vars: HashMap<String, f64> = [("spending_ceiling_usd".to_string(), 200.0)]
+            .into_iter()
+            .collect();
 
-        assert!(engine.verify_policy_invariants(&invariants, &context_vars).is_err());
+        assert!(engine
+            .verify_policy_invariants(&invariants, &context_vars)
+            .is_err());
     }
 
     #[test]
@@ -219,7 +218,9 @@ mod tests {
         let context_vars: HashMap<String, f64> = HashMap::new();
 
         // Unknown variable should be skipped (vacuously pass).
-        assert!(engine.verify_policy_invariants(&invariants, &context_vars).is_ok());
+        assert!(engine
+            .verify_policy_invariants(&invariants, &context_vars)
+            .is_ok());
     }
 
     #[test]
@@ -228,7 +229,8 @@ mod tests {
         let ctx = Context::new(&config);
         let engine = PolicyEngine::new(&ctx);
 
-        assert!(engine.verify_policy_invariants(&[], &HashMap::new()).is_ok());
+        assert!(engine
+            .verify_policy_invariants(&[], &HashMap::new())
+            .is_ok());
     }
 }
-

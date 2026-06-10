@@ -371,7 +371,9 @@ fn test_kernel_safe_mode_allows_normally_denied_operations() {
         });
 
         stats.record(ExpectedDecision::Allow, || {
-            udp_client.send_to(b"jinn-guard-safe-mode", denied_udp_addr).map(|_| ())
+            udp_client
+                .send_to(b"jinn-guard-safe-mode", denied_udp_addr)
+                .map(|_| ())
         });
 
         std::env::set_current_dir(&denied_root).unwrap();
