@@ -41,7 +41,8 @@ static __always_inline int jg_inode_basename_denied(const char *path)
 {
     struct jg_path_key key = {};
 
-    __builtin_memcpy(key.path, path, sizeof(key.path));
+    // `path` is now the full resolved path; match the denylist on its basename.
+    jg_basename_key(&key, path);
     __u8 *entry = bpf_map_lookup_elem(&denied_basenames, &key);
     return entry && *entry;
 }
@@ -73,7 +74,7 @@ int BPF_PROG(jg_inode_create, struct inode *dir, struct dentry *dentry, umode_t 
     __u64 cookie = pid_tgid ^ bpf_ktime_get_ns();
     char resource_path[JG_MAX_RESOURCE_LEN] = {};
 
-    jg_read_dentry_basename(dentry, resource_path, sizeof(resource_path));
+    jg_read_dentry_path(dentry, resource_path, sizeof(resource_path));
     int decision = (jg_inode_dir_denied(dir) || jg_inode_basename_denied(resource_path))
         ? -JG_EPERM
         : 0;

@@ -196,3 +196,137 @@ static __always_inline void jg_read_dentry_basename(
         bpf_probe_read_kernel_str(out, out_size, name);
     }
 }
+
+// Maximum number of parent directories walked when resolving a full path, and
+// the per-component scratch length. Bounded so the BPF verifier accepts the
+// unrolled walk; very deep paths are truncated on the left (the basename and
+// directory-inode checks still apply, so this is never weaker than basename).
+#define JG_PATH_MAX_DEPTH 17
+#define JG_PATH_COMP_LEN 40
+
+// Resolve the absolute path of `dentry` into `out` (CVE-2026-002). Walks
+// `d_parent` up to JG_PATH_MAX_DEPTH levels, prepending "/component" into a
+// scratch buffer from the right, then left-justifies the result into `out`.
+// Falls back to the basename if the walk yields nothing. Every dynamic buffer
+// index is masked into [0, JG_MAX_RESOURCE_LEN) so the verifier can prove the
+// accesses are in bounds. JG_MAX_RESOURCE_LEN must be a power of two.
+static __always_inline void jg_read_dentry_path(
+    struct dentry *dentry,
+    char *out,
+    __u32 out_size)
+{
+    jg_clear_resource(out);
+    if (!dentry) {
+        return;
+    }
+
+    char scratch[JG_MAX_RESOURCE_LEN];
+#pragma unroll
+    for (int i = 0; i < JG_MAX_RESOURCE_LEN; i++) {
+        scratch[i] = '\0';
+    }
+
+    int wpos = JG_MAX_RESOURCE_LEN; // exclusive end; decremented before a write
+    struct dentry *d = dentry;
+    struct dentry *parent = 0;
+    int components = 0;
+
+#pragma unroll
+    for (int depth = 0; depth < JG_PATH_MAX_DEPTH; depth++) {
+        bpf_probe_read_kernel(
+            &parent, sizeof(parent),
+            JG_CORE_FIELD_PTR(d, struct dentry, d_parent));
+
+        const unsigned char *name_ptr = 0;
+        bpf_probe_read_kernel(
+            &name_ptr, sizeof(name_ptr),
+            JG_CORE_FIELD_PTR(d, struct dentry, d_name.name));
+
+        char comp[JG_PATH_COMP_LEN];
+#pragma unroll
+        for (int i = 0; i < JG_PATH_COMP_LEN; i++) {
+            comp[i] = '\0';
+        }
+        int clen = 0;
+        if (name_ptr) {
+            clen = bpf_probe_read_kernel_str(comp, sizeof(comp), name_ptr);
+        }
+
+        // A usable component has clen > 1 (skips empty names and the root
+        // dentry, whose d_name.name is "/" giving clen == 2, comp[0] == '/').
+        int usable = (clen > 1) && !(comp[0] == '/' && clen == 2);
+        if (usable) {
+            int n = clen - 1; // characters excluding the trailing NUL
+            if (n > JG_PATH_COMP_LEN - 1) {
+                n = JG_PATH_COMP_LEN - 1;
+            }
+            // Prepend comp[0..n-1] (rightmost char first), then a leading '/'.
+#pragma unroll
+            for (int k = JG_PATH_COMP_LEN - 1; k >= 0; k--) {
+                if (k < n && wpos > 1) {
+                    wpos--;
+                    scratch[wpos & (JG_MAX_RESOURCE_LEN - 1)] = comp[k];
+                }
+            }
+            if (wpos > 1) {
+                wpos--;
+                scratch[wpos & (JG_MAX_RESOURCE_LEN - 1)] = '/';
+            }
+            components++;
+        }
+
+        if (d == parent || parent == 0) {
+            break;
+        }
+        d = parent;
+    }
+
+    if (components == 0) {
+        jg_read_dentry_basename(dentry, out, out_size);
+        return;
+    }
+
+    // Left-justify scratch[wpos .. JG_MAX_RESOURCE_LEN-1] into out. A bounded
+    // (non-unrolled) loop: the verifier proves 0 <= i < JG_MAX_RESOURCE_LEN.
+    int start = wpos & (JG_MAX_RESOURCE_LEN - 1);
+    int oi = 0;
+    for (int i = 0; i < JG_MAX_RESOURCE_LEN; i++) {
+        if (i >= start && oi < (int)out_size - 1) {
+            out[oi & (JG_MAX_RESOURCE_LEN - 1)] = scratch[i];
+            oi++;
+        }
+    }
+    out[oi & (JG_MAX_RESOURCE_LEN - 1)] = '\0';
+}
+
+// Copy the basename (text after the final '/') of a full `path` into `key`,
+// so the in-kernel basename denylist keeps working now that hooks report the
+// full resolved path. Dynamic reads of `path` are masked into bounds.
+static __always_inline void jg_basename_key(struct jg_path_key *key, const char *path)
+{
+    __builtin_memset(key, 0, sizeof(*key));
+
+    int base = 0; // index of the first basename character
+#pragma unroll
+    for (int i = 0; i < JG_MAX_RESOURCE_LEN; i++) {
+        char c = path[i];
+        if (c == '\0') {
+            break;
+        }
+        if (c == '/') {
+            base = i + 1;
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < JG_MAX_RESOURCE_LEN; i++) {
+        if (base + i >= JG_MAX_RESOURCE_LEN) {
+            break;
+        }
+        char c = path[(base + i) & (JG_MAX_RESOURCE_LEN - 1)];
+        key->path[i & (JG_MAX_RESOURCE_LEN - 1)] = c;
+        if (c == '\0') {
+            break;
+        }
+    }
+}
