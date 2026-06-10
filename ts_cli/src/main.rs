@@ -559,6 +559,70 @@ pub(crate) fn path_is_governed(path: &str) -> bool {
     path_matches_governed_prefix(path)
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive enforcement with deterministic floors (M6).
+//
+// Repeat offenders are progressively tightened: each hard denial raises an
+// agent's effective risk on subsequent requests, trending it toward
+// CONSTRAIN/DENY. The adaptation is deterministic (a pure function of the
+// offense count), bounded (a hard cap so it cannot run away), and TIGHTEN-ONLY
+// (the penalty is non-negative and never decays, so the system can never adapt
+// its way into *less* enforcement). It applies only to agent risk scoring on
+// the authenticated proposal path; operator-immune and out-of-scope decisions
+// are made earlier and are never affected.
+// ---------------------------------------------------------------------------
+
+static AGENT_OFFENSE_COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+    std::sync::OnceLock::new();
+
+/// Risk added per prior offense, and the hard ceiling on adaptive penalty.
+const ADAPTIVE_PENALTY_PER_OFFENSE: f64 = 8.0;
+const ADAPTIVE_PENALTY_CAP: f64 = 40.0;
+
+fn agent_offense_cell() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    AGENT_OFFENSE_COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Deterministic, bounded, non-negative adaptive risk penalty for an agent's
+/// prior offenses. Same offense count always yields the same penalty, the value
+/// never decreases as offenses rise, and it is capped so adaptation cannot
+/// escalate without bound.
+fn adaptive_risk_penalty(offenses: u32) -> f64 {
+    (offenses as f64 * ADAPTIVE_PENALTY_PER_OFFENSE).min(ADAPTIVE_PENALTY_CAP)
+}
+
+fn current_agent_offenses(agent_key: &str) -> u32 {
+    *agent_offense_cell()
+        .lock()
+        .unwrap()
+        .get(agent_key)
+        .unwrap_or(&0)
+}
+
+/// Record one hard denial against an agent (a tighten-only signal). Returns the
+/// new cumulative offense count.
+fn record_agent_offense(agent_key: &str) -> u32 {
+    let mut guard = agent_offense_cell().lock().unwrap();
+    let count = guard.entry(agent_key.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count
+}
+
+/// Apply the adaptive reputation penalty to an assessment in place. Tighten-only:
+/// it can only raise risk and lower trust, never the reverse.
+fn apply_adaptive_penalty(assessment: &mut RiskAssessment, offenses: u32) {
+    let penalty = adaptive_risk_penalty(offenses);
+    if penalty <= 0.0 {
+        return;
+    }
+    assessment.observed_risk = (assessment.observed_risk + penalty).min(99.0);
+    assessment.fused_risk = assessment.fused_risk.max(assessment.observed_risk).min(99.0);
+    assessment.trust_score = (100.0 - assessment.fused_risk).clamp(0.0, 100.0);
+    assessment
+        .reasons
+        .push(format!("adaptive_reputation_penalty:offenses={offenses}"));
+}
+
 pub(crate) fn protected_resource_reference(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
@@ -1505,6 +1569,11 @@ async fn handle_client_connection(
             }
         }
 
+        // M6: deterministic, tighten-only adaptation. Agents with prior hard
+        // denials carry a bounded extra risk penalty so repeated offenders trend
+        // toward CONSTRAIN/DENY. Never loosens; never touches operator paths.
+        apply_adaptive_penalty(&mut assessment, current_agent_offenses(&agent_key));
+
         if let Err(err) = verify_z3_policy_invariants(
             matched_agent_node,
             &proposal,
@@ -1515,6 +1584,7 @@ async fn handle_client_connection(
                 "[deny] pid={} policy invariant rejected proposal: {}",
                 observation.pid, err
             );
+            record_agent_offense(&agent_key);
             let invariant_decision = PolicyDecision::deny("policy_invariant_violated", &assessment);
             emit_policy_decision_explanation(
                 &invariant_decision,
@@ -1547,6 +1617,7 @@ async fn handle_client_connection(
         // STEP 13: Policy decision and hard safety ceiling.
         let mut decision = policy_decision(&assessment, &current_policy);
         if assessment.fused_risk > current_policy.upper_safety_boundary {
+            record_agent_offense(&agent_key);
             decision = PolicyDecision::deny("risk_ceiling_exceeded", &assessment);
             emit_policy_decision_explanation(
                 &decision,
@@ -3366,6 +3437,84 @@ async fn main() -> Result<()> {
             }
             Err(err) => println!("Worker interface connection drop error: {}", err),
         }
+    }
+}
+
+/// Adaptive enforcement with deterministic floors (M6). Proves the adaptation
+/// can only tighten: the penalty is non-negative, monotonic non-decreasing,
+/// bounded by a hard cap, and zero-offense application is a no-op.
+#[cfg(test)]
+mod adaptive_floor_tests {
+    use super::{
+        adaptive_risk_penalty, apply_adaptive_penalty, current_agent_offenses,
+        record_agent_offense, ADAPTIVE_PENALTY_CAP,
+    };
+    use crate::governance::RiskAssessment;
+
+    fn assessment(risk: f64) -> RiskAssessment {
+        RiskAssessment {
+            observed_risk: risk,
+            semantic_risk: risk,
+            topology_risk: risk,
+            declared_risk: None,
+            fused_risk: risk,
+            trust_score: 100.0 - risk,
+            reasons: vec![],
+        }
+    }
+
+    #[test]
+    fn penalty_is_zero_at_zero_offenses() {
+        assert_eq!(adaptive_risk_penalty(0), 0.0);
+    }
+
+    #[test]
+    fn penalty_is_monotonic_nondecreasing_and_bounded() {
+        let mut prev = 0.0;
+        for n in 0..100u32 {
+            let p = adaptive_risk_penalty(n);
+            assert!(p >= prev, "penalty must never decrease as offenses rise");
+            assert!(p >= 0.0, "penalty must never be negative");
+            assert!(
+                p <= ADAPTIVE_PENALTY_CAP,
+                "penalty must be bounded by the hard cap"
+            );
+            prev = p;
+        }
+        // Saturates at the cap — adaptation cannot escalate without bound.
+        assert_eq!(adaptive_risk_penalty(1_000_000), ADAPTIVE_PENALTY_CAP);
+    }
+
+    #[test]
+    fn apply_is_tighten_only() {
+        let mut a = assessment(20.0);
+        let (risk_before, trust_before) = (a.fused_risk, a.trust_score);
+        apply_adaptive_penalty(&mut a, 3);
+        assert!(a.fused_risk >= risk_before, "adaptation may only raise risk");
+        assert!(
+            a.trust_score <= trust_before,
+            "adaptation may only lower trust"
+        );
+    }
+
+    #[test]
+    fn apply_zero_offenses_is_noop() {
+        let mut a = assessment(20.0);
+        let before = (a.observed_risk, a.fused_risk, a.trust_score, a.reasons.len());
+        apply_adaptive_penalty(&mut a, 0);
+        assert_eq!(
+            (a.observed_risk, a.fused_risk, a.trust_score, a.reasons.len()),
+            before
+        );
+    }
+
+    #[test]
+    fn offense_recording_accumulates() {
+        let key = "m6-unit-test-agent-unique-key";
+        assert_eq!(current_agent_offenses(key), 0);
+        assert_eq!(record_agent_offense(key), 1);
+        assert_eq!(record_agent_offense(key), 2);
+        assert_eq!(current_agent_offenses(key), 2);
     }
 }
 
