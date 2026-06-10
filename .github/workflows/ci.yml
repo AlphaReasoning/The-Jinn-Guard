@@ -99,6 +99,12 @@ jobs:
           JINNGUARD_TEST_BINARY: ${{ github.workspace }}/target/release/ts_cli
         run: cargo test --workspace 2>&1
 
+      # Anti-lockout / safe-mode invariants in the LSM verdict loop only build
+      # under the kernel feature. Run them so a regression that could strand the
+      # operator fails CI.
+      - name: Run kernel-feature safety invariants
+        run: cargo test --bin ts_cli --features kernel_telemetry 2>&1
+
   # ─────────────────────────────────────────────────────────────────────────────
   # Job 3: Benchmark compilation check
   # ─────────────────────────────────────────────────────────────────────────────

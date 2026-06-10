@@ -2347,6 +2347,215 @@ mod origin_enforcement_tests {
     }
 }
 
+/// Anti-lockout invariants. The operator's machine must remain administrable
+/// and bootable with kernel enforcement fully armed (safe_mode = false). A
+/// regression in this module is the exact failure that previously prevented the
+/// operator from loading their desktop, so a break here MUST fail CI. These
+/// tests pin the guarantee at the verdict-function level so it cannot silently
+/// drift when enforcement scope, immunity lists, or gate ordering are changed.
+#[cfg(test)]
+mod operator_safety_invariants {
+    use super::{
+        is_path_in_test_scope, lsm_exec_verdict, AgentNodePolicy, NetworkPolicy, PolicyConfig,
+        RuntimePolicy,
+    };
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+    use std::collections::HashMap;
+
+    /// Base-system and desktop-critical executables. Denying execve on any of
+    /// these with enforcement armed locks the operator out of their machine.
+    const OPERATOR_CRITICAL_EXECUTABLES: &[&str] = &[
+        "/lib/systemd/systemd",
+        "/usr/lib/systemd/systemd",
+        "/sbin/init",
+        "/usr/sbin/lightdm",
+        "/usr/bin/lightdm",
+        "/usr/lib/xorg/Xorg",
+        "/usr/bin/Xorg",
+        "/usr/sbin/getty",
+        "/usr/bin/getty",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+        "/usr/bin/dash",
+        "/usr/bin/env",
+        "/usr/bin/systemctl",
+        "/usr/bin/sudo",
+        "/usr/bin/dbus-daemon",
+        "/usr/bin/Xorg",
+    ];
+
+    /// A fully-armed governance policy: aggressive denylists and a real
+    /// executable allowlist (so enforcement is genuinely live, not vacuous).
+    fn armed_policy() -> PolicyConfig {
+        let node = AgentNodePolicy {
+            id: "agent".to_string(),
+            privilege_tier: 1,
+            max_sequence_quota: 0,
+            allowed_intents: vec![],
+            // Non-empty allowlist makes lsm_exec_verdict enforce: anything not
+            // listed and inside governed scope is denied.
+            allowed_executables: vec!["/tmp/jinnguard-test/allowed".to_string()],
+            denied_write_paths: vec!["/".to_string()],
+            denied_unlink_paths: vec!["/".to_string()],
+            denied_dns_domains: vec![],
+            invariants: vec![],
+        };
+        let mut agent_nodes = HashMap::new();
+        agent_nodes.insert(node.id.clone(), node);
+        PolicyConfig {
+            upper_safety_boundary: 50.0,
+            minimum_trust_score: 0.0,
+            agent_nodes,
+            deny_anonymous_agents: true,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+        }
+    }
+
+    fn execve_request(process_path: &str, resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid: std::process::id(),
+            req_type: LsmRequestType::Execve,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: Some(process_path.to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    #[test]
+    fn operator_critical_executables_allowed_with_enforcement_armed() {
+        let policy = armed_policy();
+        for exe in OPERATOR_CRITICAL_EXECUTABLES {
+            let request = execve_request(exe, exe);
+            let verdict = lsm_exec_verdict(&request, &policy);
+            assert!(
+                matches!(verdict, Verdict::Allow),
+                "ANTI-LOCKOUT REGRESSION: operator-critical executable {exe} was not \
+                 ALLOWED with enforcement armed (got {verdict:?}). This is the exact \
+                 failure that prevents the operator from loading their desktop."
+            );
+        }
+    }
+
+    #[test]
+    fn system_prefixes_are_never_in_governed_scope() {
+        // The host stays administrable because base-system path prefixes are
+        // excluded from the enforceable scope. If this regresses, ordinary
+        // system activity becomes subject to denial.
+        for path in [
+            "/usr/lib/xorg/Xorg",
+            "/bin/bash",
+            "/lib/systemd/systemd",
+            "/etc/passwd",
+            "/sbin/init",
+        ] {
+            assert!(
+                !is_path_in_test_scope(path),
+                "ANTI-LOCKOUT REGRESSION: system path {path} entered governed \
+                 enforcement scope; host processes could now be denied."
+            );
+        }
+    }
+
+    #[test]
+    fn enforcement_is_not_vacuous_inside_governed_scope() {
+        // Proves the anti-lockout allow rules do not disable real enforcement:
+        // a non-interactive, untrusted agent process acting inside the governed
+        // scope on a non-allowlisted target is still denied. If this flips to
+        // Allow, the product no longer does what it claims.
+        let policy = armed_policy();
+        let request = execve_request("/opt/agent/runner", "/tmp/jinnguard-test/payload");
+        let verdict = lsm_exec_verdict(&request, &policy);
+        assert!(
+            matches!(verdict, Verdict::Deny),
+            "Enforcement must remain live for governed-scope agent actions \
+             (got {verdict:?}); otherwise kernel governance is a no-op."
+        );
+    }
+}
+
+/// Safe-mode guarantee (kernel build): with JINNGUARD_SAFE_MODE the daemon is
+/// audit-only and every verdict is ALLOW, so arming the kernel layer can never
+/// strand the operator. Gated behind the same feature as the verdict loop.
+#[cfg(all(test, feature = "kernel_telemetry"))]
+mod safe_mode_invariants {
+    use super::{
+        lsm_policy_verdict, AgentNodePolicy, NetworkPolicy, PolicyConfig, RuntimePolicy,
+    };
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+    use std::collections::HashMap;
+
+    fn armed_policy() -> PolicyConfig {
+        let node = AgentNodePolicy {
+            id: "agent".to_string(),
+            privilege_tier: 1,
+            max_sequence_quota: 0,
+            allowed_intents: vec![],
+            allowed_executables: vec!["/tmp/jinnguard-test/allowed".to_string()],
+            denied_write_paths: vec!["/".to_string()],
+            denied_unlink_paths: vec!["/".to_string()],
+            denied_dns_domains: vec![],
+            invariants: vec![],
+        };
+        let mut agent_nodes = HashMap::new();
+        agent_nodes.insert(node.id.clone(), node);
+        PolicyConfig {
+            upper_safety_boundary: 50.0,
+            minimum_trust_score: 0.0,
+            agent_nodes,
+            deny_anonymous_agents: true,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+        }
+    }
+
+    fn execve_request(process_path: &str, resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid: std::process::id(),
+            req_type: LsmRequestType::Execve,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: Some(process_path.to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    #[test]
+    fn safe_mode_allows_action_that_would_be_denied_when_armed() {
+        let policy = armed_policy();
+        // Identical request is denied when armed (see operator_safety_invariants)
+        // but must be allowed under safe mode.
+        let request = execve_request("/opt/agent/runner", "/tmp/jinnguard-test/payload");
+        assert!(
+            matches!(lsm_policy_verdict(&request, &policy, false), Verdict::Deny),
+            "precondition: this request must be denied when enforcement is armed"
+        );
+        assert!(
+            matches!(lsm_policy_verdict(&request, &policy, true), Verdict::Allow),
+            "SAFE-MODE REGRESSION: safe mode must be audit-only (ALLOW everything) \
+             so the operator always retains control."
+        );
+    }
+}
+
 #[cfg(test)]
 mod intent_enforcement_tests {
     use super::{lsm_intent_response_verdict, lsm_origin_gate_verdict};
