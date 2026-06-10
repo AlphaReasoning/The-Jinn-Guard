@@ -187,6 +187,16 @@ struct PolicyYaml {
     fleet_policy_min_version: u64,
     #[serde(default)]
     accept_cross_machine_lineage: bool,
+    #[serde(default)]
+    enforcement_scope: EnforcementScopeYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EnforcementScopeYaml {
+    /// Absolute path prefixes that Jinn Guard governs in addition to the
+    /// built-in test scope. Base-system prefixes are rejected at install time.
+    #[serde(default)]
+    governed_path_prefixes: Vec<String>,
 }
 
 fn default_ceiling() -> f64 {
@@ -201,6 +211,9 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
                 .into_iter()
                 .map(|n| (n.id.clone(), n))
                 .collect();
+            // Sync the process-wide enforcement scope with the active policy.
+            // Runs on initial load and every hot-reload through this function.
+            set_governed_scope_prefixes(&yaml.enforcement_scope.governed_path_prefixes);
             return PolicyConfig {
                 upper_safety_boundary: yaml.global_safety_ceiling,
                 minimum_trust_score: 100.0 - yaml.global_safety_ceiling,
@@ -215,6 +228,9 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
             };
         }
     }
+    // No readable/valid policy: clear any previously-installed governed scope so
+    // a failed reload cannot leave stale enforcement widening in place.
+    set_governed_scope_prefixes(&[]);
     PolicyConfig {
         upper_safety_boundary: 75.0,
         minimum_trust_score: 25.0,
@@ -403,7 +419,7 @@ pub(crate) fn policy_decision(
 }
 
 pub(crate) fn is_enforcement_target(path: &str) -> bool {
-    is_path_in_test_scope(path)
+    path_is_governed(path)
 }
 
 pub(crate) fn is_path_in_test_scope(path: &str) -> bool {
@@ -457,6 +473,90 @@ fn home_jinnguard_test_path(path: &str) -> bool {
         return false;
     };
     suffix.starts_with("jinnguard-test/")
+}
+
+// ---------------------------------------------------------------------------
+// Operator-configured enforcement scope (M3).
+//
+// The built-in scope (`is_path_in_test_scope`) only governs the test sandbox,
+// which is why kernel enforcement was effectively a no-op outside tests.
+// Operators extend governance to real agent working roots via policy
+// `enforcement_scope.governed_path_prefixes`. Two independent guards make it
+// structurally impossible to widen enforcement onto the host's own critical
+// paths (anti-lockout): forbidden prefixes are dropped when the scope is
+// installed, AND base-system paths are re-excluded at every lookup. The model
+// is additive — an empty config preserves the previous behavior exactly.
+// ---------------------------------------------------------------------------
+
+static GOVERNED_SCOPE_PREFIXES: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn governed_scope_cell() -> &'static std::sync::RwLock<Vec<String>> {
+    GOVERNED_SCOPE_PREFIXES.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Base-system locations that may never be placed under enforcement scope.
+fn is_base_system_path(path: &str) -> bool {
+    let p = path.trim();
+    const DIRS: &[&str] = &[
+        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/boot", "/sys", "/proc", "/dev", "/run",
+    ];
+    DIRS.iter()
+        .any(|d| p == *d || p.starts_with(&format!("{d}/")))
+}
+
+/// A governed-scope prefix is rejected if it is relative, empty, or would place
+/// a base-system path under enforcement.
+fn is_forbidden_scope_prefix(prefix: &str) -> bool {
+    let trimmed = prefix.trim();
+    let normalized = trimmed.trim_end_matches('/');
+    normalized.is_empty() || !trimmed.starts_with('/') || is_base_system_path(normalized)
+}
+
+/// Install operator-configured governed prefixes, dropping any that are
+/// relative, empty, or under a base-system path. Returns the prefixes actually
+/// installed. Called on initial load and on every hot-reload via
+/// `load_policy_from_path`, so the global always matches the active policy.
+pub(crate) fn set_governed_scope_prefixes(raw: &[String]) -> Vec<String> {
+    let mut installed = Vec::new();
+    for prefix in raw {
+        if is_forbidden_scope_prefix(prefix) {
+            eprintln!(
+                "[policy] rejecting enforcement_scope prefix {prefix:?}: base-system or \
+                 malformed paths cannot be governed (anti-lockout)"
+            );
+            continue;
+        }
+        installed.push(prefix.trim().trim_end_matches('/').to_string());
+    }
+    let mut guard = governed_scope_cell().write().unwrap();
+    *guard = installed.clone();
+    installed
+}
+
+fn path_matches_governed_prefix(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+    let guard = governed_scope_cell().read().unwrap();
+    guard
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+/// True when `path` is subject to Jinn Guard enforcement: the built-in test
+/// scope OR an operator-configured governed prefix. Base-system paths are never
+/// governed, regardless of configuration — this is the second anti-lockout
+/// guard and it dominates the operator-supplied prefix list.
+pub(crate) fn path_is_governed(path: &str) -> bool {
+    if is_path_in_test_scope(path) {
+        return true;
+    }
+    if is_base_system_path(path) || is_protected_system_path(path) {
+        return false;
+    }
+    path_matches_governed_prefix(path)
 }
 
 pub(crate) fn protected_resource_reference(value: &str) -> bool {
@@ -1835,7 +1935,7 @@ fn lsm_origin_gate_verdict(request: &LsmRequest) -> Option<Verdict> {
         return Some(Verdict::Allow);
     }
 
-    if !is_path_in_test_scope(resource_path) {
+    if !path_is_governed(resource_path) {
         return Some(Verdict::Allow);
     }
 
@@ -1847,7 +1947,7 @@ fn lsm_intent_response_verdict(
     risk: &explainability::IntentRiskLevel,
 ) -> Option<Verdict> {
     if *risk == explainability::IntentRiskLevel::High
-        && is_path_in_test_scope(request.effective_path())
+        && path_is_governed(request.effective_path())
         && explainability::is_agent_escalated(&explainability::compute_agent_identity(request))
     {
         return Some(explainability::explain_deny(
@@ -3167,5 +3267,102 @@ async fn main() -> Result<()> {
             }
             Err(err) => println!("Worker interface connection drop error: {}", err),
         }
+    }
+}
+
+/// Policy-driven enforcement scope (M3). Verifies the model is additive
+/// (empty config == previous behavior), that operators can extend governance to
+/// real agent roots, and that base-system paths can never be drawn into scope
+/// — the two anti-lockout guards.
+#[cfg(test)]
+mod governed_scope_tests {
+    use super::{
+        is_base_system_path, is_enforcement_target, is_path_in_test_scope, path_is_governed,
+        set_governed_scope_prefixes,
+    };
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate the process-wide governed scope.
+    static SCOPE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset() {
+        set_governed_scope_prefixes(&[]);
+    }
+
+    #[test]
+    fn empty_scope_preserves_built_in_behavior() {
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        for p in [
+            "/tmp/jinnguard-test/x",
+            "/opt/jinn-agent/run",
+            "/home/alice/work/script",
+            "/usr/bin/bash",
+            "/etc/passwd",
+        ] {
+            assert_eq!(path_is_governed(p), is_path_in_test_scope(p), "path {p}");
+        }
+        reset();
+    }
+
+    #[test]
+    fn configured_prefix_becomes_governed() {
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        let installed = set_governed_scope_prefixes(&[
+            "/opt/jinn-agent".to_string(),
+            "/srv/agents/work/".to_string(),
+        ]);
+        assert_eq!(installed.len(), 2, "both legitimate prefixes install");
+        assert!(path_is_governed("/opt/jinn-agent/runner"));
+        assert!(path_is_governed("/srv/agents/work/output.txt"));
+        assert!(is_enforcement_target("/opt/jinn-agent/runner"));
+        // A sibling outside the configured prefix stays ungoverned.
+        assert!(!path_is_governed("/opt/other/runner"));
+        reset();
+    }
+
+    #[test]
+    fn base_system_prefixes_rejected_at_install() {
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        let installed = set_governed_scope_prefixes(&[
+            "/".to_string(),
+            "/usr".to_string(),
+            "/usr/bin".to_string(),
+            "/etc/agents".to_string(),
+            "/bin".to_string(),
+            "relative/path".to_string(),
+            String::new(),
+        ]);
+        assert!(
+            installed.is_empty(),
+            "ANTI-LOCKOUT: no base-system or malformed prefix may install, got {installed:?}"
+        );
+        reset();
+    }
+
+    #[test]
+    fn base_system_paths_never_governed_even_with_config() {
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        // A legitimate governed root is active; operator-critical base-system
+        // paths must still never be governed (second anti-lockout guard).
+        set_governed_scope_prefixes(&["/opt/jinn-agent".to_string()]);
+        for p in [
+            "/usr/lib/xorg/Xorg",
+            "/bin/bash",
+            "/lib/systemd/systemd",
+            "/sbin/init",
+            "/etc/passwd",
+            "/run/dbus/system_bus_socket",
+        ] {
+            assert!(is_base_system_path(p), "{p} should be a base-system path");
+            assert!(
+                !path_is_governed(p),
+                "ANTI-LOCKOUT: base-system path {p} must never be governed"
+            );
+        }
+        reset();
     }
 }

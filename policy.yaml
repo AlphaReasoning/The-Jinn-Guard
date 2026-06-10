@@ -1,6 +1,19 @@
 # Jinn Guard Enterprise Policy Specification
 global_safety_ceiling: 95.0
 
+# Enforcement scope (optional). Jinn Guard always governs its built-in test
+# sandbox. To govern real agent working directories host-wide, list absolute
+# path prefixes here. Base-system prefixes (/usr, /bin, /lib, /etc, /sbin,
+# /boot, /sys, /proc, /dev, /run, and "/") are rejected at load time and can
+# never be placed under enforcement — this is a hard anti-lockout guarantee, so
+# the operator's own desktop and system processes are never governed.
+# Leaving this empty preserves the previous (test-sandbox-only) behavior.
+enforcement_scope:
+  governed_path_prefixes: []
+  # Example — uncomment to govern agents that run out of these roots:
+  #   - "/opt/jinn-agent"
+  #   - "/srv/agents/work"
+
 agent_nodes:
   - id: "fabric_swarm_production_01"
     privilege_tier: 2
