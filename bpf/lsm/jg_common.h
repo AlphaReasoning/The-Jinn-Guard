@@ -79,6 +79,14 @@ enum jg_request_type {
     REQ_INODE_UNLINK   = 4,
 };
 
+enum jg_source_program {
+    JG_SRC_INODE_CREATE = 1,
+    JG_SRC_INODE_UNLINK = 2,
+    JG_SRC_BPRM_CHECK_SECURITY = 3,
+    JG_SRC_SOCKET_CONNECT = 4,
+    JG_SRC_SOCKET_SENDMSG = 5,
+};
+
 // Request from BPF to user-space, sent via ring buffer.
 struct jg_request {
     __u64 cookie;
@@ -105,6 +113,9 @@ struct jg_request {
 
     // For sendmsg, a preview of the outgoing payload.
     __u8 payload_preview[JG_PAYLOAD_PREVIEW_LEN];
+
+    // Stable route back to the object-local verdict map.
+    __u32 source_program;
 };
 
 // Verdict from user-space to BPF, sent via a hash map.

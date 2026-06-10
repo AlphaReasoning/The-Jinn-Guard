@@ -7,11 +7,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "jg_common.h"
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
-} requests SEC(".maps");
+#include "../common/maps.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -66,6 +62,7 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
     req->cookie = cookie;
     req->pid = pid;
     req->type = REQ_SENDMSG;
+    req->source_program = JG_SRC_SOCKET_SENDMSG;
     req->family = family;
     int denied = 0;
 

@@ -7,11 +7,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "jg_common.h"
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
-} requests SEC(".maps");
+#include "../common/maps.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -91,6 +87,7 @@ int BPF_PROG(jg_inode_create, struct inode *dir, struct dentry *dentry, umode_t 
     req->cookie = cookie;
     req->pid = pid;
     req->type = REQ_INODE_CREATE;
+    req->source_program = JG_SRC_INODE_CREATE;
     __builtin_memcpy(req->resource_path, resource_path, sizeof(req->resource_path));
 
     bpf_ringbuf_submit(req, 0);

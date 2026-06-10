@@ -7,12 +7,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "jg_common.h"
-
-// Map definitions for the linked LSM object. Other LSM files declare these as extern.
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
-} requests SEC(".maps");
+#include "../common/maps.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -62,6 +57,7 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
     req->cookie = cookie;
     req->pid = pid;
     req->type = REQ_CONNECT;
+    req->source_program = JG_SRC_SOCKET_CONNECT;
     req->family = family;
     int denied = 0;
 

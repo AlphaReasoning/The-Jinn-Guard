@@ -7,11 +7,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "jg_common.h"
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
-} requests SEC(".maps");
+#include "../common/maps.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -51,6 +47,7 @@ int BPF_PROG(jg_bprm_check_security, struct linux_binprm *bprm) {
     req->cookie = cookie;
     req->pid = pid;
     req->type = REQ_EXECVE;
+    req->source_program = JG_SRC_BPRM_CHECK_SECURITY;
     const char *filename = 0;
     bpf_core_read(&filename, sizeof(filename), &bprm->filename);
     bpf_probe_read_kernel_str(req->resource_path, sizeof(req->resource_path), filename);

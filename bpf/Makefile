@@ -60,7 +60,7 @@ check-tools:
 %.bpf.o: %.bpf.c jg_events.h $(OUT)/vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-lsm/%.o: lsm/%.c lsm/jg_common.h $(OUT)/vmlinux.h
+lsm/%.o: lsm/%.c lsm/jg_common.h common/maps.h $(OUT)/vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 legacy-telemetry: check-tools $(OUT)/vmlinux.h $(LEGACY_TELEMETRY_OBJS)
