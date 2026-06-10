@@ -19,13 +19,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::{
-    get_runtime_secret,
+    explainability::{
+        build_explanation, emit_explanation_if_enabled, ExplanationEvent, ExplanationPolicy,
+        ExplanationRiskEval,
+    },
+    explicit_protected_resource_attack,
     governance::{
         AgentLineage, AuditLogger, CapabilityProfile, ClientProposal, CombinedSemanticService,
-        ExecutionBroker, ExecutionRequest, LineageRegistry, ObservationRecord, RiskAssessment,
-        SemanticAnalysisService,
+        ExecutionBroker, ExecutionRequest, IntentClass, LineageRegistry, ObservationRecord,
+        PolicyDecision, RiskAssessment, SemanticAnalysisService, SemanticIntent,
     },
-    observed_risk_penalty, policy_decision, KernelTelemetryEvent, PolicyConfig, TelemetryStore,
+    intent_is_dangerous, is_enforcement_target, observed_risk_penalty, policy_decision,
+    protected_resource_reference, system_immunity, KernelTelemetryEvent, PolicyConfig,
+    TelemetryStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,6 +79,109 @@ fn synthetic_agent_id(peer_ip: &str, secret: &[u8]) -> String {
     mac.update(peer_ip.as_bytes());
     let hash = hex::encode(mac.finalize().into_bytes());
     format!("mcp_gw_{}", &hash[..16])
+}
+
+fn emit_mcp_decision_explanation(
+    decision: &str,
+    reason: &str,
+    peer_ip: &str,
+    method: &str,
+    agent_id: &str,
+    assessment: &RiskAssessment,
+) {
+    emit_explanation_if_enabled(|| {
+        let mut reasons = assessment.reasons.clone();
+        reasons.push(reason.to_string());
+
+        build_explanation(
+            ExplanationEvent {
+                action_type: method.to_string(),
+                resource: Some(method.to_string()),
+                source: Some(peer_ip.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                intent: Some(method.to_string()),
+                decision: decision.to_string(),
+                reason: Some(reason.to_string()),
+                enforcement_layer: "gateway".to_string(),
+            },
+            ExplanationPolicy {
+                name: "runtime_governance".to_string(),
+            },
+            ExplanationRiskEval {
+                risk_score: assessment.fused_risk,
+                reasons,
+            },
+        )
+    });
+}
+
+fn mcp_immunity_assessment(reason: &str) -> RiskAssessment {
+    RiskAssessment {
+        observed_risk: 0.0,
+        semantic_risk: 0.0,
+        topology_risk: 0.0,
+        declared_risk: Some(0.0),
+        fused_risk: 0.0,
+        trust_score: 100.0,
+        reasons: vec![reason.to_string()],
+    }
+}
+
+fn mcp_immunity_intent(method: &str, reason: &str) -> SemanticIntent {
+    let class = if method.contains("exec") || method.contains("command") {
+        IntentClass::ProcessExecution
+    } else if method.contains("write") || method.contains("unlink") {
+        IntentClass::FileWrite
+    } else if method.contains("connect") || method.contains("network") {
+        IntentClass::NetworkAccess
+    } else {
+        IntentClass::Unknown
+    };
+
+    SemanticIntent {
+        class,
+        confidence: 1.0,
+        risk_score: 0.0,
+        signals: vec![reason.to_string()],
+    }
+}
+
+fn mcp_enforcement_path(params: &Value) -> Option<&str> {
+    if let Some(obj) = params.as_object() {
+        for key in ["path", "resource", "target", "file_path", "executable"] {
+            if let Some(path) = obj
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn mcp_requires_intent_aware_enforcement(
+    method: &str,
+    params: &Value,
+    resource_path: Option<&str>,
+    action_risk_score: Option<f64>,
+    risk_floor: f64,
+) -> bool {
+    intent_is_dangerous(method)
+        || action_risk_score.is_some_and(|risk| risk >= risk_floor)
+        || resource_path.is_some_and(protected_resource_reference)
+        || params_contains_protected_resource(params)
+}
+
+fn params_contains_protected_resource(value: &Value) -> bool {
+    match value {
+        Value::String(s) => protected_resource_reference(s),
+        Value::Array(values) => values.iter().any(params_contains_protected_resource),
+        Value::Object(map) => map.values().any(params_contains_protected_resource),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +284,7 @@ pub(crate) async fn handle_mcp_connection(
     registry_store: Arc<Mutex<LineageRegistry>>,
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
-    secret_file: Option<String>,
+    secret: Arc<Vec<u8>>,
     upstream_addr: String,
 ) {
     // Read the incoming HTTP request.
@@ -218,11 +327,7 @@ pub(crate) async fn handle_mcp_connection(
 
     // Derive synthetic agent_id from client IP + HMAC secret.
     let peer_ip = peer_addr.ip().to_string();
-    let secret_bytes: Vec<u8> = match &secret_file {
-        Some(path) => std::fs::read(path).unwrap_or_default(),
-        None => get_runtime_secret().unwrap_or_default(),
-    };
-    let agent_id = synthetic_agent_id(&peer_ip, &secret_bytes);
+    let agent_id = synthetic_agent_id(&peer_ip, secret.as_slice());
 
     // Map JSON-RPC params to context_vars.
     let mut context_vars: HashMap<String, f64> = HashMap::new();
@@ -263,6 +368,173 @@ pub(crate) async fn handle_mcp_connection(
     // Use dummy PID/UID/GID (0) for MCP connections — no SO_PEERCRED available over TCP.
     let observation = ObservationRecord::from_peer(0, 0, 0);
     let lineage_key = format!("mcp:{}", agent_id);
+
+    if system_immunity::mcp_caller_is_immune(&jsonrpc.method, &jsonrpc.params) {
+        let reason = "system_process_immunity";
+        let assessment = mcp_immunity_assessment(reason);
+        let semantic_intent = mcp_immunity_intent(&jsonrpc.method, reason);
+        let decision = PolicyDecision::allow(&assessment);
+        let _ = audit_logger.log(&observation, &semantic_intent, &assessment, &decision);
+        println!(
+            "[mcp_gateway] ALLOW peer={peer_ip} method={} reason={reason} → forwarding to {upstream_addr}",
+            jsonrpc.method
+        );
+        emit_mcp_decision_explanation(
+            "ALLOW",
+            reason,
+            &peer_ip,
+            &jsonrpc.method,
+            &agent_id,
+            &assessment,
+        );
+
+        match forward_to_upstream(
+            &upstream_addr,
+            &http_req.method,
+            &http_req.path,
+            &http_req.headers,
+            &http_req.body,
+        )
+        .await
+        {
+            Ok((status, status_text, body)) => {
+                let _ = write_http_response(
+                    &mut stream,
+                    status,
+                    &status_text,
+                    "application/json",
+                    &body,
+                )
+                .await;
+            }
+            Err(e) => {
+                eprintln!("[mcp_gateway] upstream error after immunity allow: {e}");
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc.id,
+                    "error": { "code": -32603, "message": format!("Upstream error: {e}") }
+                }))
+                .unwrap_or_default();
+                let _ =
+                    write_http_response(&mut stream, 502, "Bad Gateway", "application/json", &body)
+                        .await;
+            }
+        }
+        return;
+    }
+
+    let enforcement_path = mcp_enforcement_path(&jsonrpc.params);
+    if let Some(reason) = explicit_protected_resource_attack(
+        Some(&jsonrpc.method),
+        None,
+        Some(&jsonrpc.params),
+        enforcement_path,
+    ) {
+        println!(
+            "[mcp_gateway] DENY peer={peer_ip} method={} reason={reason}",
+            jsonrpc.method
+        );
+        let assessment = RiskAssessment {
+            observed_risk: 0.0,
+            semantic_risk: 99.0,
+            topology_risk: 0.0,
+            declared_risk: action_risk_score,
+            fused_risk: action_risk_score.unwrap_or(99.0).max(99.0),
+            trust_score: 1.0,
+            reasons: vec![reason.to_string()],
+        };
+        emit_mcp_decision_explanation(
+            "DENY",
+            reason,
+            &peer_ip,
+            &jsonrpc.method,
+            &agent_id,
+            &assessment,
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "signal": "DENY_PROTECTED_RESOURCE_ACTION",
+            "reason": reason,
+            "risk_score": assessment.fused_risk,
+            "jsonrpc": "2.0",
+            "id": jsonrpc.id,
+            "error": {
+                "code": -32600,
+                "message": "Request denied by Jinn Guard: protected resource action",
+            }
+        }))
+        .unwrap_or_default();
+        let _ = write_http_response(&mut stream, 403, "Forbidden", "application/json", &body).await;
+        return;
+    }
+
+    let constrain_floor = current_policy.upper_safety_boundary * 0.40;
+    let force_policy = mcp_requires_intent_aware_enforcement(
+        &jsonrpc.method,
+        &jsonrpc.params,
+        enforcement_path,
+        action_risk_score,
+        constrain_floor,
+    );
+    if let Some(enforcement_path) = enforcement_path {
+        if !is_enforcement_target(enforcement_path) && !force_policy {
+            let reason = "outside_enforcement_scope";
+            let assessment = mcp_immunity_assessment(reason);
+            let semantic_intent = mcp_immunity_intent(&jsonrpc.method, reason);
+            let decision = PolicyDecision::allow(&assessment);
+            let _ = audit_logger.log(&observation, &semantic_intent, &assessment, &decision);
+            println!(
+                "[mcp_gateway] ALLOW peer={peer_ip} method={} path={} reason={reason} → forwarding to {upstream_addr}",
+                jsonrpc.method, enforcement_path
+            );
+            emit_mcp_decision_explanation(
+                "ALLOW",
+                reason,
+                &peer_ip,
+                &jsonrpc.method,
+                &agent_id,
+                &assessment,
+            );
+
+            match forward_to_upstream(
+                &upstream_addr,
+                &http_req.method,
+                &http_req.path,
+                &http_req.headers,
+                &http_req.body,
+            )
+            .await
+            {
+                Ok((status, status_text, body)) => {
+                    let _ = write_http_response(
+                        &mut stream,
+                        status,
+                        &status_text,
+                        "application/json",
+                        &body,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    eprintln!("[mcp_gateway] upstream error after outside-scope allow: {e}");
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": jsonrpc.id,
+                        "error": { "code": -32603, "message": format!("Upstream error: {e}") }
+                    }))
+                    .unwrap_or_default();
+                    let _ = write_http_response(
+                        &mut stream,
+                        502,
+                        "Bad Gateway",
+                        "application/json",
+                        &body,
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
+    }
 
     // Prune dead processes.
     {
@@ -337,6 +609,14 @@ pub(crate) async fn handle_mcp_connection(
             "[mcp_gateway] DENY peer={peer_ip} method={} risk={:.2} reason={}",
             jsonrpc.method, assessment.fused_risk, decision.reason
         );
+        emit_mcp_decision_explanation(
+            "DENY",
+            &decision.reason,
+            &peer_ip,
+            &jsonrpc.method,
+            &agent_id,
+            &assessment,
+        );
         // Return HTTP 403 with deny signal as JSON body.
         let body = serde_json::to_vec(&serde_json::json!({
             "signal": format!("DENY_{}", decision.reason.to_uppercase()),
@@ -370,6 +650,14 @@ pub(crate) async fn handle_mcp_connection(
             "[mcp_gateway] DENY_BROKER peer={peer_ip} method={} reason={}",
             jsonrpc.method, exec_decision.reason
         );
+        emit_mcp_decision_explanation(
+            "DENY",
+            &exec_decision.reason,
+            &peer_ip,
+            &jsonrpc.method,
+            &agent_id,
+            &assessment,
+        );
         let body = serde_json::to_vec(&serde_json::json!({
             "signal": "DENY_EXECUTION_BROKER",
             "reason": exec_decision.reason,
@@ -385,6 +673,14 @@ pub(crate) async fn handle_mcp_connection(
     println!(
         "[mcp_gateway] ALLOW peer={peer_ip} method={} risk={:.2} → forwarding to {upstream_addr}",
         jsonrpc.method, assessment.fused_risk
+    );
+    emit_mcp_decision_explanation(
+        "ALLOW",
+        &decision.reason,
+        &peer_ip,
+        &jsonrpc.method,
+        &agent_id,
+        &assessment,
     );
 
     // ── Forward to upstream ──────────────────────────────────────────────
@@ -531,17 +827,25 @@ pub(crate) async fn run_mcp_gateway(
                 let secret_clone = Arc::clone(&secret);
 
                 tokio::spawn(async move {
-                    handle_mcp_connection(
-                        stream,
-                        peer_addr,
-                        policy_snapshot,
-                        registry_clone,
-                        logger_clone,
-                        telemetry_clone,
-                        None,           // secret_file — use env var / runtime secret
-                        upstream_clone, // upstream_addr
-                    )
-                    .await;
+                    let worker = tokio::spawn(async move {
+                        handle_mcp_connection(
+                            stream,
+                            peer_addr,
+                            policy_snapshot,
+                            registry_clone,
+                            logger_clone,
+                            telemetry_clone,
+                            secret_clone,
+                            upstream_clone,
+                        )
+                        .await;
+                    });
+
+                    if let Err(err) = worker.await {
+                        eprintln!(
+                            "[mcp_gateway] isolated connection task failure from {peer_addr}: {err}"
+                        );
+                    }
                 });
             }
             Err(e) => eprintln!("[MCP] accept error: {e}"),

@@ -9,16 +9,19 @@
 #![cfg(target_os = "linux")]
 
 pub mod ebpf_monitor;
+pub mod explainability;
 pub mod fleet_policy;
 pub mod governance;
 pub mod mcp_gateway;
+pub mod system_immunity;
 
 use anyhow::Result;
 use clap::Parser;
 use governance::{
     AgentLineage, AuditLogger, CapabilityProfile, ClientProposal, CombinedSemanticService,
-    ConstraintSet, ExecutionBroker, ExecutionRequest, LineageRegistry, ObservationRecord,
-    PolicyDecision, ProposedAction, RiskAssessment, SemanticAnalysisService,
+    ConstraintSet, ExecutionBroker, ExecutionRequest, IntentClass, LineageRegistry,
+    ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment, SemanticAnalysisService,
+    SemanticIntent,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -41,8 +44,10 @@ use tokio::signal::unix::{signal, SignalKind};
 use ts_checker::PolicyEngine;
 use z3::{Config as Z3Config, Context as Z3Context};
 
+use ebpf_monitor::{LsmRequest, Verdict};
+
 #[cfg(feature = "kernel_telemetry")]
-use ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+use ebpf_monitor::{LsmPathResolutionCache, LsmRequestType};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -247,9 +252,7 @@ fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
     }
     // Fall back to env var / kernel keyring-backed runtime secret.
     get_runtime_secret().unwrap_or_else(|_| {
-        eprintln!(
-            "FATAL: No HMAC secret. Use --secret-file or configure the kernel keyring."
-        );
+        eprintln!("FATAL: No HMAC secret. Use --secret-file or configure the kernel keyring.");
         std::process::exit(1);
     })
 }
@@ -327,18 +330,20 @@ fn runtime_policy_denial(
 
 fn execute_broker_action(action: &ProposedAction) -> serde_json::Value {
     match action {
-        ProposedAction::ShellCommand { command } => match Command::new("/bin/sh").arg("-c").arg(command).output() {
-            Ok(output) => serde_json::json!({
-                "executed": output.status.success(),
-                "exit_code": output.status.code(),
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "stderr": String::from_utf8_lossy(&output.stderr),
-            }),
-            Err(err) => serde_json::json!({
-                "executed": false,
-                "error": err.to_string(),
-            }),
-        },
+        ProposedAction::ShellCommand { command } => {
+            match Command::new("/bin/sh").arg("-c").arg(command).output() {
+                Ok(output) => serde_json::json!({
+                    "executed": output.status.success(),
+                    "exit_code": output.status.code(),
+                    "stdout": String::from_utf8_lossy(&output.stdout),
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                }),
+                Err(err) => serde_json::json!({
+                    "executed": false,
+                    "error": err.to_string(),
+                }),
+            }
+        }
         ProposedAction::FileWrite { path, contents } => match fs::write(path, contents) {
             Ok(()) => serde_json::json!({
                 "executed": true,
@@ -395,6 +400,329 @@ pub(crate) fn policy_decision(
         return PolicyDecision::constrain("mid_band_risk_constrained", assessment, constraints);
     }
     PolicyDecision::allow(assessment)
+}
+
+pub(crate) fn is_enforcement_target(path: &str) -> bool {
+    is_path_in_test_scope(path)
+}
+
+pub(crate) fn is_path_in_test_scope(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+
+    if path.starts_with("/usr/")
+        || path.starts_with("/bin/")
+        || path.starts_with("/lib/")
+        || path.starts_with("/etc/")
+    {
+        return false;
+    }
+
+    path.starts_with("/tmp/jinnguard-test/")
+        || path.starts_with("/var/tmp/jinnguard-test/")
+        || home_jinnguard_test_path(path)
+}
+
+fn is_protected_system_path(path: &str) -> bool {
+    let path = path.trim();
+    path.starts_with("/etc/")
+        || path.starts_with("/sys/")
+        || path.starts_with("/proc/")
+        || path.starts_with("/root/")
+        || path.starts_with("/boot/")
+}
+
+fn is_trusted_process(request: &LsmRequest) -> bool {
+    let path = request.process_path.as_deref().unwrap_or("");
+
+    path.starts_with("/usr/bin/cargo")
+        || path.starts_with("/usr/bin/rustc")
+        || path.starts_with("/usr/bin/bash")
+        || path.starts_with("/bin/bash")
+        || path.starts_with("/bin/sh")
+        || path.starts_with("/usr/bin/dash")
+        || path.starts_with("/bin/dash")
+        || path.starts_with("/usr/bin/env")
+        || path.starts_with("/usr/bin/patch")
+        || path.starts_with("/bin/patch")
+}
+
+fn home_jinnguard_test_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/home/") else {
+        return false;
+    };
+    let Some((_user, suffix)) = rest.split_once('/') else {
+        return false;
+    };
+    suffix.starts_with("jinnguard-test/")
+}
+
+pub(crate) fn protected_resource_reference(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+
+    for prefix in ["/etc", "/usr", "/bin", "/lib"] {
+        if value == prefix
+            || value
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return true;
+        }
+    }
+
+    // Catch explicit traversal attempts such as ../../../etc/passwd in broker
+    // proposals without trying to normalize arbitrary shell syntax.
+    value.starts_with("etc/")
+        || value.starts_with("usr/")
+        || value.starts_with("bin/")
+        || value.starts_with("lib/")
+        || value.contains("/etc/")
+        || value.contains("/usr/")
+        || value.contains("/bin/")
+        || value.contains("/lib/")
+}
+
+pub(crate) fn intent_is_dangerous(intent: &str) -> bool {
+    let intent = intent.to_ascii_lowercase();
+    [
+        "write", "delete", "unlink", "remove", "exec", "shell", "command", "spawn", "run",
+        "network", "connect",
+    ]
+    .iter()
+    .any(|needle| intent.contains(needle))
+}
+
+fn proposed_action_references_protected_resource(action: &ProposedAction) -> bool {
+    match action {
+        ProposedAction::FileWrite { path, .. } => protected_resource_reference(path),
+        ProposedAction::ShellCommand { command } => protected_resource_reference(command),
+        ProposedAction::NetworkRequest { url, .. } => protected_resource_reference(url),
+    }
+}
+
+fn json_references_protected_resource(value: &Value) -> bool {
+    match value {
+        Value::String(s) => protected_resource_reference(s),
+        Value::Array(values) => values.iter().any(json_references_protected_resource),
+        Value::Object(map) => map.values().any(json_references_protected_resource),
+        _ => false,
+    }
+}
+
+pub(crate) fn explicit_protected_resource_attack(
+    intent: Option<&str>,
+    proposed_action: Option<&ProposedAction>,
+    raw_payload: Option<&Value>,
+    resource_path: Option<&str>,
+) -> Option<&'static str> {
+    if proposed_action
+        .as_ref()
+        .is_some_and(|action| proposed_action_references_protected_resource(action))
+    {
+        return Some("protected_resource_proposed_action");
+    }
+
+    let dangerous_intent = intent.is_some_and(intent_is_dangerous);
+    let protected_resource = resource_path.is_some_and(protected_resource_reference)
+        || raw_payload.is_some_and(json_references_protected_resource);
+
+    if dangerous_intent && protected_resource {
+        return Some("protected_resource_intent");
+    }
+
+    None
+}
+
+pub(crate) fn requires_intent_aware_enforcement(
+    proposal: &ClientProposal,
+    raw_payload: &Value,
+    risk_floor: f64,
+) -> bool {
+    proposal.proposed_action.is_some()
+        || proposal
+            .intent_name
+            .as_deref()
+            .is_some_and(intent_is_dangerous)
+        || proposal
+            .action_risk_score
+            .is_some_and(|risk| risk >= risk_floor)
+        || json_references_protected_resource(raw_payload)
+}
+
+fn proposal_enforcement_path<'a>(
+    proposal: &'a ClientProposal,
+    raw_payload: &'a Value,
+    observation: &'a ObservationRecord,
+) -> Option<&'a str> {
+    if let Some(action) = proposal.proposed_action.as_ref() {
+        match action {
+            ProposedAction::ShellCommand { command } => {
+                if !command.trim().is_empty() {
+                    return Some(command.as_str());
+                }
+            }
+            ProposedAction::FileWrite { path, .. } => {
+                if !path.trim().is_empty() {
+                    return Some(path.as_str());
+                }
+            }
+            ProposedAction::NetworkRequest { .. } => {}
+        }
+    }
+
+    for key in ["path", "resource", "target", "file_path", "executable"] {
+        if let Some(path) = raw_payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(path);
+        }
+    }
+
+    observation.executable_path.as_deref()
+}
+
+fn outside_scope_assessment(path: &str) -> RiskAssessment {
+    RiskAssessment {
+        observed_risk: 0.0,
+        semantic_risk: 0.0,
+        topology_risk: 0.0,
+        declared_risk: Some(0.0),
+        fused_risk: 0.0,
+        trust_score: 100.0,
+        reasons: vec![format!("outside_enforcement_scope:{path}")],
+    }
+}
+
+fn emit_daemon_decision_explanation(
+    decision: &str,
+    reason: &str,
+    policy_name: &str,
+    source: &str,
+    proposal: Option<&ClientProposal>,
+    agent_id: Option<&str>,
+    assessment: Option<&RiskAssessment>,
+) {
+    explainability::emit_explanation_if_enabled(|| {
+        let mut risk_reasons = assessment
+            .map(|risk| risk.reasons.clone())
+            .unwrap_or_default();
+        risk_reasons.push(reason.to_string());
+
+        explainability::build_explanation(
+            explainability::ExplanationEvent {
+                action_type: explanation_action_type(proposal, reason),
+                resource: explanation_resource(proposal),
+                source: Some(source.to_string()),
+                agent_id: agent_id.map(str::to_string),
+                intent: proposal.and_then(|p| p.intent_name.clone()),
+                decision: decision.to_string(),
+                reason: Some(reason.to_string()),
+                enforcement_layer: "daemon".to_string(),
+            },
+            explainability::ExplanationPolicy {
+                name: policy_name.to_string(),
+            },
+            explainability::ExplanationRiskEval {
+                risk_score: assessment
+                    .map(|risk| risk.fused_risk)
+                    .or_else(|| proposal.and_then(|p| p.action_risk_score))
+                    .unwrap_or(0.0),
+                reasons: risk_reasons,
+            },
+        )
+    });
+}
+
+fn emit_policy_decision_explanation(
+    decision: &PolicyDecision,
+    source: &str,
+    proposal: &ClientProposal,
+    agent_id: Option<&str>,
+    assessment: &RiskAssessment,
+) {
+    let decision_label = if decision.is_allow() {
+        "ALLOW"
+    } else if decision.is_constrain() {
+        "CONSTRAIN"
+    } else {
+        "DENY"
+    };
+
+    emit_daemon_decision_explanation(
+        decision_label,
+        &decision.reason,
+        "runtime_governance",
+        source,
+        Some(proposal),
+        agent_id,
+        Some(assessment),
+    );
+}
+
+fn explanation_action_type(proposal: Option<&ClientProposal>, fallback: &str) -> String {
+    if let Some(action) = proposal.and_then(|p| p.proposed_action.as_ref()) {
+        return match action {
+            ProposedAction::ShellCommand { .. } => "shell_command".to_string(),
+            ProposedAction::FileWrite { .. } => "file_write".to_string(),
+            ProposedAction::NetworkRequest { .. } => "network_request".to_string(),
+        };
+    }
+
+    proposal
+        .and_then(|p| p.intent_name.clone())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn explanation_resource(proposal: Option<&ClientProposal>) -> Option<String> {
+    if let Some(action) = proposal.and_then(|p| p.proposed_action.as_ref()) {
+        return Some(match action {
+            ProposedAction::ShellCommand { command } => command.clone(),
+            ProposedAction::FileWrite { path, .. } => path.clone(),
+            ProposedAction::NetworkRequest { url, .. } => url.clone(),
+        });
+    }
+
+    proposal.and_then(|p| p.intent_name.clone())
+}
+
+#[cfg(feature = "kernel_telemetry")]
+fn emit_lsm_decision_explanation(request: &LsmRequest, verdict: Verdict) {
+    explainability::emit_explanation_if_enabled(|| {
+        let denied = matches!(verdict, Verdict::Deny);
+        let decision = if denied { "DENY" } else { "ALLOW" };
+        let reason = if denied {
+            "kernel_policy_map_deny"
+        } else {
+            "kernel_policy_map_allow"
+        };
+
+        explainability::build_explanation(
+            explainability::ExplanationEvent {
+                action_type: format!("{:?}", request.req_type).to_ascii_lowercase(),
+                resource: Some(request.effective_path().to_string()),
+                source: Some(format!("pid={}", request.pid)),
+                agent_id: None,
+                intent: None,
+                decision: decision.to_string(),
+                reason: Some(reason.to_string()),
+                enforcement_layer: "kernel".to_string(),
+            },
+            explainability::ExplanationPolicy {
+                name: "kernel_lsm_policy".to_string(),
+            },
+            explainability::ExplanationRiskEval {
+                risk_score: if denied { 100.0 } else { 0.0 },
+                reasons: vec![reason.to_string()],
+            },
+        )
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +784,38 @@ async fn deny(stream: &mut tokio::net::UnixStream, signal: &[u8]) {
     let _ = write_framed_response(stream, 1, signal).await;
 }
 
+fn system_immunity_assessment(reason: &str) -> RiskAssessment {
+    RiskAssessment {
+        observed_risk: 0.0,
+        semantic_risk: 0.0,
+        topology_risk: 0.0,
+        declared_risk: Some(0.0),
+        fused_risk: 0.0,
+        trust_score: 100.0,
+        reasons: vec![reason.to_string()],
+    }
+}
+
+fn system_immunity_intent(proposal: &ClientProposal, reason: &str) -> SemanticIntent {
+    let class = match proposal.intent_name.as_deref().unwrap_or_default() {
+        intent if intent.contains("exec") || intent.contains("command") => {
+            IntentClass::ProcessExecution
+        }
+        intent if intent.contains("write") || intent.contains("unlink") => IntentClass::FileWrite,
+        intent if intent.contains("connect") || intent.contains("network") => {
+            IntentClass::NetworkAccess
+        }
+        _ => IntentClass::Unknown,
+    };
+
+    SemanticIntent {
+        class,
+        confidence: 1.0,
+        risk_score: 0.0,
+        signals: vec![reason.to_string()],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lineage check result
 // ---------------------------------------------------------------------------
@@ -478,6 +838,10 @@ async fn handle_client_connection(
         return;
     };
     let observation = ObservationRecord::from_peer(peer.pid, peer.uid, peer.gid);
+    let peer_source = format!(
+        "pid={} uid={} gid={}",
+        observation.pid, observation.uid, observation.gid
+    );
 
     // Drain eBPF events accumulated for this kernel PID.
     let peer_telemetry_events: Vec<KernelTelemetryEvent> = {
@@ -503,12 +867,30 @@ async fn handle_client_connection(
         let version = header[4];
 
         if version != 1 {
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_BAD_VERSION",
+                "protocol_integrity",
+                &peer_source,
+                None,
+                None,
+                None,
+            );
             deny(&mut stream, b"SIGNAL: DENY_BAD_VERSION\n").await;
             return;
         }
 
         // STEP 2: Read payload bytes of declared length.
         if length > 4 * 1024 * 1024 {
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_PAYLOAD_TOO_LARGE",
+                "protocol_integrity",
+                &peer_source,
+                None,
+                None,
+                None,
+            );
             deny(&mut stream, b"SIGNAL: DENY_PAYLOAD_TOO_LARGE\n").await;
             return;
         }
@@ -522,6 +904,15 @@ async fn handle_client_connection(
         let raw_wire_packet = match std::str::from_utf8(&buffer) {
             Ok(s) => s,
             Err(_) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_ENCODING_ERROR",
+                    "protocol_integrity",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
                 deny(&mut stream, b"SIGNAL: DENY_ENCODING_ERROR\n").await;
                 return;
             }
@@ -531,6 +922,15 @@ async fn handle_client_connection(
         let envelope: SignedEnvelope = match serde_json::from_str(raw_wire_packet) {
             Ok(e) => e,
             Err(_) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_MALFORMED_PAYLOAD",
+                    "protocol_integrity",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
                 deny(&mut stream, b"SIGNAL: DENY_MALFORMED_PAYLOAD\n").await;
                 return;
             }
@@ -540,6 +940,15 @@ async fn handle_client_connection(
         let secret = load_secret_from_file(secret_file.as_deref());
         if !verify_envelope(&envelope, &secret) {
             println!("[deny] pid={} HMAC verification failed", observation.pid);
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_TAMPERED_TOKEN",
+                "transport_integrity",
+                &peer_source,
+                None,
+                None,
+                None,
+            );
             deny(&mut stream, b"SIGNAL: DENY_TAMPERED_TOKEN\n").await;
             return;
         }
@@ -548,6 +957,15 @@ async fn handle_client_connection(
         let proposal: ClientProposal = match serde_json::from_str(&envelope.payload) {
             Ok(p) => p,
             Err(_) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_MALFORMED_PAYLOAD",
+                    "runtime_governance",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
                 deny(&mut stream, b"SIGNAL: DENY_MALFORMED_PAYLOAD\n").await;
                 return;
             }
@@ -556,6 +974,15 @@ async fn handle_client_connection(
         let raw_payload_value: Value = match serde_json::from_str(&envelope.payload) {
             Ok(v) => v,
             Err(_) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_MALFORMED_PAYLOAD",
+                    "runtime_governance",
+                    &peer_source,
+                    Some(&proposal),
+                    None,
+                    None,
+                );
                 deny(&mut stream, b"SIGNAL: DENY_MALFORMED_PAYLOAD\n").await;
                 return;
             }
@@ -571,6 +998,46 @@ async fn handle_client_connection(
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
 
+        // System-process immunity and out-of-scope fast-paths are evaluated only
+        // AFTER the full identity/replay/quota gate chain below. Granting an early
+        // ALLOW here would let a replayed, unknown, or over-quota proposal bypass
+        // enforcement merely because the connecting host process or target path
+        // looked benign. The reason is computed now (cheap, borrow-free) and the
+        // ALLOW is emitted post-gates.
+        let immunity_reason = system_immunity::immunity_reason_for_observation(
+            &observation,
+            proposal.proposed_action.as_ref(),
+        );
+
+        let enforcement_path =
+            proposal_enforcement_path(&proposal, &raw_payload_value, &observation);
+        if let Some(reason) = explicit_protected_resource_attack(
+            proposal.intent_name.as_deref(),
+            proposal.proposed_action.as_ref(),
+            Some(&raw_payload_value),
+            enforcement_path,
+        ) {
+            println!(
+                "[deny] pid={} intent-aware protected resource detection reason={}",
+                observation.pid, reason
+            );
+            emit_daemon_decision_explanation(
+                "DENY",
+                reason,
+                "intent_aware_attack_surface",
+                &peer_source,
+                Some(&proposal),
+                agent_id_opt.as_deref(),
+                None,
+            );
+            deny(&mut stream, b"SIGNAL: DENY_VIOLATION\n").await;
+            return;
+        }
+
+        let constrain_floor = current_policy.upper_safety_boundary * 0.40;
+        let force_policy =
+            requires_intent_aware_enforcement(&proposal, &raw_payload_value, constrain_floor);
+
         // STEP 6: Replay detection.
         let agent_key = agent_id_opt
             .clone()
@@ -584,6 +1051,15 @@ async fn handle_client_connection(
                 "[deny] pid={} replay attack detected agent={} seq={}",
                 observation.pid, agent_key, proposal.sequence_counter
             );
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_REPLAY_ATTACK",
+                "runtime_governance",
+                &peer_source,
+                Some(&proposal),
+                Some(&agent_key),
+                None,
+            );
             deny(&mut stream, b"SIGNAL: DENY_REPLAY_ATTACK\n").await;
             return;
         }
@@ -596,6 +1072,15 @@ async fn handle_client_connection(
                 "[deny] pid={} anonymous agent rejected (policy)",
                 observation.pid
             );
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_ANONYMOUS_AGENT_NOT_PERMITTED",
+                "runtime_governance",
+                &peer_source,
+                Some(&proposal),
+                None,
+                None,
+            );
             deny(&mut stream, b"SIGNAL: DENY_ANONYMOUS_AGENT_NOT_PERMITTED\n").await;
             return;
         }
@@ -607,6 +1092,15 @@ async fn handle_client_connection(
         if agent_id_opt.is_some() && matched_agent_node.is_none() {
             if let Some(ref id) = agent_id_opt {
                 println!("[deny] pid={} unknown agent_id={}", observation.pid, id);
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_UNKNOWN_AGENT_ID",
+                    "runtime_governance",
+                    &peer_source,
+                    Some(&proposal),
+                    Some(id),
+                    None,
+                );
                 deny(&mut stream, b"SIGNAL: DENY_UNKNOWN_AGENT_ID\n").await;
                 return;
             }
@@ -623,6 +1117,15 @@ async fn handle_client_connection(
                     println!(
                         "[deny] pid={} intent '{}' not in allowlist",
                         observation.pid, intent
+                    );
+                    emit_daemon_decision_explanation(
+                        "DENY",
+                        "DENY_INTENT_NOT_ALLOWED",
+                        "runtime_governance",
+                        &peer_source,
+                        Some(&proposal),
+                        agent_id_opt.as_deref(),
+                        None,
                     );
                     deny(&mut stream, b"SIGNAL: DENY_INTENT_NOT_ALLOWED\n").await;
                     return;
@@ -646,6 +1149,15 @@ async fn handle_client_connection(
                     "[deny] pid={} forged delegation token rejected",
                     observation.pid
                 );
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_DELEGATION_INVALID",
+                    "runtime_governance",
+                    &peer_source,
+                    Some(&proposal),
+                    agent_id_opt.as_deref(),
+                    None,
+                );
                 deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
                 return;
             }
@@ -653,6 +1165,15 @@ async fn handle_client_connection(
             println!(
                 "[deny] pid={} unsupported delegation token rejected",
                 observation.pid
+            );
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_DELEGATION_UNSUPPORTED",
+                "runtime_governance",
+                &peer_source,
+                Some(&proposal),
+                agent_id_opt.as_deref(),
+                None,
             );
             deny(&mut stream, b"SIGNAL: DENY_DELEGATION_UNSUPPORTED\n").await;
             return;
@@ -668,6 +1189,15 @@ async fn handle_client_connection(
             println!(
                 "[deny] pid={} runtime policy rejected proposal: {}",
                 observation.pid, reason
+            );
+            emit_daemon_decision_explanation(
+                "DENY",
+                &reason,
+                "runtime_governance",
+                &peer_source,
+                Some(&proposal),
+                agent_id_opt.as_deref(),
+                None,
             );
             deny(&mut stream, b"SIGNAL: DENY_RUNTIME_POLICY\n").await;
             return;
@@ -715,9 +1245,69 @@ async fn handle_client_connection(
                         "[deny] pid={} sequence quota exhausted agent={}",
                         observation.pid, agent_key
                     );
+                    emit_daemon_decision_explanation(
+                        "DENY",
+                        "DENY_QUOTA_EXHAUSTED",
+                        "runtime_governance",
+                        &peer_source,
+                        Some(&proposal),
+                        Some(&agent_key),
+                        None,
+                    );
                     deny(&mut stream, b"SIGNAL: DENY_QUOTA_EXHAUSTED\n").await;
                     return;
                 }
+            }
+        }
+
+        // STEP 11.5: Post-gate fast-paths. The proposal has now cleared HMAC,
+        // replay, anonymous/unknown-agent, intent allowlist, delegation, runtime
+        // policy, and quota. Only here is it safe to skip the heavier risk/Z3
+        // evaluation for base-system processes or out-of-enforcement-scope paths.
+        if let Some(reason) = immunity_reason {
+            println!(
+                "[allow] pid={} system-process immunity reason={} (post-gate)",
+                observation.pid, reason
+            );
+            let assessment = system_immunity_assessment(reason);
+            let semantic_intent = system_immunity_intent(&proposal, reason);
+            let decision = PolicyDecision::allow(&assessment);
+            emit_daemon_decision_explanation(
+                "ALLOW",
+                reason,
+                "system_process_immunity",
+                &peer_source,
+                Some(&proposal),
+                agent_id_opt.as_deref(),
+                Some(&assessment),
+            );
+            let _ = write_framed_response(&mut stream, 1, b"SIGNAL: ALLOW\n").await;
+            let _ = audit_logger.log(&observation, &semantic_intent, &assessment, &decision);
+            continue;
+        }
+
+        if let Some(enforcement_path) = enforcement_path {
+            if !is_enforcement_target(enforcement_path) && !force_policy {
+                println!(
+                    "[allow] pid={} outside enforcement scope path={} (post-gate)",
+                    observation.pid, enforcement_path
+                );
+                let assessment = outside_scope_assessment(enforcement_path);
+                let semantic_intent =
+                    system_immunity_intent(&proposal, "outside_enforcement_scope");
+                let decision = PolicyDecision::allow(&assessment);
+                emit_daemon_decision_explanation(
+                    "ALLOW",
+                    "outside_enforcement_scope",
+                    "enforcement_scope",
+                    &peer_source,
+                    Some(&proposal),
+                    agent_id_opt.as_deref(),
+                    Some(&assessment),
+                );
+                let _ = write_framed_response(&mut stream, 1, b"SIGNAL: ALLOW\n").await;
+                let _ = audit_logger.log(&observation, &semantic_intent, &assessment, &decision);
+                continue;
             }
         }
 
@@ -762,6 +1352,13 @@ async fn handle_client_connection(
                 observation.pid, err
             );
             let invariant_decision = PolicyDecision::deny("policy_invariant_violated", &assessment);
+            emit_policy_decision_explanation(
+                &invariant_decision,
+                &peer_source,
+                &proposal,
+                agent_id_opt.as_deref(),
+                &assessment,
+            );
             let _ = write_framed_response(&mut stream, 1, b"SIGNAL: DENY_VIOLATION\n").await;
             {
                 let mut reg = registry_store.lock().unwrap();
@@ -787,6 +1384,13 @@ async fn handle_client_connection(
         let mut decision = policy_decision(&assessment, &current_policy);
         if assessment.fused_risk > current_policy.upper_safety_boundary {
             decision = PolicyDecision::deny("risk_ceiling_exceeded", &assessment);
+            emit_policy_decision_explanation(
+                &decision,
+                &peer_source,
+                &proposal,
+                agent_id_opt.as_deref(),
+                &assessment,
+            );
             let _ = write_framed_response(&mut stream, 1, b"SIGNAL: DENY_RISK_CEILING_EXCEEDED\n")
                 .await;
             {
@@ -808,6 +1412,13 @@ async fn handle_client_connection(
             println!(
                 "[deny] pid={} reason={} risk={:.2} trust={:.2}",
                 observation.pid, decision.reason, decision.risk_score, decision.trust_score
+            );
+            emit_policy_decision_explanation(
+                &decision,
+                &peer_source,
+                &proposal,
+                agent_id_opt.as_deref(),
+                &assessment,
             );
             let _ = write_framed_response(&mut stream, 1, b"SIGNAL: DENY_VIOLATION\n").await;
             {
@@ -848,6 +1459,13 @@ async fn handle_client_connection(
             );
             let _ = write_framed_response(&mut stream, 1, b"SIGNAL: DENY_VIOLATION\n").await;
             let deny_decision = PolicyDecision::deny(execution_decision.reason, &assessment);
+            emit_policy_decision_explanation(
+                &deny_decision,
+                &peer_source,
+                &proposal,
+                agent_id_opt.as_deref(),
+                &assessment,
+            );
             {
                 let mut reg = registry_store.lock().unwrap();
                 update_lineage_after_decision(
@@ -863,9 +1481,7 @@ async fn handle_client_connection(
             return;
         }
 
-        let broker_result = if current_policy
-            .runtime_policy
-            .require_brokered_execution
+        let broker_result = if current_policy.runtime_policy.require_brokered_execution
             && execute_requested
             && proposal.proposed_action.is_some()
         {
@@ -892,6 +1508,13 @@ async fn handle_client_connection(
             "SIGNAL: ALLOW\n".to_string()
         };
         let _ = write_framed_response(&mut stream, 1, response.as_bytes()).await;
+        emit_policy_decision_explanation(
+            &decision,
+            &peer_source,
+            &proposal,
+            agent_id_opt.as_deref(),
+            &assessment,
+        );
 
         // STEP 15: Update lineage decisions_seen and state.
         {
@@ -1004,12 +1627,19 @@ fn verify_z3_policy_invariants(
 // ---------------------------------------------------------------------------
 
 fn env_flag_enabled(name: &str) -> bool {
+    env_flag_value(name).unwrap_or(false)
+}
+
+fn env_flag_value(name: &str) -> Option<bool> {
     std::env::var(name)
         .map(|value| {
             let value = value.trim();
-            value == "1" || value.eq_ignore_ascii_case("true")
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
         })
-        .unwrap_or(false)
+        .ok()
 }
 
 fn enterprise_kernel_telemetry_required() -> bool {
@@ -1017,20 +1647,17 @@ fn enterprise_kernel_telemetry_required() -> bool {
 }
 
 fn jinnguard_safe_mode_enabled() -> bool {
-    env_flag_enabled("JINNGUARD_SAFE_MODE")
+    env_flag_value("JINNGUARD_SAFE_MODE").unwrap_or_else(|| {
+        if enterprise_kernel_telemetry_required() {
+            false
+        } else {
+            eprintln!(
+                "[startup] JINNGUARD_SAFE_MODE unset; local development default is audit-only"
+            );
+            true
+        }
+    })
 }
-
-#[cfg(feature = "kernel_telemetry")]
-const BOOTSTRAP_ALLOWED_EXECUTABLES: &[&str] = &[
-    "/usr/bin/sudo",
-    "/usr/bin/systemctl",
-    "/usr/bin/journalctl",
-    "/usr/bin/bash",
-    "/bin/bash",
-    "/usr/bin/env",
-    "/usr/bin/clear",
-    "/usr/bin/sleep",
-];
 
 #[cfg(feature = "kernel_telemetry")]
 fn start_lsm_verdict_loop(
@@ -1055,9 +1682,11 @@ fn start_lsm_verdict_loop(
     };
 
     let policy_snapshot = active_policy.lock().unwrap().clone();
-    monitor.configure_policy(&policy_snapshot, safe_mode).map_err(|err| {
-        anyhow::anyhow!("fail-closed: failed to configure in-kernel LSM policy maps: {err}")
-    })?;
+    monitor
+        .configure_policy(&policy_snapshot, safe_mode)
+        .map_err(|err| {
+            anyhow::anyhow!("fail-closed: failed to configure in-kernel LSM policy maps: {err}")
+        })?;
 
     thread::Builder::new()
         .name("jinn-lsm-verdict-loop".to_string())
@@ -1087,6 +1716,7 @@ fn run_lsm_verdict_loop(
     telemetry_store: TelemetryStore,
     safe_mode: bool,
 ) {
+    let path_cache = LsmPathResolutionCache::new();
     loop {
         let requests = match monitor.poll_requests() {
             Ok(requests) => requests,
@@ -1102,10 +1732,12 @@ fn run_lsm_verdict_loop(
             continue;
         }
 
-        for request in requests {
+        for mut request in requests {
+            path_cache.resolve_request(&mut request);
             let policy_snapshot = active_policy.lock().unwrap().clone();
             let verdict = lsm_policy_verdict(&request, &policy_snapshot, safe_mode);
             let denied = matches!(verdict, Verdict::Deny);
+            emit_lsm_decision_explanation(&request, verdict);
 
             {
                 let mut store = telemetry_store.lock().unwrap();
@@ -1130,13 +1762,39 @@ fn run_lsm_verdict_loop(
 }
 
 #[cfg(feature = "kernel_telemetry")]
-fn lsm_policy_verdict(
-    request: &LsmRequest,
-    policy: &PolicyConfig,
-    safe_mode: bool,
-) -> Verdict {
+fn lsm_policy_verdict(request: &LsmRequest, policy: &PolicyConfig, safe_mode: bool) -> Verdict {
+    let origin_verdict = if safe_mode {
+        None
+    } else {
+        lsm_origin_gate_verdict(request)
+    };
+    let observation =
+        explainability::observe_lsm_request(request, safe_mode || origin_verdict.is_none());
+
     if safe_mode {
         return Verdict::Allow;
+    }
+
+    if let Some(verdict) = origin_verdict {
+        return verdict;
+    }
+
+    if observation.trust.0 < 0.5 {
+        println!(
+            "[JINNGUARD LOW TRUST] pid={} trust={}",
+            request.pid, observation.trust.0
+        );
+    }
+
+    if observation.risk == explainability::IntentRiskLevel::High {
+        println!(
+            "[JINNGUARD INTENT RISK] pid={} risk={:?} pattern={:?}",
+            request.pid, observation.risk, observation.pattern
+        );
+    }
+
+    if let Some(verdict) = lsm_intent_response_verdict(request, &observation.risk) {
+        return verdict;
     }
 
     match request.req_type {
@@ -1144,17 +1802,61 @@ fn lsm_policy_verdict(
             lsm_network_verdict(request, &policy.network_policy)
         }
         LsmRequestType::Execve => lsm_exec_verdict(request, policy),
-        LsmRequestType::InodeCreate => {
-            lsm_path_denylist_verdict(request.effective_path(), policy, |node| {
-                &node.denied_write_paths
-            })
-        }
-        LsmRequestType::InodeUnlink => {
-            lsm_path_denylist_verdict(request.effective_path(), policy, |node| {
-                &node.denied_unlink_paths
-            })
-        }
+        LsmRequestType::InodeCreate => lsm_path_denylist_verdict(
+            request,
+            policy,
+            explainability::DenyReason::WriteNotAllowed,
+            |node| &node.denied_write_paths,
+        ),
+        LsmRequestType::InodeUnlink => lsm_path_denylist_verdict(
+            request,
+            policy,
+            explainability::DenyReason::WriteNotAllowed,
+            |node| &node.denied_unlink_paths,
+        ),
     }
+}
+
+fn lsm_origin_gate_verdict(request: &LsmRequest) -> Option<Verdict> {
+    let resource_path = request.effective_path();
+
+    if is_protected_system_path(resource_path) {
+        return Some(explainability::explain_deny(
+            request,
+            explainability::DenyReason::ProtectedSystemPath,
+        ));
+    }
+
+    if is_trusted_process(request) {
+        return Some(Verdict::Allow);
+    }
+
+    if request.is_interactive {
+        return Some(Verdict::Allow);
+    }
+
+    if !is_path_in_test_scope(resource_path) {
+        return Some(Verdict::Allow);
+    }
+
+    None
+}
+
+fn lsm_intent_response_verdict(
+    request: &LsmRequest,
+    risk: &explainability::IntentRiskLevel,
+) -> Option<Verdict> {
+    if *risk == explainability::IntentRiskLevel::High
+        && is_path_in_test_scope(request.effective_path())
+        && explainability::is_agent_escalated(&explainability::compute_agent_identity(request))
+    {
+        return Some(explainability::explain_deny(
+            request,
+            explainability::DenyReason::PolicyViolation,
+        ));
+    }
+
+    None
 }
 
 #[cfg(feature = "kernel_telemetry")]
@@ -1167,17 +1869,20 @@ fn lsm_network_verdict(request: &LsmRequest, policy: &NetworkPolicy) -> Verdict 
                 .iter()
                 .any(|allowed| resource.starts_with(allowed))
         {
-            return Verdict::Deny;
+            return explainability::explain_deny(
+                request,
+                explainability::DenyReason::PolicyViolation,
+            );
         }
         return Verdict::Allow;
     }
 
     let resource_ip = network_resource_ip(resource);
     if matches_network_entry(resource, resource_ip, &policy.denied_ips) {
-        return Verdict::Deny;
+        return explainability::explain_deny(request, explainability::DenyReason::PolicyViolation);
     }
     if policy.default_deny && !matches_network_entry(resource, resource_ip, &policy.allowed_ips) {
-        return Verdict::Deny;
+        return explainability::explain_deny(request, explainability::DenyReason::PolicyViolation);
     }
     Verdict::Allow
 }
@@ -1205,13 +1910,13 @@ fn matches_network_entry(resource: &str, ip: &str, entries: &[String]) -> bool {
     })
 }
 
-#[cfg(feature = "kernel_telemetry")]
 fn lsm_exec_verdict(request: &LsmRequest, policy: &PolicyConfig) -> Verdict {
     let path = request.effective_path();
-    if BOOTSTRAP_ALLOWED_EXECUTABLES
-        .iter()
-        .any(|allowed| path == *allowed)
-    {
+    if let Some(verdict) = lsm_origin_gate_verdict(request) {
+        return verdict;
+    }
+
+    if system_immunity::path_is_immune(path) {
         return Verdict::Allow;
     }
 
@@ -1225,32 +1930,813 @@ fn lsm_exec_verdict(request: &LsmRequest, policy: &PolicyConfig) -> Verdict {
             .values()
             .any(|node| path_matches_any(path, &node.allowed_executables))
     {
-        return Verdict::Deny;
+        return explainability::explain_deny(request, explainability::DenyReason::PolicyViolation);
     }
     Verdict::Allow
 }
 
 #[cfg(feature = "kernel_telemetry")]
-fn lsm_path_denylist_verdict<F>(path: &str, policy: &PolicyConfig, denylist: F) -> Verdict
+fn lsm_path_denylist_verdict<F>(
+    request: &LsmRequest,
+    policy: &PolicyConfig,
+    reason: explainability::DenyReason,
+    denylist: F,
+) -> Verdict
 where
     F: Fn(&AgentNodePolicy) -> &Vec<String>,
 {
+    let path = request.effective_path();
     if policy
         .agent_nodes
         .values()
         .any(|node| path_matches_any(path, denylist(node)))
     {
-        return Verdict::Deny;
+        return explainability::explain_deny(request, reason);
     }
     Verdict::Allow
 }
 
-#[cfg(feature = "kernel_telemetry")]
 fn path_matches_any(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         let pattern = pattern.trim();
         !pattern.is_empty() && (path == pattern || path.starts_with(pattern.trim_end_matches('/')))
     })
+}
+
+#[cfg(test)]
+mod enforcement_scope_tests {
+    use super::{
+        explicit_protected_resource_attack, intent_is_dangerous, is_enforcement_target,
+        is_path_in_test_scope, lsm_exec_verdict, protected_resource_reference,
+        requires_intent_aware_enforcement, AgentNodePolicy, ClientProposal, NetworkPolicy,
+        PolicyConfig, ProposedAction, RuntimePolicy,
+    };
+    use crate::ebpf_monitor::{
+        current_time_ms, normalize_lsm_resource_path, LsmPathResolutionCache, LsmRequest,
+        LsmRequestType, Verdict,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn enforces_only_controlled_local_regions() {
+        assert!(is_enforcement_target("/tmp/jinnguard-test/attack"));
+        assert!(is_enforcement_target("/var/tmp/jinnguard-test/attack"));
+        assert!(is_enforcement_target("/home/alice/jinnguard-test/attack"));
+
+        assert!(!is_enforcement_target("/home/alice/.com.google.Chrome.tmp"));
+        assert!(!is_enforcement_target("/home/alice/.bashrc"));
+        assert!(!is_enforcement_target(
+            "/home/alice/projects/topology-s/file"
+        ));
+        assert!(!is_enforcement_target("/usr/bin/clear"));
+        assert!(!is_enforcement_target("/bin/bash"));
+        assert!(!is_enforcement_target("/lib/systemd/systemd"));
+        assert!(!is_enforcement_target("/etc/passwd"));
+        assert!(!is_enforcement_target("relative/path"));
+        assert!(!is_enforcement_target(""));
+        assert_eq!(
+            is_enforcement_target("/tmp/jinnguard-test/attack"),
+            is_path_in_test_scope("/tmp/jinnguard-test/attack")
+        );
+    }
+
+    #[test]
+    fn detects_explicit_protected_resource_attacks() {
+        let action = ProposedAction::FileWrite {
+            path: "/etc/passwd".to_string(),
+            contents: "evil".to_string(),
+        };
+        assert_eq!(
+            explicit_protected_resource_attack(
+                Some("write_file"),
+                Some(&action),
+                None,
+                Some("/etc/passwd")
+            ),
+            Some("protected_resource_proposed_action")
+        );
+
+        let traversal = json!({
+            "path": "../../../etc/passwd",
+            "content": "evil"
+        });
+        assert_eq!(
+            explicit_protected_resource_attack(
+                Some("write_file"),
+                None,
+                Some(&traversal),
+                Some("../../../etc/passwd")
+            ),
+            Some("protected_resource_intent")
+        );
+    }
+
+    #[test]
+    fn classifies_scope_and_intent_without_broad_home_enforcement() {
+        assert!(protected_resource_reference("/etc/shadow"));
+        assert!(protected_resource_reference("../../../etc/passwd"));
+        assert!(!protected_resource_reference(
+            "/home/alice/projects/topology-s/file"
+        ));
+        assert!(intent_is_dangerous("execute_shell"));
+        assert!(intent_is_dangerous("write_file"));
+        assert!(!intent_is_dangerous("read_file"));
+
+        let proposal = ClientProposal {
+            sequence_counter: 1,
+            intent_name: Some("execute_shell".to_string()),
+            action_risk_score: Some(5.0),
+            session_privilege_bit: None,
+            prompt: None,
+            plan: None,
+            source_code: None,
+            requested_capabilities: vec![],
+            proposed_action: None,
+            context_vars: HashMap::new(),
+        };
+        assert!(requires_intent_aware_enforcement(
+            &proposal,
+            &json!({}),
+            40.0
+        ));
+    }
+
+    #[test]
+    fn normalizes_lsm_resource_paths_without_panics() {
+        assert_eq!(
+            normalize_lsm_resource_path(std::process::id(), "/tmp/jinnguard-test/example"),
+            "/tmp/jinnguard-test/example"
+        );
+        assert_eq!(normalize_lsm_resource_path(std::process::id(), ""), "");
+
+        let basename = "jinnguard-normalize-basename-only";
+        let normalized = normalize_lsm_resource_path(std::process::id(), basename);
+        assert!(
+            normalized.ends_with(basename),
+            "basename normalization should preserve leaf name, got {normalized}"
+        );
+    }
+
+    #[test]
+    fn normalized_paths_drive_scope_classification() {
+        let scoped = normalize_lsm_resource_path(std::process::id(), "/tmp/jinnguard-test/example");
+        assert!(is_enforcement_target(&scoped));
+
+        let home_noise = "/home/alice/.com.google.Chrome.tmp";
+        assert!(!is_enforcement_target(&normalize_lsm_resource_path(
+            std::process::id(),
+            home_noise
+        )));
+        assert!(!is_enforcement_target("/home/alice/file"));
+        assert!(!is_enforcement_target("/home/alice/jinnguard-test"));
+        assert!(is_enforcement_target("/home/alice/jinnguard-test/file"));
+    }
+
+    fn test_lsm_request(req_type: LsmRequestType, resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid: std::process::id(),
+            req_type,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: None,
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    fn exec_policy(allowed_executables: Vec<&str>) -> PolicyConfig {
+        let node = AgentNodePolicy {
+            id: "scope-test-agent".to_string(),
+            privilege_tier: 1,
+            max_sequence_quota: 0,
+            allowed_intents: vec![],
+            allowed_executables: allowed_executables
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            denied_write_paths: vec![],
+            denied_unlink_paths: vec![],
+            denied_dns_domains: vec![],
+            invariants: vec![],
+        };
+        let mut agent_nodes = HashMap::new();
+        agent_nodes.insert(node.id.clone(), node);
+
+        PolicyConfig {
+            upper_safety_boundary: 90.0,
+            minimum_trust_score: 0.0,
+            agent_nodes,
+            deny_anonymous_agents: false,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+        }
+    }
+
+    #[test]
+    fn exec_outside_test_scope_always_allows_desktop_helpers() {
+        let policy = exec_policy(vec!["/tmp/jinnguard-test/allowed"]);
+
+        for path in ["/usr/bin/exo-open", "/bin/sh", "/opt/non-test-zone/tool"] {
+            let request = test_lsm_request(LsmRequestType::Execve, path);
+            assert!(
+                matches!(lsm_exec_verdict(&request, &policy), Verdict::Allow),
+                "exec outside explicit test zones must allow {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_inside_test_scope_remains_policy_enforceable() {
+        let policy = exec_policy(vec!["/tmp/jinnguard-test/allowed"]);
+
+        let denied = test_lsm_request(LsmRequestType::Execve, "/tmp/jinnguard-test/blocked");
+        assert!(
+            matches!(lsm_exec_verdict(&denied, &policy), Verdict::Deny),
+            "test-zone exec missing from allowlist should remain deny-capable"
+        );
+
+        let allowed = test_lsm_request(LsmRequestType::Execve, "/tmp/jinnguard-test/allowed");
+        assert!(
+            matches!(lsm_exec_verdict(&allowed, &policy), Verdict::Allow),
+            "test-zone exec on allowlist should be allowed"
+        );
+    }
+
+    #[test]
+    fn lsm_path_cache_stores_scoped_create_path() {
+        let cache = LsmPathResolutionCache::new();
+        let mut request = test_lsm_request(
+            LsmRequestType::InodeCreate,
+            "/tmp/jinnguard-test/cache-create",
+        );
+
+        cache.resolve_request(&mut request);
+
+        assert_eq!(
+            cache.resolve("cache-create").as_deref(),
+            Some("/tmp/jinnguard-test/cache-create")
+        );
+        assert_eq!(request.effective_path(), "/tmp/jinnguard-test/cache-create");
+    }
+
+    #[test]
+    fn lsm_path_cache_resolves_basename_unlink_to_scoped_path() {
+        let cache = LsmPathResolutionCache::new();
+        cache.cache_if_scoped("cache-unlink", "/tmp/jinnguard-test/cache-unlink");
+        let mut request = test_lsm_request(LsmRequestType::InodeUnlink, "cache-unlink");
+
+        cache.resolve_request(&mut request);
+
+        assert_eq!(request.effective_path(), "/tmp/jinnguard-test/cache-unlink");
+        assert!(is_enforcement_target(request.effective_path()));
+    }
+
+    #[test]
+    fn lsm_path_cache_ignores_normal_home_path() {
+        let cache = LsmPathResolutionCache::new();
+        cache.cache_if_scoped("desktop-noise", "/home/alice/.com.google.Chrome.tmp");
+
+        assert!(cache.resolve("desktop-noise").is_none());
+    }
+
+    #[test]
+    fn lsm_path_cache_ignores_expired_entry() {
+        let cache = LsmPathResolutionCache::new();
+        let old = current_time_ms().saturating_sub(31_000);
+        cache.insert_for_test("expired", "/tmp/jinnguard-test/expired", old);
+
+        assert!(cache.resolve("expired").is_none());
+    }
+
+    #[test]
+    fn lsm_path_cache_miss_does_not_fabricate_protected_path() {
+        let cache = LsmPathResolutionCache::new();
+        let mut request = test_lsm_request(LsmRequestType::InodeUnlink, "missing-cache-entry");
+
+        cache.resolve_request(&mut request);
+
+        assert!(request.effective_path().ends_with("missing-cache-entry"));
+        assert!(!request.effective_path().starts_with("/etc/"));
+        assert!(!request.effective_path().starts_with("/usr/"));
+        assert!(!request.effective_path().starts_with("/bin/"));
+        assert!(!request.effective_path().starts_with("/lib/"));
+    }
+}
+
+#[cfg(test)]
+mod origin_enforcement_tests {
+    use super::{
+        is_protected_system_path, is_trusted_process, lsm_exec_verdict, lsm_origin_gate_verdict,
+        AgentNodePolicy, NetworkPolicy, PolicyConfig, RuntimePolicy,
+    };
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+    use std::collections::HashMap;
+
+    fn test_lsm_request(resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid: std::process::id(),
+            req_type: LsmRequestType::Execve,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: Some("/opt/jinn-agent/runner".to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    fn exec_policy(allowed_executables: Vec<&str>) -> PolicyConfig {
+        let node = AgentNodePolicy {
+            id: "origin-test-agent".to_string(),
+            privilege_tier: 1,
+            max_sequence_quota: 0,
+            allowed_intents: vec![],
+            allowed_executables: allowed_executables
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            denied_write_paths: vec![],
+            denied_unlink_paths: vec![],
+            denied_dns_domains: vec![],
+            invariants: vec![],
+        };
+        let mut agent_nodes = HashMap::new();
+        agent_nodes.insert(node.id.clone(), node);
+
+        PolicyConfig {
+            upper_safety_boundary: 90.0,
+            minimum_trust_score: 0.0,
+            agent_nodes,
+            deny_anonymous_agents: false,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+        }
+    }
+
+    #[test]
+    fn interactive_process_allows_before_test_zone_policy() {
+        let policy = exec_policy(vec!["/tmp/jinnguard-test/allowed"]);
+        let mut request = test_lsm_request("/tmp/jinnguard-test/blocked");
+        request.tty = Some("pts/0".to_string());
+        request.is_interactive = request.tty.is_some();
+
+        assert!(matches!(
+            lsm_origin_gate_verdict(&request),
+            Some(Verdict::Allow)
+        ));
+        assert!(matches!(
+            lsm_exec_verdict(&request, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn trusted_toolchain_process_allows_before_test_zone_policy() {
+        let policy = exec_policy(vec!["/tmp/jinnguard-test/allowed"]);
+        let mut request = test_lsm_request("/tmp/jinnguard-test/blocked");
+        request.process_path = Some("/usr/bin/cargo".to_string());
+
+        assert!(is_trusted_process(&request));
+        assert!(matches!(
+            lsm_origin_gate_verdict(&request),
+            Some(Verdict::Allow)
+        ));
+        assert!(matches!(
+            lsm_exec_verdict(&request, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn non_interactive_unknown_process_inside_test_scope_remains_enforceable() {
+        let policy = exec_policy(vec!["/tmp/jinnguard-test/allowed"]);
+        let request = test_lsm_request("/tmp/jinnguard-test/blocked");
+
+        assert!(lsm_origin_gate_verdict(&request).is_none());
+        assert!(matches!(lsm_exec_verdict(&request, &policy), Verdict::Deny));
+    }
+
+    #[test]
+    fn protected_system_path_overrides_interactive_and_trusted_allow() {
+        let policy = exec_policy(vec!["/etc/shadow"]);
+        let mut request = test_lsm_request("/etc/shadow");
+        request.tty = Some("pts/0".to_string());
+        request.is_interactive = request.tty.is_some();
+        request.process_path = Some("/usr/bin/cargo".to_string());
+
+        assert!(is_protected_system_path(request.effective_path()));
+        assert!(matches!(
+            lsm_origin_gate_verdict(&request),
+            Some(Verdict::Deny)
+        ));
+        assert!(matches!(lsm_exec_verdict(&request, &policy), Verdict::Deny));
+    }
+}
+
+#[cfg(test)]
+mod intent_enforcement_tests {
+    use super::{lsm_intent_response_verdict, lsm_origin_gate_verdict};
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+    use crate::explainability::{
+        classify_intent, clear_intent_tracking_for_test, intent_tracking_test_guard, record_intent,
+        IntentRiskLevel,
+    };
+
+    fn test_lsm_request(pid: u32, req_type: LsmRequestType, resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid,
+            req_type,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: Some("/opt/jinn-agent/runner".to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    fn final_gate_verdict(request: &LsmRequest, risk: &IntentRiskLevel) -> Verdict {
+        if let Some(verdict) = lsm_origin_gate_verdict(request) {
+            return verdict;
+        }
+        if let Some(verdict) = lsm_intent_response_verdict(request, risk) {
+            return verdict;
+        }
+        Verdict::Allow
+    }
+
+    fn drive_high_risk_sequence(pid: u32, final_resource: &str) -> (LsmRequest, IntentRiskLevel) {
+        clear_intent_tracking_for_test();
+        let exec = test_lsm_request(pid, LsmRequestType::Execve, "/tmp/jinnguard-test/tool");
+        let write = test_lsm_request(pid, LsmRequestType::InodeCreate, "/tmp/jinnguard-test/file");
+        let network = test_lsm_request(pid, LsmRequestType::Connect, final_resource);
+
+        let _ = record_intent(&exec, classify_intent(&exec));
+        let _ = record_intent(&write, classify_intent(&write));
+        let (_pattern, risk) = record_intent(&network, classify_intent(&network));
+
+        (network, risk)
+    }
+
+    #[test]
+    fn single_high_risk_sequence_inside_test_scope_logs_without_deny() {
+        let _guard = intent_tracking_test_guard();
+        let (request, risk) = drive_high_risk_sequence(800_001, "/tmp/jinnguard-test/exfil");
+
+        assert_eq!(risk, IntentRiskLevel::High);
+        assert!(matches!(lsm_intent_response_verdict(&request, &risk), None));
+        assert!(matches!(
+            final_gate_verdict(&request, &risk),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn high_risk_sequence_interactive_still_allows() {
+        let _guard = intent_tracking_test_guard();
+        let (mut request, risk) = drive_high_risk_sequence(800_002, "/tmp/jinnguard-test/exfil");
+        request.tty = Some("pts/0".to_string());
+        request.is_interactive = request.tty.is_some();
+
+        assert_eq!(risk, IntentRiskLevel::High);
+        assert!(matches!(
+            final_gate_verdict(&request, &risk),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn high_risk_sequence_outside_test_scope_still_allows() {
+        let _guard = intent_tracking_test_guard();
+        let (request, risk) = drive_high_risk_sequence(800_003, "/opt/outside/exfil");
+
+        assert_eq!(risk, IntentRiskLevel::High);
+        assert!(matches!(
+            final_gate_verdict(&request, &risk),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn high_risk_sequence_from_trusted_toolchain_still_allows() {
+        let _guard = intent_tracking_test_guard();
+        let (mut request, risk) = drive_high_risk_sequence(800_004, "/tmp/jinnguard-test/exfil");
+        request.process_path = Some("/usr/bin/cargo".to_string());
+
+        assert_eq!(risk, IntentRiskLevel::High);
+        assert!(matches!(
+            final_gate_verdict(&request, &risk),
+            Verdict::Allow
+        ));
+    }
+}
+
+#[cfg(test)]
+mod escalation_tests {
+    use super::{lsm_intent_response_verdict, lsm_origin_gate_verdict};
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+    use crate::explainability::{
+        classify_intent, clear_intent_tracking_for_test, intent_tracking_test_guard, is_escalated,
+        record_intent,
+    };
+
+    fn test_lsm_request(pid: u32, req_type: LsmRequestType, resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid,
+            req_type,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: Some("/opt/jinn-agent/runner".to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    fn evaluate_like_policy(request: &LsmRequest) -> Verdict {
+        if let Some(verdict) = lsm_origin_gate_verdict(request) {
+            return verdict;
+        }
+
+        let (_pattern, risk) = record_intent(request, classify_intent(request));
+        if let Some(verdict) = lsm_intent_response_verdict(request, &risk) {
+            return verdict;
+        }
+
+        Verdict::Allow
+    }
+
+    fn run_high_risk_sequence(
+        pid: u32,
+        final_resource: &str,
+        interactive: bool,
+        process_path: &str,
+    ) -> Verdict {
+        let events = [
+            (LsmRequestType::Execve, "/tmp/jinnguard-test/tool"),
+            (LsmRequestType::InodeCreate, "/tmp/jinnguard-test/file"),
+            (LsmRequestType::Connect, final_resource),
+        ];
+
+        let mut verdict = Verdict::Allow;
+        for (req_type, resource) in events {
+            let mut request = test_lsm_request(pid, req_type, resource);
+            request.tty = interactive.then(|| "pts/0".to_string());
+            request.is_interactive = request.tty.is_some();
+            request.process_path = Some(process_path.to_string());
+            verdict = evaluate_like_policy(&request);
+        }
+
+        verdict
+    }
+
+    #[test]
+    fn single_high_risk_event_logs_without_deny() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let pid = 810_001;
+
+        let verdict = run_high_risk_sequence(
+            pid,
+            "/tmp/jinnguard-test/exfil",
+            false,
+            "/opt/jinn-agent/runner",
+        );
+
+        assert!(matches!(verdict, Verdict::Allow));
+        assert!(!is_escalated(pid));
+    }
+
+    #[test]
+    fn three_repeated_high_risk_events_escalate_to_deny() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let pid = 810_002;
+        let mut verdict = Verdict::Allow;
+
+        for _ in 0..3 {
+            verdict = run_high_risk_sequence(
+                pid,
+                "/tmp/jinnguard-test/exfil",
+                false,
+                "/opt/jinn-agent/runner",
+            );
+        }
+
+        assert!(is_escalated(pid));
+        assert!(matches!(verdict, Verdict::Deny));
+    }
+
+    #[test]
+    fn repeated_interactive_behavior_never_escalates() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let pid = 810_003;
+
+        for _ in 0..5 {
+            let verdict = run_high_risk_sequence(
+                pid,
+                "/tmp/jinnguard-test/exfil",
+                true,
+                "/opt/jinn-agent/runner",
+            );
+            assert!(matches!(verdict, Verdict::Allow));
+        }
+
+        assert!(!is_escalated(pid));
+    }
+
+    #[test]
+    fn repeated_trusted_toolchain_behavior_never_escalates() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let pid = 810_004;
+
+        for _ in 0..5 {
+            let verdict =
+                run_high_risk_sequence(pid, "/tmp/jinnguard-test/exfil", false, "/usr/bin/cargo");
+            assert!(matches!(verdict, Verdict::Allow));
+        }
+
+        assert!(!is_escalated(pid));
+    }
+
+    #[test]
+    fn repeated_outside_scope_behavior_never_escalates() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let pid = 810_005;
+
+        for _ in 0..5 {
+            let verdict =
+                run_high_risk_sequence(pid, "/opt/outside/exfil", false, "/opt/jinn-agent/runner");
+            assert!(matches!(verdict, Verdict::Allow));
+        }
+
+        assert!(!is_escalated(pid));
+    }
+}
+
+#[cfg(test)]
+mod identity_tracking_tests {
+    use super::{lsm_intent_response_verdict, lsm_origin_gate_verdict};
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+    use crate::explainability::{
+        classify_intent, clear_intent_tracking_for_test, compute_agent_identity,
+        intent_tracking_test_guard, is_agent_escalated, record_intent,
+    };
+
+    fn test_lsm_request(
+        pid: u32,
+        req_type: LsmRequestType,
+        resource: &str,
+        process_path: &str,
+    ) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid,
+            req_type,
+            source_program: 0,
+            family: 0,
+            tty: None,
+            is_interactive: false,
+            process_path: Some(process_path.to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    fn evaluate_like_policy(request: &LsmRequest) -> Verdict {
+        if let Some(verdict) = lsm_origin_gate_verdict(request) {
+            return verdict;
+        }
+
+        let (_pattern, risk) = record_intent(request, classify_intent(request));
+        if let Some(verdict) = lsm_intent_response_verdict(request, &risk) {
+            return verdict;
+        }
+
+        Verdict::Allow
+    }
+
+    fn run_high_risk_sequence(pid: u32, process_path: &str) -> Verdict {
+        let events = [
+            (LsmRequestType::Execve, "/tmp/jinnguard-test/tool"),
+            (LsmRequestType::InodeCreate, "/tmp/jinnguard-test/file"),
+            (LsmRequestType::Connect, "/tmp/jinnguard-test/exfil"),
+        ];
+
+        let mut verdict = Verdict::Allow;
+        for (req_type, resource) in events {
+            let request = test_lsm_request(pid, req_type, resource, process_path);
+            verdict = evaluate_like_policy(&request);
+        }
+
+        verdict
+    }
+
+    #[test]
+    fn same_agent_restarting_new_pid_keeps_reputation() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let process_path = "/opt/jinn-agent/runner";
+        let identity = compute_agent_identity(&test_lsm_request(
+            820_001,
+            LsmRequestType::Connect,
+            "",
+            process_path,
+        ));
+
+        assert!(matches!(
+            run_high_risk_sequence(820_001, process_path),
+            Verdict::Allow
+        ));
+        assert!(matches!(
+            run_high_risk_sequence(820_002, process_path),
+            Verdict::Allow
+        ));
+        assert!(!is_agent_escalated(&identity));
+
+        assert!(matches!(
+            run_high_risk_sequence(820_003, process_path),
+            Verdict::Deny
+        ));
+        assert!(is_agent_escalated(&identity));
+    }
+
+    #[test]
+    fn different_binary_uses_separate_reputation() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let first = "/opt/jinn-agent/runner-a";
+        let second = "/opt/jinn-agent/runner-b";
+        let first_identity = compute_agent_identity(&test_lsm_request(
+            821_001,
+            LsmRequestType::Connect,
+            "",
+            first,
+        ));
+        let second_identity = compute_agent_identity(&test_lsm_request(
+            821_004,
+            LsmRequestType::Connect,
+            "",
+            second,
+        ));
+
+        for pid in [821_001, 821_002, 821_003] {
+            let _ = run_high_risk_sequence(pid, first);
+        }
+
+        assert!(is_agent_escalated(&first_identity));
+        assert!(matches!(
+            run_high_risk_sequence(821_004, second),
+            Verdict::Allow
+        ));
+        assert!(!is_agent_escalated(&second_identity));
+    }
+
+    #[test]
+    fn trusted_toolchain_does_not_accumulate_reputation() {
+        let _guard = intent_tracking_test_guard();
+        clear_intent_tracking_for_test();
+        let process_path = "/usr/bin/cargo";
+        let identity = compute_agent_identity(&test_lsm_request(
+            822_001,
+            LsmRequestType::Connect,
+            "",
+            process_path,
+        ));
+
+        for pid in [822_001, 822_002, 822_003, 822_004] {
+            assert!(matches!(
+                run_high_risk_sequence(pid, process_path),
+                Verdict::Allow
+            ));
+        }
+
+        assert!(!is_agent_escalated(&identity));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +2755,10 @@ async fn main() -> Result<()> {
         enterprise_kernel_telemetry_required(),
         jinnguard_safe_mode_enabled()
     );
+    if explainability::explainability_demo_enabled() {
+        explainability::print_demo_decision("read_file", "allow");
+        explainability::print_demo_decision("write_file", "deny");
+    }
 
     // Ensure all required directories exist.
     for dir in [

@@ -9,6 +9,9 @@
 // Shared event types (always compiled)
 // ---------------------------------------------------------------------------
 
+const LSM_PATH_CACHE_TTL_MS: u64 = 30_000;
+const LSM_PATH_CACHE_MAX_ENTRIES: usize = 4096;
+
 /// The type of enforcement request from the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LsmRequestType {
@@ -25,36 +28,41 @@ pub struct LsmRequest {
     pub cookie: u64,
     pub pid: u32,
     pub req_type: LsmRequestType,
+    pub source_program: u32,
     pub family: u16,
+    /// Best-effort controlling TTY marker from `/proc/<pid>/stat`.
+    pub tty: Option<String>,
+    /// True when the request appears to originate from an interactive user process.
+    pub is_interactive: bool,
+    /// Best-effort executable path for the process that triggered the LSM event.
+    pub process_path: Option<String>,
     /// Raw resource name as reported by the kernel (filename only for inode ops).
     pub resource: String,
-    /// Best-effort full path resolved from /proc/[pid]/cwd + resource.
-    /// Populated in the verdict loop before policy evaluation.
+    /// Best-effort full path resolved from process context + resource.
+    /// Populated before policy evaluation.
     pub resolved_path: Option<String>,
     pub payload_preview: Vec<u8>,
 }
 
 impl LsmRequest {
-    /// Attempt to resolve the full path for inode operations by reading
-    /// /proc/[pid]/cwd and prepending it to the raw resource filename.
-    /// Falls back to resource if /proc resolution fails.
+    /// Attempt to resolve the full path for inode operations.
+    /// Falls back to the raw resource if /proc resolution fails.
     pub fn resolve_path(&mut self) {
         if matches!(
             self.req_type,
             LsmRequestType::InodeCreate | LsmRequestType::InodeUnlink
         ) {
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", self.pid)) {
-                // Only prepend cwd if resource doesn't already look like a full path.
-                let full = if self.resource.starts_with('/') {
-                    self.resource.clone()
-                } else {
-                    format!("{}/{}", cwd.display(), self.resource)
-                };
-                self.resolved_path = Some(full);
-                return;
-            }
+            self.resolved_path = Some(normalize_lsm_resource_path(self.pid, &self.resource));
         }
-        // For non-inode ops, resolved_path stays None (caller uses resource).
+        // For non-inode ops, resolved_path stays None and callers use resource.
+    }
+
+    /// Populate origin metadata without making policy decisions depend on /proc
+    /// availability. Missing process data leaves the request non-interactive.
+    pub fn populate_origin(&mut self) {
+        self.tty = process_tty(self.pid);
+        self.is_interactive = self.tty.is_some();
+        self.process_path = process_exe_path(self.pid);
     }
 
     /// Return the effective path for policy evaluation:
@@ -62,6 +70,265 @@ impl LsmRequest {
     pub fn effective_path(&self) -> &str {
         self.resolved_path.as_deref().unwrap_or(&self.resource)
     }
+}
+
+pub fn process_tty(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_comm, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+
+    // Fields after comm: state, ppid, pgrp, session, tty_nr, ...
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    let _pgrp = fields.next()?;
+    let _session = fields.next()?;
+    let tty_nr = fields.next()?.parse::<i64>().ok()?;
+
+    if tty_nr == 0 {
+        None
+    } else {
+        Some(format!("tty:{tty_nr}"))
+    }
+}
+
+pub fn process_exe_path(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedPath {
+    pub absolute_path: String,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct LsmPathResolutionCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, CachedPath>>,
+}
+
+impl LsmPathResolutionCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn resolve_request(&self, request: &mut LsmRequest) {
+        match request.req_type {
+            LsmRequestType::InodeCreate => {
+                let normalized = normalize_lsm_resource_path(request.pid, &request.resource);
+                request.resolved_path = Some(normalized.clone());
+                self.cache_if_scoped(&request.resource, &normalized);
+            }
+            LsmRequestType::InodeUnlink => {
+                if !request.resource.starts_with('/') {
+                    if let Some(cached) = self.resolve(&request.resource) {
+                        request.resolved_path = Some(cached);
+                        return;
+                    }
+                }
+                request.resolved_path =
+                    Some(normalize_lsm_resource_path(request.pid, &request.resource));
+            }
+            _ => {}
+        }
+    }
+
+    pub fn cache_if_scoped(&self, raw_path: &str, absolute_path: &str) {
+        if !path_is_scoped_enforcement_zone(absolute_path) {
+            return;
+        }
+
+        let key = path_leaf(raw_path);
+        if key.is_empty() {
+            return;
+        }
+
+        let now = current_time_ms();
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        cleanup_expired_entries(&mut entries, now);
+        if entries.len() >= LSM_PATH_CACHE_MAX_ENTRIES {
+            entries.clear();
+        }
+        entries.insert(
+            key.to_string(),
+            CachedPath {
+                absolute_path: absolute_path.to_string(),
+                timestamp_ms: now,
+            },
+        );
+    }
+
+    pub fn resolve(&self, raw_path: &str) -> Option<String> {
+        let key = path_leaf(raw_path);
+        if key.is_empty() {
+            return None;
+        }
+
+        let now = current_time_ms();
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        cleanup_expired_entries(&mut entries, now);
+
+        entries.get(key).map(|entry| entry.absolute_path.clone())
+    }
+
+    #[cfg(test)]
+    pub fn insert_for_test(&self, raw_path: &str, absolute_path: &str, timestamp_ms: u64) {
+        let key = path_leaf(raw_path);
+        if key.is_empty() {
+            return;
+        }
+
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        entries.insert(
+            key.to_string(),
+            CachedPath {
+                absolute_path: absolute_path.to_string(),
+                timestamp_ms,
+            },
+        );
+    }
+}
+
+/// Normalize an LSM resource into a best-effort absolute path without panics.
+///
+/// Inode hooks currently report the dentry basename. Userspace can often recover
+/// the operator-visible target from `/proc/<pid>/cmdline`; this is more accurate
+/// than blindly joining the basename to cwd for absolute-path invocations such as
+/// `touch /tmp/jinnguard-test/file`. If the process has already exited, fall
+/// back to known test-zone existence checks and then cwd joining.
+pub fn normalize_lsm_resource_path(pid: u32, raw_path: &str) -> String {
+    if raw_path.is_empty() {
+        return String::new();
+    }
+    if raw_path.starts_with('/') {
+        return raw_path.to_string();
+    }
+
+    if let Some(path) = path_from_cmdline(pid, raw_path) {
+        return path;
+    }
+    if let Some(path) = existing_test_zone_path(raw_path) {
+        return path;
+    }
+    if let Some(path) = path_from_cwd(pid, raw_path) {
+        return path;
+    }
+
+    raw_path.to_string()
+}
+
+fn path_from_cmdline(pid: u32, raw_path: &str) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let raw_leaf = path_leaf(raw_path);
+
+    for arg in cmdline
+        .split(|byte| *byte == 0)
+        .filter(|bytes| !bytes.is_empty())
+    {
+        let Ok(arg) = std::str::from_utf8(arg) else {
+            continue;
+        };
+        if arg.is_empty() {
+            continue;
+        }
+        if arg.starts_with('/') && path_leaf(arg) == raw_leaf {
+            return Some(canonical_or_original(arg));
+        }
+        if path_leaf(arg) == raw_leaf {
+            if let Some(path) = path_from_cwd(pid, arg) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn existing_test_zone_path(raw_path: &str) -> Option<String> {
+    let leaf = path_leaf(raw_path);
+    if leaf.is_empty() {
+        return None;
+    }
+
+    for base in ["/tmp/jinnguard-test", "/var/tmp/jinnguard-test"] {
+        let candidate = std::path::Path::new(base).join(leaf);
+        if candidate.exists() {
+            return Some(canonical_or_original_path(&candidate));
+        }
+    }
+
+    let Ok(home_entries) = std::fs::read_dir("/home") else {
+        return None;
+    };
+    for entry in home_entries.flatten().take(256) {
+        let candidate = entry.path().join("jinnguard-test").join(leaf);
+        if candidate.exists() {
+            return Some(canonical_or_original_path(&candidate));
+        }
+    }
+
+    None
+}
+
+fn path_from_cwd(pid: u32, raw_path: &str) -> Option<String> {
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let candidate = cwd.join(raw_path);
+    Some(canonical_or_original_path(&candidate))
+}
+
+fn canonical_or_original(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    canonical_or_original_path(path)
+}
+
+fn canonical_or_original_path(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn path_leaf(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
+pub fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn cleanup_expired_entries(
+    entries: &mut std::collections::HashMap<String, CachedPath>,
+    now_ms: u64,
+) {
+    entries.retain(|_, entry| now_ms.saturating_sub(entry.timestamp_ms) <= LSM_PATH_CACHE_TTL_MS);
+}
+
+fn path_is_scoped_enforcement_zone(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+
+    path.starts_with("/tmp/jinnguard-test/")
+        || path.starts_with("/var/tmp/jinnguard-test/")
+        || home_jinnguard_test_path(path)
+}
+
+fn home_jinnguard_test_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/home/") else {
+        return false;
+    };
+    let Some((_user, suffix)) = rest.split_once('/') else {
+        return false;
+    };
+    suffix.starts_with("jinnguard-test/")
 }
 
 /// A policy verdict sent from user-space back to the kernel.
@@ -88,7 +355,7 @@ pub struct VerdictPayload {
 #[cfg(feature = "kernel_telemetry")]
 pub mod aya_backend {
     use super::{LsmRequest, LsmRequestType, Verdict, VerdictPayload};
-    use crate::PolicyConfig;
+    use crate::{system_immunity, PolicyConfig};
     use anyhow::{anyhow, Result};
     use aya::{
         maps::{ring_buf::RingBuf, Array as AyaArray, HashMap as AyaHashMap, MapData},
@@ -105,16 +372,11 @@ pub mod aya_backend {
     const JG_MAX_RESOURCE_LEN: usize = 128;
     const JG_CONTROL_KEY: u32 = 0;
     const JG_CONTROL_AUDIT_ONLY: u32 = 1;
-    const BOOTSTRAP_ALLOWED_EXECUTABLES: &[&str] = &[
-        "/usr/bin/sudo",
-        "/usr/bin/systemctl",
-        "/usr/bin/journalctl",
-        "/usr/bin/bash",
-        "/bin/bash",
-        "/usr/bin/env",
-        "/usr/bin/clear",
-        "/usr/bin/sleep",
-    ];
+    const JG_SRC_INODE_CREATE: u32 = 1;
+    const JG_SRC_INODE_UNLINK: u32 = 2;
+    const JG_SRC_BPRM_CHECK_SECURITY: u32 = 3;
+    const JG_SRC_SOCKET_CONNECT: u32 = 4;
+    const JG_SRC_SOCKET_SENDMSG: u32 = 5;
     /// Policy path key used by BPF maps.
     /// Must match `struct jg_path_key` in `bpf/lsm/jg_common.h`.
     #[repr(C)]
@@ -138,9 +400,10 @@ pub mod aya_backend {
         pub _pad_after_resource: [u8; 2],
         pub dest: [u8; 108],
         pub payload_preview: [u8; 64],
+        pub source_program: u32,
     }
 
-    const _: [(); 320] = [(); std::mem::size_of::<RawLsmRequest>()];
+    const _: [(); 328] = [(); std::mem::size_of::<RawLsmRequest>()];
     const _: [(); 0] = [(); std::mem::offset_of!(RawLsmRequest, cookie)];
     const _: [(); 8] = [(); std::mem::offset_of!(RawLsmRequest, pid)];
     const _: [(); 12] = [(); std::mem::offset_of!(RawLsmRequest, req_type)];
@@ -149,6 +412,7 @@ pub mod aya_backend {
     const _: [(); 146] = [(); std::mem::offset_of!(RawLsmRequest, _pad_after_resource)];
     const _: [(); 148] = [(); std::mem::offset_of!(RawLsmRequest, dest)];
     const _: [(); 256] = [(); std::mem::offset_of!(RawLsmRequest, payload_preview)];
+    const _: [(); 320] = [(); std::mem::offset_of!(RawLsmRequest, source_program)];
     const _: [(); 16] = [(); std::mem::size_of::<VerdictPayload>()];
 
     impl TryFrom<RawLsmRequest> for LsmRequest {
@@ -177,13 +441,18 @@ pub mod aya_backend {
                 cookie: raw.cookie,
                 pid: raw.pid,
                 req_type,
+                source_program: raw.source_program,
                 family: raw.family,
+                tty: None,
+                is_interactive: false,
+                process_path: None,
                 resource,
                 resolved_path: None,
                 payload_preview,
             };
             // Attempt full-path resolution for inode operations.
             req.resolve_path();
+            req.populate_origin();
             Ok(req)
         }
     }
@@ -224,7 +493,7 @@ pub mod aya_backend {
     struct LoadedLsmObject {
         _bpf: Ebpf,
         object_path: &'static str,
-        requests: RingBuf<MapData>,
+        source_program: u32,
         verdicts: AyaHashMap<MapData, u64, VerdictPayload>,
         runtime_controls: Option<AyaArray<MapData, u32>>,
         ipv4_denylist: Option<AyaHashMap<MapData, u32, u8>>,
@@ -236,6 +505,8 @@ pub mod aya_backend {
     /// The main user-space monitor for loading LSM hooks and handling requests.
     pub struct AyaLsmMonitor {
         objects: Vec<LoadedLsmObject>,
+        requests: RingBuf<MapData>,
+        program_routes: StdHashMap<u32, usize>,
         pending_routes: StdHashMap<u64, usize>,
     }
 
@@ -244,42 +515,68 @@ pub mod aya_backend {
             let btf = Btf::from_sys_fs()
                 .map_err(|e| anyhow!("aya: failed to load kernel BTF from sysfs: {}", e))?;
 
-            let mut objects = Vec::new();
-            for (object_path, prog_name, hook_name) in [
+            let lsm_objects = [
                 (
+                    JG_SRC_SOCKET_CONNECT,
                     "/usr/lib/jinnguard/lsm/jg_socket_connect.o",
                     "jg_socket_connect",
                     "socket_connect",
                 ),
                 (
+                    JG_SRC_SOCKET_SENDMSG,
                     "/usr/lib/jinnguard/lsm/jg_socket_sendmsg.o",
                     "jg_socket_sendmsg",
                     "socket_sendmsg",
                 ),
                 (
+                    JG_SRC_BPRM_CHECK_SECURITY,
                     "/usr/lib/jinnguard/lsm/jg_bprm_check_security.o",
                     "jg_bprm_check_security",
                     "bprm_check_security",
                 ),
                 (
+                    JG_SRC_INODE_CREATE,
                     "/usr/lib/jinnguard/lsm/jg_inode_create.o",
                     "jg_inode_create",
                     "inode_create",
                 ),
                 (
+                    JG_SRC_INODE_UNLINK,
                     "/usr/lib/jinnguard/lsm/jg_inode_unlink.o",
                     "jg_inode_unlink",
                     "inode_unlink",
                 ),
-            ] {
-                objects.push(load_lsm_object(
+            ];
+
+            let mut objects = Vec::new();
+            let mut requests = None;
+            for (index, (source_program, object_path, prog_name, hook_name)) in
+                lsm_objects.into_iter().enumerate()
+            {
+                let (object, object_requests) = load_lsm_object(
+                    source_program,
                     object_path,
                     prog_name,
                     hook_name,
                     &btf,
                     safe_mode,
-                )?);
+                    index == 0,
+                )?;
+                if object_requests.is_some() && requests.is_some() {
+                    return Err(anyhow!(
+                        "internal loader error: multiple requests ring buffer readers created"
+                    ));
+                }
+                requests = requests.or(object_requests);
+                objects.push(object);
             }
+            let requests = requests
+                .ok_or_else(|| anyhow!("eBPF map 'requests' not found in any loaded LSM object"))?;
+            let program_routes = objects
+                .iter()
+                .enumerate()
+                .map(|(index, object)| (object.source_program, index))
+                .collect();
 
             if safe_mode {
                 eprintln!("[safe-mode] LSM audit-only mode active; deny decisions disabled");
@@ -287,6 +584,8 @@ pub mod aya_backend {
 
             Ok(Self {
                 objects,
+                requests,
+                program_routes,
                 pending_routes: StdHashMap::new(),
             })
         }
@@ -379,22 +678,34 @@ pub mod aya_backend {
         /// Poll and parse requests from the ring buffer.
         pub fn poll_requests(&mut self) -> Result<Vec<LsmRequest>> {
             let mut parsed_requests = Vec::new();
-            for (object_index, object) in self.objects.iter_mut().enumerate() {
-                while let Some(bytes) = object.requests.next() {
-                    if bytes.len() >= std::mem::size_of::<RawLsmRequest>() {
-                        let raw_req: RawLsmRequest = unsafe {
-                            std::ptr::read_unaligned(bytes.as_ptr() as *const RawLsmRequest)
-                        };
-                        match LsmRequest::try_from(raw_req) {
-                            Ok(req) => {
-                                self.pending_routes.insert(req.cookie, object_index);
+            while let Some(bytes) = self.requests.next() {
+                if bytes.len() >= std::mem::size_of::<RawLsmRequest>() {
+                    let raw_req: RawLsmRequest =
+                        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawLsmRequest) };
+                    match LsmRequest::try_from(raw_req) {
+                        Ok(req) => {
+                            let route = self
+                                .program_routes
+                                .get(&req.source_program)
+                                .copied()
+                                .or_else(|| {
+                                    source_program_for_request_type(req.req_type).and_then(
+                                        |source_program| {
+                                            self.program_routes.get(&source_program).copied()
+                                        },
+                                    )
+                                });
+                            if let Some(route) = route {
+                                self.pending_routes.insert(req.cookie, route);
                                 parsed_requests.push(req);
+                            } else {
+                                eprintln!(
+                                    "[eBPF LSM] no route for source_program={} req_type={:?}; dropping verdict feedback for cookie={}",
+                                    req.source_program, req.req_type, req.cookie
+                                );
                             }
-                            Err(e) => eprintln!(
-                                "[eBPF LSM] Error parsing raw request from {}: {}",
-                                object.object_path, e
-                            ),
                         }
+                        Err(e) => eprintln!("[eBPF LSM] Error parsing raw request: {}", e),
                     }
                 }
             }
@@ -402,13 +713,25 @@ pub mod aya_backend {
         }
     }
 
+    fn source_program_for_request_type(req_type: LsmRequestType) -> Option<u32> {
+        Some(match req_type {
+            LsmRequestType::Connect => JG_SRC_SOCKET_CONNECT,
+            LsmRequestType::SendMsg => JG_SRC_SOCKET_SENDMSG,
+            LsmRequestType::Execve => JG_SRC_BPRM_CHECK_SECURITY,
+            LsmRequestType::InodeCreate => JG_SRC_INODE_CREATE,
+            LsmRequestType::InodeUnlink => JG_SRC_INODE_UNLINK,
+        })
+    }
+
     fn load_lsm_object(
+        source_program: u32,
         object_path: &'static str,
         prog_name: &'static str,
         hook_name: &'static str,
         btf: &Btf,
         safe_mode: bool,
-    ) -> Result<LoadedLsmObject> {
+        take_requests: bool,
+    ) -> Result<(LoadedLsmObject, Option<RingBuf<MapData>>)> {
         let data = std::fs::read(object_path)
             .map_err(|e| anyhow!("Failed to read eBPF LSM object {}: {}", object_path, e))?;
 
@@ -418,7 +741,9 @@ pub mod aya_backend {
         {
             let prog: &mut Lsm = bpf
                 .program_mut(prog_name)
-                .ok_or_else(|| anyhow!("eBPF program '{}' not found in {}", prog_name, object_path))?
+                .ok_or_else(|| {
+                    anyhow!("eBPF program '{}' not found in {}", prog_name, object_path)
+                })?
                 .try_into()?;
             prog.load(hook_name, btf)?;
         }
@@ -453,10 +778,13 @@ pub mod aya_backend {
             prog_name, object_path, hook_name
         );
 
-        let requests = RingBuf::try_from(
-            bpf.take_map("requests")
-                .ok_or_else(|| anyhow!("eBPF map 'requests' not found in {}", object_path))?,
-        )?;
+        let requests = if take_requests {
+            Some(RingBuf::try_from(bpf.take_map("requests").ok_or_else(
+                || anyhow!("eBPF map 'requests' not found in {}", object_path),
+            )?)?)
+        } else {
+            None
+        };
 
         let verdicts: AyaHashMap<_, u64, VerdictPayload> = AyaHashMap::try_from(
             bpf.take_map("verdicts")
@@ -468,17 +796,20 @@ pub mod aya_backend {
         let denied_basenames = optional_hash_map(&mut bpf, "denied_basenames", object_path)?;
         let denied_dir_inodes = optional_hash_map(&mut bpf, "denied_dir_inodes", object_path)?;
 
-        Ok(LoadedLsmObject {
-            _bpf: bpf,
-            object_path,
+        Ok((
+            LoadedLsmObject {
+                _bpf: bpf,
+                object_path,
+                source_program,
+                verdicts,
+                runtime_controls,
+                ipv4_denylist,
+                allowed_exec_paths,
+                denied_basenames,
+                denied_dir_inodes,
+            },
             requests,
-            verdicts,
-            runtime_controls,
-            ipv4_denylist,
-            allowed_exec_paths,
-            denied_basenames,
-            denied_dir_inodes,
-        })
+        ))
     }
 
     fn optional_array_map<V>(
@@ -554,8 +885,8 @@ pub mod aya_backend {
         policy: &PolicyConfig,
         object_path: &str,
     ) -> Result<()> {
-        for path in BOOTSTRAP_ALLOWED_EXECUTABLES {
-            insert_allowed_exec_path(map, path, object_path)?;
+        for path in system_immunity::immune_exec_path_candidates() {
+            insert_allowed_exec_path(map, &path, object_path)?;
         }
 
         for path in policy
