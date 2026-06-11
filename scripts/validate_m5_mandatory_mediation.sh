@@ -75,7 +75,7 @@ set -e
 say "Step 4/4 — result"
 echo "Probe outcomes (from the locked agent):"
 echo "------------------------------------------------------------------"
-grep -E "^\[(PASS|FAIL)\] " "$LOG" | tail -20 || echo "(no probe lines captured)"
+grep -E "\[(PASS|FAIL)\] " "$LOG" | tail -20 || echo "(no probe lines captured)"
 echo "------------------------------------------------------------------"
 
 # Count expected probes.
@@ -84,7 +84,7 @@ expected=(runtime_attestation direct_network_egress direct_sensitive_file_write 
           broker_owned_file_write)
 pass_count=0
 for p in "${expected[@]}"; do
-  if grep -qE "^\[PASS\] $p:" "$LOG"; then pass_count=$((pass_count+1)); fi
+  if grep -qE "\[PASS\] $p:" "$LOG"; then pass_count=$((pass_count+1)); fi
 done
 
 echo
