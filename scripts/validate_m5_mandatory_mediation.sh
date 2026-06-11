@@ -62,11 +62,14 @@ fi
 ok "images built"
 
 say "Step 3/4 — run the locked agent against the broker"
-# The locked-agent's exit code is the probe result (0 = all probes passed).
-# runtime_smoke.sh builds (cached now) and runs with --exit-code-from locked-agent.
+# Bring up BOTH services attached so broker logs are visible, and use the
+# locked-agent's exit code as the probe result (0 = all probes passed).
 set +e
-COMPOSE_FILE="$COMPOSE_FILE" DOCKER_COMPOSE="$DC" bash scripts/runtime_smoke.sh 2>&1 | tee -a "$LOG"
+$DC -f "$COMPOSE_FILE" up --abort-on-container-exit --exit-code-from locked-agent 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
+# Capture the broker's own logs explicitly in case it died before the agent ran.
+{ echo "----- jinnguard-broker logs -----"; $DC -f "$COMPOSE_FILE" logs jinnguard-broker 2>&1 | tail -40; } >> "$LOG" 2>&1 || true
+$DC -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
 set -e
 
 say "Step 4/4 — result"

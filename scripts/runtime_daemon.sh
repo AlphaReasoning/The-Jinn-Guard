@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The Rust container exposes cargo under /usr/local/cargo/bin, but `sudo` resets
+# PATH to its secure_path, dropping that directory, so `cargo` would not be found
+# (exit 127). Re-add the cargo bin dir before invoking it.
+export PATH="/usr/local/cargo/bin:${CARGO_HOME:-/usr/local/cargo}/bin:${PATH}"
+
 export JINN_GUARD_SECRET="${JINN_GUARD_SECRET:-dev-only-change-me}"
 export JINN_GUARD_SOCKET="${JINN_GUARD_SOCKET:-${JINNGUARD_SOCKET:-/run/jinnguard/jinnguard.sock}}"
 export JINNGUARD_SOCKET="$JINN_GUARD_SOCKET"
