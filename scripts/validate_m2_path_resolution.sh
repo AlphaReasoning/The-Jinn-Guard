@@ -118,7 +118,10 @@ fi
 ok "built target/release/ts_cli"
 
 say "Step 5/7 — start the daemon in SAFE MODE (audit-only, blocks nothing)"
-head -c 32 /dev/urandom | xxd -p | tr -d '\n' > "$WORK/secret"
+# Generate a throwaway HMAC secret. Its value is irrelevant here (we send no
+# signed proposals — this is LSM-only validation); the daemon just needs the
+# file to exist. Use od so we don't depend on xxd being installed.
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$WORK/secret"
 cat > "$WORK/policy.yaml" <<'YAML'
 global_safety_ceiling: 95.0
 enforcement_scope:
