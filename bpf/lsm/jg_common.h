@@ -211,6 +211,13 @@ static __always_inline void jg_read_dentry_basename(
 // the destination is in bounds, so there are no nested copy loops, no scratch
 // buffer, and no index masking. Falls back to the basename for paths deeper
 // than JG_PATH_MAX_DEPTH so a partial path is never emitted.
+//
+// Mount boundaries: the inode_create/unlink hooks receive only a dentry (no
+// vfsmount), so the walk stops at the dentry-tree root of the file's own mount.
+// On the root filesystem this is the true absolute path (/etc, /usr, /opt, ...).
+// For a file on a sub-mount (e.g. a tmpfs at /tmp) the result is relative to
+// that mount's root (/tmp/x -> /x). Crossing mounts needs path-family LSM hooks
+// or bpf_d_path; tracked as a known limitation.
 static __always_inline void jg_read_dentry_path(
     struct dentry *dentry,
     char *out,

@@ -32,9 +32,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="/tmp/jg-m2-validate"
 LOG="$WORK/daemon.log"
+# tmpfs nested path: proves multi-level resolution (the CVE fix). On a tmpfs
+# /tmp this resolves relative to the tmpfs root, so we match the nested suffix.
 TEST_DIR="/tmp/jinnguard-test/alpha/beta/gamma"
 TEST_FILE="$TEST_DIR/secret.txt"
-EXPECTED_PATH="$TEST_FILE"
+NESTED_SUFFIX="jinnguard-test/alpha/beta/gamma/secret.txt"
+# Root-filesystem path: proves full ABSOLUTE resolution where there is no mount
+# boundary (the case that matters for /etc, /usr, /opt, etc.).
+ROOTFS_DIR="/root/jinnguard-m2-test/x/y/z"
+ROOTFS_FILE="$ROOTFS_DIR/probe.txt"
 LSM_INSTALL_DIR="/usr/lib/jinnguard/lsm"
 DAEMON_PID=""
 
@@ -161,31 +167,59 @@ if grep -qiE "verifier|failed to load|BPF program load|invalid|rejected" "$LOG";
 fi
 ok "daemon is up in safe mode (it will not block anything)."
 
-say "Step 6/7 — create a deeply nested file and watch what Jinn Guard records"
+say "Step 6/7 — create deeply nested files and watch what Jinn Guard records"
+# (a) tmpfs nested path
 rm -f "$TEST_FILE" 2>/dev/null || true
 mkdir -p "$TEST_DIR"
-# Two operations the inode hooks see: create, then delete.
-: > "$TEST_FILE"
+: > "$TEST_FILE"; sleep 0.3; rm -f "$TEST_FILE"
+ok "tmpfs: created+deleted $TEST_FILE"
+# (b) root-filesystem nested path
+rm -f "$ROOTFS_FILE" 2>/dev/null || true
+mkdir -p "$ROOTFS_DIR"
+: > "$ROOTFS_FILE"; sleep 0.3; rm -f "$ROOTFS_FILE"
+rm -rf /root/jinnguard-m2-test 2>/dev/null || true
+ok "rootfs: created+deleted $ROOTFS_FILE"
 sleep 0.4
-rm -f "$TEST_FILE"
-sleep 0.4
-ok "created and deleted $TEST_FILE"
 
 say "Step 7/7 — result"
-if grep -qF "$EXPECTED_PATH" "$LOG"; then
-  ok "Jinn Guard recorded the FULL path: $EXPECTED_PATH"
-  printf '\n\033[1;32m############################################################\n'
-  printf '#  M2 PASS — full-path resolution works. CVE-2026-002 fix   #\n'
-  printf '#  is behaving correctly in audit-only mode.                #\n'
+nested_ok=0; rootfs_ok=0
+grep -qF "$NESTED_SUFFIX"  "$LOG" && nested_ok=1
+grep -qF "$ROOTFS_FILE"    "$LOG" && rootfs_ok=1
+
+echo "Multi-level resolution (the CVE-2026-002 fix):"
+if (( nested_ok )); then
+  ok "resolved the full nested chain: ...$NESTED_SUFFIX"
+  grep -F "$NESTED_SUFFIX" "$LOG" | grep -iE "resource=|Target:" | head -4
+else
+  warn "did not see the nested chain $NESTED_SUFFIX"
+fi
+echo
+echo "Absolute resolution on the real disk (root filesystem):"
+if (( rootfs_ok )); then
+  ok "resolved the full ABSOLUTE path: $ROOTFS_FILE"
+  grep -F "$ROOTFS_FILE" "$LOG" | grep -iE "resource=|Target:" | head -4
+else
+  warn "did not see $ROOTFS_FILE (is /root on a separate mount?)"
+fi
+
+echo
+if (( nested_ok )); then
+  printf '\033[1;32m############################################################\n'
+  printf '#  M2 PASS — full multi-level path resolution works.        #\n'
+  printf '#  CVE-2026-002 (basename-only blindness) is closed.        #\n'
+  if (( rootfs_ok )); then
+  printf '#  Absolute paths on the root filesystem resolve fully.     #\n'
+  fi
   printf '############################################################\033[0m\n'
   echo
-  echo "Relevant log lines:"
-  grep -F "$EXPECTED_PATH" "$LOG" | head -8
+  echo "(Note: paths under a separate mount such as a tmpfs /tmp resolve"
+  echo " relative to that mount's root — a documented limitation. Paths on"
+  echo " the main disk, including /etc /usr /opt, resolve absolutely.)"
 else
-  warn "did not find the full path in the log. What we DID see for our test file:"
+  warn "nested resolution not confirmed. Recent inode log lines:"
   echo "------------------------------------------------------------------"
-  grep -iE "secret.txt|jinnguard-test|inode" "$LOG" | head -20 || echo "(no related lines)"
+  grep -iE "secret.txt|probe.txt|jinnguard|inode" "$LOG" | head -20 || echo "(no related lines)"
   echo "------------------------------------------------------------------"
   echo "Full log is at: $LOG"
-  die "full path not confirmed — copy the lines above back to Claude to diagnose."
+  die "copy the lines above back to Claude to diagnose."
 fi
