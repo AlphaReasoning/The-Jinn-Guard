@@ -512,6 +512,13 @@ pub mod aya_backend {
 
     impl AyaLsmMonitor {
         pub fn load(safe_mode: bool) -> Result<Self> {
+            // A previous daemon instance may have left the LIBBPF_PIN_BY_NAME
+            // 'requests' ring buffer pinned in bpffs. Reusing that stale buffer
+            // on restart leaves us attached to a buffer that delivers no events
+            // (synchronous enforcement still works, but telemetry goes silent).
+            // Clear it first so we always start with a fresh ring buffer.
+            clear_stale_request_pin();
+
             let btf = Btf::from_sys_fs()
                 .map_err(|e| anyhow!("aya: failed to load kernel BTF from sysfs: {}", e))?;
 
@@ -721,6 +728,26 @@ pub mod aya_backend {
             LsmRequestType::InodeCreate => JG_SRC_INODE_CREATE,
             LsmRequestType::InodeUnlink => JG_SRC_INODE_UNLINK,
         })
+    }
+
+    /// Remove a stale pinned `requests` ring buffer left by a previous daemon
+    /// instance. The map is pinned LIBBPF_PIN_BY_NAME (see bpf/common/maps.h) so
+    /// it outlives the process; aya reuses the existing pin on the next load,
+    /// which re-attaches the new daemon to an old, drained ring buffer. Removing
+    /// the pin forces aya to create and pin a fresh buffer. The bpffs default
+    /// mount is /sys/fs/bpf; the map name is the pin file name.
+    fn clear_stale_request_pin() {
+        for path in ["/sys/fs/bpf/requests", "/sys/fs/bpf/jinnguard/requests"] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    eprintln!("[eBPF LSM] cleared stale pinned ring buffer at {path}")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!(
+                    "[eBPF LSM] warning: could not remove stale ring buffer pin {path}: {e}"
+                ),
+            }
+        }
     }
 
     fn load_lsm_object(

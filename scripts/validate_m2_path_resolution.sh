@@ -138,12 +138,12 @@ enforcement_scope:
 agent_nodes: []
 YAML
 
-# Remove any stale pinned 'requests' ring buffer left by a previous daemon run.
-# It is pinned LIBBPF_PIN_BY_NAME so it outlives the process; a restarted daemon
-# that re-attaches to the old buffer receives ZERO kernel events. Clearing it
-# forces a fresh ring buffer, the same clean state as the very first run.
-if mountpoint -q /sys/fs/bpf 2>/dev/null || [ -d /sys/fs/bpf ]; then
-  find /sys/fs/bpf -maxdepth 3 -name requests -exec rm -f {} + 2>/dev/null || true
+# NOTE: the daemon now clears any stale pinned 'requests' ring buffer itself on
+# startup (clear_stale_request_pin in ebpf_monitor.rs), so this harness no longer
+# removes it. Running this script twice in a row therefore exercises that fix: a
+# second PASS proves the daemon recovers a clean ring buffer across restarts.
+if [ -e /sys/fs/bpf/requests ]; then
+  echo "   (note: a stale pin exists from a previous run; the daemon should clear it)"
 fi
 
 # stdbuf -oL forces line-buffered stdout so every log line is written to the
