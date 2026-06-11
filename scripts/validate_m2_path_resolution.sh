@@ -32,14 +32,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="/tmp/jg-m2-validate"
 LOG="$WORK/daemon.log"
+# Use a fresh, never-seen run id so directories/inodes are always new (rules out
+# any stale-dentry effects from a previous run).
+RUN_ID="$$_${RANDOM}"
 # tmpfs nested path: proves multi-level resolution (the CVE fix). On a tmpfs
 # /tmp this resolves relative to the tmpfs root, so we match the nested suffix.
-TEST_DIR="/tmp/jinnguard-test/alpha/beta/gamma"
+TEST_DIR="/tmp/jinnguard-test/run-$RUN_ID/alpha/beta/gamma"
 TEST_FILE="$TEST_DIR/secret.txt"
-NESTED_SUFFIX="jinnguard-test/alpha/beta/gamma/secret.txt"
+NESTED_SUFFIX="alpha/beta/gamma/secret.txt"
 # Root-filesystem path: proves full ABSOLUTE resolution where there is no mount
 # boundary (the case that matters for /etc, /usr, /opt, etc.).
-ROOTFS_DIR="/root/jinnguard-m2-test/x/y/z"
+ROOTFS_DIR="/root/jinnguard-m2-test/run-$RUN_ID/x/y/z"
 ROOTFS_FILE="$ROOTFS_DIR/probe.txt"
 LSM_INSTALL_DIR="/usr/lib/jinnguard/lsm"
 DAEMON_PID=""
@@ -135,8 +138,11 @@ enforcement_scope:
 agent_nodes: []
 YAML
 
+# stdbuf -oL forces line-buffered stdout so every log line is written to the
+# file immediately, instead of sitting in a memory batch that is lost when we
+# stop the daemon at the end.
 JINNGUARD_SAFE_MODE=1 ENABLE_EXPLAINABILITY=1 JINN_GUARD_MCP_PORT=48750 \
-  "$REPO_ROOT/target/release/ts_cli" \
+  stdbuf -oL -eL "$REPO_ROOT/target/release/ts_cli" \
     --socket-path "$WORK/jg.sock" \
     --policy-file "$WORK/policy.yaml" \
     --secret-file "$WORK/secret" \
@@ -168,23 +174,30 @@ fi
 ok "daemon is up in safe mode (it will not block anything)."
 
 say "Step 6/7 — create deeply nested files and watch what Jinn Guard records"
-# (a) tmpfs nested path
-rm -f "$TEST_FILE" 2>/dev/null || true
-mkdir -p "$TEST_DIR"
-: > "$TEST_FILE"; sleep 0.3; rm -f "$TEST_FILE"
-ok "tmpfs: created+deleted $TEST_FILE"
-# (b) root-filesystem nested path
-rm -f "$ROOTFS_FILE" 2>/dev/null || true
-mkdir -p "$ROOTFS_DIR"
-: > "$ROOTFS_FILE"; sleep 0.3; rm -f "$ROOTFS_FILE"
-rm -rf /root/jinnguard-m2-test 2>/dev/null || true
-ok "rootfs: created+deleted $ROOTFS_FILE"
-sleep 0.4
+mkdir -p "$TEST_DIR" "$ROOTFS_DIR"
+# Create each file several times (fresh inode each round) so a single missed
+# event does not fail the run. inode_create fires only when the file does not
+# already exist, so delete before each create.
+for round in 1 2 3 4; do
+  rm -f "$TEST_FILE" "$ROOTFS_FILE" 2>/dev/null || true
+  sleep 0.2
+  : > "$TEST_FILE"
+  : > "$ROOTFS_FILE"
+  sleep 0.2
+done
+rm -f "$TEST_FILE" "$ROOTFS_FILE" 2>/dev/null || true
+ok "created the nested files (4 rounds each)"
 
 say "Step 7/7 — result"
+# Poll the log for up to ~10s: the daemon reads events on a background loop, so
+# give it time rather than peeking once.
 nested_ok=0; rootfs_ok=0
-grep -qF "$NESTED_SUFFIX"  "$LOG" && nested_ok=1
-grep -qF "$ROOTFS_FILE"    "$LOG" && rootfs_ok=1
+for _ in $(seq 1 50); do
+  grep -qF "$NESTED_SUFFIX" "$LOG" && nested_ok=1
+  grep -qF "$ROOTFS_FILE"   "$LOG" && rootfs_ok=1
+  (( nested_ok )) && break
+  sleep 0.2
+done
 
 echo "Multi-level resolution (the CVE-2026-002 fix):"
 if (( nested_ok )); then
@@ -216,9 +229,13 @@ if (( nested_ok )); then
   echo " relative to that mount's root — a documented limitation. Paths on"
   echo " the main disk, including /etc /usr /opt, resolve absolutely.)"
 else
-  warn "nested resolution not confirmed. Recent inode log lines:"
+  warn "nested resolution not confirmed. Diagnostics:"
+  ev_total=$(grep -c "JINNGUARD EVENT" "$LOG" 2>/dev/null || echo 0)
+  ev_create=$(grep -c "type=InodeCreate" "$LOG" 2>/dev/null || echo 0)
+  echo "  total kernel events logged:       $ev_total"
+  echo "  InodeCreate events logged:        $ev_create"
   echo "------------------------------------------------------------------"
-  grep -iE "secret.txt|probe.txt|jinnguard|inode" "$LOG" | head -20 || echo "(no related lines)"
+  grep -iE "JINNGUARD EVENT|resource=|Target:" "$LOG" | head -25 || echo "(no event lines at all)"
   echo "------------------------------------------------------------------"
   echo "Full log is at: $LOG"
   die "copy the lines above back to Claude to diagnose."
