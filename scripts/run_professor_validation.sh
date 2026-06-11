@@ -137,7 +137,7 @@ fi
 # ---------------------------------------------------------------------------
 c_hdr "Tier 4 — kernel ENFORCEMENT allow/deny (arms real denial)"
 if [[ $ARM -eq 0 ]]; then
-  c_skip "off by default. Re-run with '--arm' ON A SPARE MACHINE to validate real allow/deny."
+  c_skip "off by default. Re-run with '--arm' to validate real allow/deny (cgroup-scoped to the test; needs cgroup v2)."
   mark T4 SKIP
 elif [[ $IS_ROOT -eq 0 || $HAS_BPFLSM -eq 0 || $HAS_CLANG -eq 0 ]]; then
   c_skip "needs sudo + BPF-LSM + clang; skipping."
