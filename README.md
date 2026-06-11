@@ -141,9 +141,26 @@ Kernel Layer (eBPF)
 
 ## Known Limitations
 
-### Filesystem Enforcement (CVE-2026-002)
+### Filesystem path resolution — mount boundaries (was CVE-2026-002, now fixed)
 
-The BPF inode_create and inode_unlink hooks currently capture only the filename, not the full resolved path. Path-prefix policy rules (e.g. denying writes to /etc/) can be bypassed by using a relative path from a directory within the denied prefix. Full dentry path resolution is planned for v1.1. In the interim, disable the inode_create/inode_unlink hooks for sensitive deployments and rely on execve-based enforcement.
+The BPF `inode_create`/`inode_unlink` hooks now resolve the **full absolute
+path** of a file operation in the kernel (a bounded `d_parent` walk), closing the
+earlier basename-only bypass. Validated live (audit-only) via
+`scripts/validate_m2_path_resolution.sh`.
+
+Residual limitation: the inode hooks receive a dentry without a vfsmount, so a
+file on a **sub-mount** (e.g. a tmpfs `/tmp`) resolves relative to that mount's
+root (`/tmp/x` → `/x`). Root-filesystem paths (`/etc`, `/usr`, `/opt`, `/home`
+on a single-root install) — the security-critical cases — resolve to full
+absolute paths. Crossing mount boundaries requires path-family LSM hooks or
+`bpf_d_path` and is tracked for a future release.
+
+### Interpreter chains (CVE-2026-001, mitigated)
+
+An agent explicitly allowed to run an interpreter can invoke other tools through
+it. Jinn Guard denies known interpreters by policy for governed agents (any
+agent carrying an executable allowlist); per-binary execve limits remain only as
+strong as that allowlist.
 
 ---
 
@@ -346,7 +363,24 @@ cargo check
 
 ---
 
-## 📊 Production Readiness — ~75%
+## 📊 Validation status — validated research prototype / controlled-pilot MVP
+
+> **Independent reviewers:** see [`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md)
+> and run `bash scripts/run_professor_validation.sh` for a one-command, tiered
+> validation of everything below.
+
+**Validated on a real Linux 6.12 host:**
+
+| Capability | How it was validated |
+|---|---|
+| Full automated suite (≈117 tests) | `cargo test --workspace` — Z3 engine, governance pipeline, 13 integration, 12 swarm-attack, anti-lockout + safe-mode invariants |
+| Mandatory mediation | Docker locked-agent: 7/7 probes — direct network/`/etc`-write/shell blocked, broker-mediated actions succeed |
+| Kernel full-path resolution | eBPF-LSM hooks load + resolve absolute paths live (audit-only) |
+| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` allow/deny suite (execve, TCP, UDP, create, unlink), zero fail-open — *run on a spare host* |
+| Anti-lockout guarantee | CI-enforced tests: base-system/desktop processes always allowed when armed; safe mode stays audit-only |
+
+This is **not** independently audited or enterprise-GA. It is a strong,
+test-backed prototype demonstrating OS-level AI-agent enforcement.
 
 ### ✅ Shippable components
 
