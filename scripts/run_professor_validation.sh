@@ -164,12 +164,26 @@ else
     run_cargo build --features enterprise >/tmp/jg-prof-build.log 2>&1 || { c_fail "enterprise build failed (see /tmp/jg-prof-build.log)"; mark T4 FAIL; }
   fi
 
+  # Compile the kernel test binary AS THE USER (cargo/rustup live in the user's
+  # PATH, not root's) and run the compiled binary directly as root. The test
+  # itself needs root for BPF + cgroup setup, but needs no cargo at run time.
+  TEST_BIN=""
+  if [[ "${RESULT[T4]:-}" != "FAIL" ]]; then
+    c_info "building kernel allow/deny test binary (as $CARGO_USER)..."
+    if run_cargo test --features enterprise --test kernel_lsm --no-run >/tmp/jg-prof-testbuild.log 2>&1; then
+      TEST_BIN="$(find "$REPO_ROOT/target/debug/deps" -maxdepth 1 -type f -executable -name 'kernel_lsm-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+      [[ -n "$TEST_BIN" ]] || { c_fail "could not locate compiled kernel_lsm test binary (see /tmp/jg-prof-testbuild.log)"; mark T4 FAIL; }
+    else
+      c_fail "kernel test build failed (see /tmp/jg-prof-testbuild.log)"; mark T4 FAIL
+    fi
+  fi
+
   if [[ "${RESULT[T4]:-}" != "FAIL" ]]; then
     BIN="$REPO_ROOT/target/debug/ts_cli"
     c_info "running the project's kernel allow/deny suite (10-min watchdog)..."
     # A hard timeout guarantees enforcement is removed even if a test hangs.
     if timeout --signal=KILL 600 env JINNGUARD_TEST_BINARY="$BIN" JINN_KERNEL_LSM_OPS=500 \
-         bash -lc "cd '$REPO_ROOT' && cargo test --features enterprise --test kernel_lsm -- --ignored --test-threads=1 --nocapture" \
+         "$TEST_BIN" --ignored --test-threads=1 --nocapture \
          >/tmp/jg-prof-m5b.log 2>&1; then
       c_ok "kernel enforcement validated — allow/deny correct across execve, TCP, UDP, create, unlink"
       grep -E "\[KERNEL_LSM_" /tmp/jg-prof-m5b.log | sed 's/^/         /'
