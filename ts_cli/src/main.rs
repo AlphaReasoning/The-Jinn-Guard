@@ -268,8 +268,11 @@ fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
     }
     // Fall back to env var / kernel keyring-backed runtime secret.
     get_runtime_secret().unwrap_or_else(|_| {
-        eprintln!("FATAL: No HMAC secret. Use --secret-file or configure the kernel keyring.");
-        std::process::exit(1);
+        exit_codes::fatal(
+            exit_codes::EX_CONFIG,
+            "SECRET_MISSING",
+            "No HMAC secret. Use --secret-file or configure the kernel keyring.",
+        )
     })
 }
 
@@ -616,7 +619,10 @@ fn apply_adaptive_penalty(assessment: &mut RiskAssessment, offenses: u32) {
         return;
     }
     assessment.observed_risk = (assessment.observed_risk + penalty).min(99.0);
-    assessment.fused_risk = assessment.fused_risk.max(assessment.observed_risk).min(99.0);
+    assessment.fused_risk = assessment
+        .fused_risk
+        .max(assessment.observed_risk)
+        .min(99.0);
     assessment.trust_score = (100.0 - assessment.fused_risk).clamp(0.0, 100.0);
     assessment
         .reasons
@@ -673,9 +679,8 @@ pub(crate) fn intent_is_dangerous(intent: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 const KNOWN_INTERPRETERS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh", "python",
-    "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua",
-    "tclsh", "awk", "gawk", "Rscript", "pwsh",
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh", "python", "python2", "python3",
+    "perl", "ruby", "node", "nodejs", "php", "lua", "tclsh", "awk", "gawk", "Rscript", "pwsh",
 ];
 
 fn binary_basename(token: &str) -> &str {
@@ -1689,8 +1694,9 @@ async fn handle_client_connection(
                 agent_id_opt.as_deref(),
                 &assessment,
             );
-            let _ = write_framed_response(&mut stream, 1, b"SIGNAL: DENY_INTERPRETER_NOT_ALLOWED\n")
-                .await;
+            let _ =
+                write_framed_response(&mut stream, 1, b"SIGNAL: DENY_INTERPRETER_NOT_ALLOWED\n")
+                    .await;
             {
                 let mut reg = registry_store.lock().unwrap();
                 update_lineage_after_decision(
@@ -1957,6 +1963,12 @@ fn start_lsm_verdict_loop(
         .map_err(|err| {
             anyhow::anyhow!("fail-closed: failed to configure in-kernel LSM policy maps: {err}")
         })?;
+
+    // LSM programs are now loaded, attached, and configured. Optionally shed the
+    // privileges we no longer need (opt-in; never breaks enforcement).
+    if capability_hardening::enabled() {
+        capability_hardening::apply();
+    }
 
     thread::Builder::new()
         .name("jinn-lsm-verdict-loop".to_string())
@@ -2231,6 +2243,56 @@ fn path_matches_any(path: &str, patterns: &[String]) -> bool {
         let pattern = pattern.trim();
         !pattern.is_empty() && (path == pattern || path.starts_with(pattern.trim_end_matches('/')))
     })
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::exit_codes;
+
+    #[test]
+    fn fatal_line_is_machine_parseable() {
+        let line = exit_codes::format_fatal(
+            exit_codes::EX_CONFIG,
+            "SECRET_MISSING",
+            "No HMAC secret. Use --secret-file",
+        );
+        // Stable, greppable shape: `code=<n> kind=<KIND> msg="..."`.
+        assert!(line.starts_with("jinnguard: fatal "));
+        assert!(line.contains("code=78"));
+        assert!(line.contains("kind=SECRET_MISSING"));
+        // Message is quoted (Debug) so embedded spaces don't break parsing.
+        assert!(line.contains(r#"msg="No HMAC secret. Use --secret-file""#));
+    }
+
+    #[test]
+    fn hardening_never_drops_a_required_capability() {
+        use super::capability_hardening::{DROP_FROM_BOUNDING_SET, RETAINED_CAPS};
+        for (_, drop_cap) in DROP_FROM_BOUNDING_SET {
+            assert!(
+                !RETAINED_CAPS.iter().any(|(_, keep)| keep == drop_cap),
+                "drop list must never include a capability the daemon needs at runtime"
+            );
+        }
+        // No duplicate cap numbers in the drop list.
+        let mut nums: Vec<i32> = DROP_FROM_BOUNDING_SET.iter().map(|(_, c)| *c).collect();
+        nums.sort_unstable();
+        let len = nums.len();
+        nums.dedup();
+        assert_eq!(nums.len(), len, "drop list must not contain duplicates");
+    }
+
+    #[test]
+    fn startup_failure_codes_are_distinct() {
+        let codes = [
+            exit_codes::EX_UNAVAILABLE,
+            exit_codes::EX_SOFTWARE,
+            exit_codes::EX_CONFIG,
+        ];
+        let mut sorted = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "exit codes must be distinct");
+    }
 }
 
 #[cfg(test)]
@@ -2759,9 +2821,7 @@ mod operator_safety_invariants {
 /// strand the operator. Gated behind the same feature as the verdict loop.
 #[cfg(all(test, feature = "kernel_telemetry"))]
 mod safe_mode_invariants {
-    use super::{
-        lsm_policy_verdict, AgentNodePolicy, NetworkPolicy, PolicyConfig, RuntimePolicy,
-    };
+    use super::{lsm_policy_verdict, AgentNodePolicy, NetworkPolicy, PolicyConfig, RuntimePolicy};
     use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
     use std::collections::HashMap;
 
@@ -3222,8 +3282,117 @@ mod identity_tracking_tests {
 // main
 // ---------------------------------------------------------------------------
 
+/// Opt-in post-load capability hardening (`JINNGUARD_HARDEN_CAPS=1`).
+///
+/// After the LSM programs are loaded and attached the daemon no longer needs to
+/// acquire new privileges. This module sets `no_new_privs` and drops a curated
+/// set of dangerous capabilities from the **bounding set**. Dropping from the
+/// bounding set does NOT remove capabilities already in the effective set, so
+/// the daemon's steady-state work (BPF map writes, `/proc` enrichment of other
+/// processes) keeps working — it only prevents the daemon, or any child it
+/// spawns, from ever *acquiring* the dropped capabilities post-compromise.
+pub mod capability_hardening {
+    /// `(name, capability number)` to drop from the bounding set. These are
+    /// capabilities the daemon provably never needs after BPF load.
+    pub const DROP_FROM_BOUNDING_SET: &[(&str, i32)] = &[
+        ("CAP_NET_ADMIN", 12),
+        ("CAP_NET_RAW", 13),
+        ("CAP_SYS_MODULE", 16),
+        ("CAP_SYS_RAWIO", 17),
+        ("CAP_SYS_BOOT", 22),
+        ("CAP_SYS_NICE", 23),
+        ("CAP_SYS_TIME", 25),
+        ("CAP_MKNOD", 27),
+        ("CAP_AUDIT_CONTROL", 30),
+        ("CAP_SYSLOG", 34),
+    ];
+
+    /// Capabilities the daemon MUST keep at runtime; the drop list must never
+    /// intersect this set (enforced by a unit test).
+    pub const RETAINED_CAPS: &[(&str, i32)] = &[
+        ("CAP_DAC_OVERRIDE", 1),
+        ("CAP_DAC_READ_SEARCH", 2),
+        ("CAP_SETPCAP", 8),       // needed to perform the bounding-set drop itself
+        ("CAP_SYS_PTRACE", 19),   // /proc enrichment of other processes
+        ("CAP_SYS_ADMIN", 21),    // BPF map ops on kernels without split CAP_BPF
+        ("CAP_SYS_RESOURCE", 24), // memlock rlimit for BPF
+        ("CAP_BPF", 39),
+    ];
+
+    pub fn enabled() -> bool {
+        std::env::var("JINNGUARD_HARDEN_CAPS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Set `no_new_privs` and drop the bounding-set capabilities. Best-effort:
+    /// failures are logged, never fatal (hardening must not break enforcement).
+    pub fn apply() {
+        let nnp = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if nnp == 0 {
+            eprintln!("[hardening] no_new_privs set");
+        } else {
+            eprintln!(
+                "[hardening] warning: PR_SET_NO_NEW_PRIVS failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let mut dropped = 0usize;
+        for (name, cap) in DROP_FROM_BOUNDING_SET {
+            let r = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, *cap as libc::c_ulong, 0, 0, 0) };
+            if r == 0 {
+                dropped += 1;
+            } else {
+                eprintln!(
+                    "[hardening] note: could not drop {name} from bounding set: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        eprintln!(
+            "[hardening] dropped {dropped}/{} dangerous capabilities from the bounding set",
+            DROP_FROM_BOUNDING_SET.len()
+        );
+    }
+}
+
+/// Process exit codes (sysexits.h convention) for machine-parseable *startup*
+/// failures, so a supervisor (systemd, an orchestrator) can branch on the cause
+/// instead of a generic exit 1. Once startup succeeds the daemon stays resident;
+/// these cover the fatal startup paths only.
+pub mod exit_codes {
+    pub const EX_UNAVAILABLE: i32 = 69; // a required service (kernel LSM) is unavailable
+    pub const EX_SOFTWARE: i32 = 70; // internal/unclassified startup error
+    pub const EX_CONFIG: i32 = 78; // missing/invalid configuration (e.g. HMAC secret)
+
+    /// The single machine-parseable fatal line:
+    /// `jinnguard: fatal code=<n> kind=<KIND> msg="<message>"`
+    pub fn format_fatal(code: i32, kind: &str, msg: &str) -> String {
+        format!("jinnguard: fatal code={code} kind={kind} msg={msg:?}")
+    }
+
+    /// Emit the fatal line to stderr and exit with `code`.
+    pub fn fatal(code: i32, kind: &str, msg: &str) -> ! {
+        eprintln!("{}", format_fatal(code, kind, msg));
+        std::process::exit(code);
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = run().await {
+        // Any startup error that propagated via `?` lands here with a structured,
+        // machine-parseable exit instead of a bare Debug print + exit 1.
+        exit_codes::fatal(
+            exit_codes::EX_SOFTWARE,
+            "STARTUP_FAILED",
+            &format!("{err:#}"),
+        );
+    }
+}
+
+async fn run() -> Result<()> {
     let args = CliArgs::parse();
     eprintln!(
         "[startup] pid={} socket_path={} policy_file={} kernel_telemetry_feature={} enterprise_required={} safe_mode={}",
@@ -3275,7 +3444,17 @@ async fn main() -> Result<()> {
     let nonce_store: Arc<Mutex<HashSet<(String, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
 
     eprintln!("[startup] initializing LSM verdict loop");
-    start_lsm_verdict_loop(Arc::clone(&active_policy), Arc::clone(&telemetry_store))?;
+    if let Err(err) =
+        start_lsm_verdict_loop(Arc::clone(&active_policy), Arc::clone(&telemetry_store))
+    {
+        // Fail-closed kernel-telemetry startup gets its own code so a supervisor
+        // can distinguish "kernel LSM unavailable" from a generic crash.
+        exit_codes::fatal(
+            exit_codes::EX_UNAVAILABLE,
+            "KERNEL_LSM_UNAVAILABLE",
+            &format!("{err:#}"),
+        );
+    }
     eprintln!("[startup] LSM verdict loop initialization complete");
 
     // ── SIGHUP: hot-reload policy ─────────────────────────────────────────
@@ -3490,7 +3669,10 @@ mod adaptive_floor_tests {
         let mut a = assessment(20.0);
         let (risk_before, trust_before) = (a.fused_risk, a.trust_score);
         apply_adaptive_penalty(&mut a, 3);
-        assert!(a.fused_risk >= risk_before, "adaptation may only raise risk");
+        assert!(
+            a.fused_risk >= risk_before,
+            "adaptation may only raise risk"
+        );
         assert!(
             a.trust_score <= trust_before,
             "adaptation may only lower trust"
@@ -3500,10 +3682,20 @@ mod adaptive_floor_tests {
     #[test]
     fn apply_zero_offenses_is_noop() {
         let mut a = assessment(20.0);
-        let before = (a.observed_risk, a.fused_risk, a.trust_score, a.reasons.len());
+        let before = (
+            a.observed_risk,
+            a.fused_risk,
+            a.trust_score,
+            a.reasons.len(),
+        );
         apply_adaptive_penalty(&mut a, 0);
         assert_eq!(
-            (a.observed_risk, a.fused_risk, a.trust_score, a.reasons.len()),
+            (
+                a.observed_risk,
+                a.fused_risk,
+                a.trust_score,
+                a.reasons.len()
+            ),
             before
         );
     }

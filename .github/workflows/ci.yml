@@ -189,25 +189,34 @@ jobs:
   # Job 6: eBPF build
   # ─────────────────────────────────────────────────────────────────────────────
   build-ebpf:
-    name: Build eBPF object
+    name: Build eBPF LSM objects
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang, llvm, libbpf-dev
+      - name: Install clang, llvm, libbpf-dev, bpftool
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) || \
-          sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic
+          sudo apt-get install -y clang llvm libbpf-dev bpftool
 
-      - name: Build eBPF object
-        run: make -C bpf
-        continue-on-error: true  # eBPF build may fail on older kernels; warn, don't block
+      # Generate vmlinux.h from the runner's own BTF, then compile each of the
+      # five LSM objects the daemon actually loads, with the exact flags used in
+      # scripts/validate_m2_path_resolution.sh. This GATES CI: a change that
+      # breaks BPF compilation (bad map, missing helper, etc.) now fails the build.
+      - name: Compile LSM objects (gating)
+        run: |
+          set -euo pipefail
+          cd bpf
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+          for f in lsm/jg_socket_connect lsm/jg_socket_sendmsg \
+                   lsm/jg_bprm_check_security lsm/jg_inode_create lsm/jg_inode_unlink; do
+            echo "  CLANG   $f.o"
+            clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include -I. -c "$f.c" -o "$f.o"
+          done
 
-      - name: Upload eBPF artifact
-        if: success() || steps.build-ebpf.outcome == 'success'
+      - name: Upload eBPF LSM objects
         uses: actions/upload-artifact@v4
         with:
-          name: jinnguard_ebpf-${{ github.sha }}
-          path: bpf/jinnguard_ebpf.o
-          if-no-files-found: warn
+          name: jinnguard-lsm-objects-${{ github.sha }}
+          path: bpf/lsm/*.o
+          if-no-files-found: error

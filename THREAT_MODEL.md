@@ -200,8 +200,14 @@ the same observation history always yields the same decision.
 | Multi-distribution / multi-kernel validation matrix | Engineering |
 | Automated HMAC key rotation | Engineering |
 | mTLS/auth for the optional MCP/remote semantic service | Engineering |
-| `CAP_BPF` privilege drop after program load | Hardening |
+| Full effective-set deprivilege after load | Hardening |
 | Monitoring/metrics export (Prometheus/OTel) | Operability |
+
+**Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup
+failures use structured machine-parseable exit codes; opt-in post-load
+capability hardening (`no_new_privs` + bounding-set drop via
+`JINNGUARD_HARDEN_CAPS=1`) reduces the daemon's post-compromise capability
+without affecting enforcement.
 
 ---
 

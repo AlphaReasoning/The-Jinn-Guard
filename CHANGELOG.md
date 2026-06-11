@@ -4,6 +4,25 @@ All notable changes to Jinn Guard are documented here. This project is a
 validated research prototype / controlled-pilot MVP; see
 [`THREAT_MODEL.md`](THREAT_MODEL.md) for the security model and honest scope.
 
+## [Unreleased]
+
+Post-rc1 productionization hardening (M7).
+
+### Added
+- **eBPF compilation gated in CI.** The `build-ebpf` job now installs `bpftool`,
+  generates `vmlinux.h` from the runner's BTF, and compiles all five LSM objects
+  with the validated clang flags. It no longer `continue-on-error`s — a change
+  that breaks BPF compilation now fails the build.
+- **Structured CLI exit codes.** Startup failures emit a single machine-parseable
+  line (`jinnguard: fatal code=<n> kind=<KIND> msg="…"`) and exit with a
+  sysexits-style code so a supervisor can branch on the cause: `78` config
+  (missing HMAC secret), `69` kernel LSM unavailable, `70` internal. Unit-tested.
+- **Opt-in capability hardening.** With `JINNGUARD_HARDEN_CAPS=1`, after the LSM
+  programs are loaded the daemon sets `no_new_privs` and drops a curated set of
+  dangerous capabilities (CAP_SYS_MODULE, CAP_NET_ADMIN, CAP_SYS_BOOT, …) from
+  the bounding set. Default off; never removes a capability the daemon needs at
+  runtime (guarded by a unit test) so enforcement is unaffected.
+
 ## [v1.0.0-rc1] — 2026-06-11
 
 First labeled release candidate. The governance pipeline, kernel enforcement,

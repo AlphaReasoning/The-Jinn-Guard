@@ -404,12 +404,20 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | eBPF C sources (4 programs + Makefile) | ✅ Source complete |
 | UDS saturation benchmark | ✅ Implemented |
 
+### ✅ Recently closed (post-rc1 hardening)
+
+| Item | Status |
+|---|---|
+| eBPF compilation gated in CI (compiles all 5 LSM objects, fails the build on a BPF regression) | ✅ Done |
+| Structured, machine-parseable CLI exit codes for startup failures (`code=`/`kind=`) | ✅ Done |
+| Opt-in capability hardening after BPF load — `no_new_privs` + bounding-set drop (`JINNGUARD_HARDEN_CAPS=1`) | ✅ Done |
+
 ### 🔴 Remaining gaps before 100%
 
 | Gap | Effort |
 |---|---|
-| eBPF compilation in CI (clang/libbpf in build image) | Medium |
 | mTLS for optional RootAI remote semantic service | Medium |
 | OpenTelemetry metrics export (Prometheus endpoint) | Medium |
-| `CAP_BPF` privilege drop after eBPF program load | Small |
-| Structured CLI error codes (machine-parseable) | Small |
+| Multi-distribution / multi-kernel validation matrix | Medium |
+| Full effective-set deprivilege after load (beyond the opt-in bounding-set hardening) | Medium |
+| Automated HMAC key rotation | Medium |
