@@ -138,6 +138,14 @@ enforcement_scope:
 agent_nodes: []
 YAML
 
+# Remove any stale pinned 'requests' ring buffer left by a previous daemon run.
+# It is pinned LIBBPF_PIN_BY_NAME so it outlives the process; a restarted daemon
+# that re-attaches to the old buffer receives ZERO kernel events. Clearing it
+# forces a fresh ring buffer, the same clean state as the very first run.
+if mountpoint -q /sys/fs/bpf 2>/dev/null || [ -d /sys/fs/bpf ]; then
+  find /sys/fs/bpf -maxdepth 3 -name requests -exec rm -f {} + 2>/dev/null || true
+fi
+
 # stdbuf -oL forces line-buffered stdout so every log line is written to the
 # file immediately, instead of sitting in a memory batch that is lost when we
 # stop the daemon at the end.
