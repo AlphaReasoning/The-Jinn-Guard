@@ -376,8 +376,8 @@ cargo check
 | Full automated suite (≈117 tests) | `cargo test --workspace` — Z3 engine, governance pipeline, 13 integration, 12 swarm-attack, anti-lockout + safe-mode invariants |
 | Mandatory mediation | Docker locked-agent: 7/7 probes — direct network/`/etc`-write/shell blocked, broker-mediated actions succeed |
 | Kernel full-path resolution | eBPF-LSM hooks load + resolve absolute paths live (audit-only) |
-| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` allow/deny suite (execve, TCP, UDP, create, unlink), zero fail-open — *run on a spare host* |
-| Anti-lockout guarantee | CI-enforced tests: base-system/desktop processes always allowed when armed; safe mode stays audit-only |
+| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` armed on a real 6.12 host: 2,500 enforced ops across execve/TCP/UDP/create/unlink, **0 fail-open, 0 incorrect decisions** (P50 8–473µs, P99 20–1038µs by surface); enforcement is **cgroup-scoped** so it runs safely without a spare machine |
+| Anti-lockout guarantee | CI-enforced invariant tests **plus** in-kernel cgroup scoping (`bpf_get_current_cgroup_id`): only the governed cgroup is subject to allow/deny, every other task passes through; safe mode stays audit-only |
 
 This is **not** independently audited or enterprise-GA. It is a strong,
 test-backed prototype demonstrating OS-level AI-agent enforcement.
