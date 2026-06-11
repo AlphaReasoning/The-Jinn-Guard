@@ -43,6 +43,17 @@ ok()   { printf '\033[1;32m   OK: %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m   ! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m   FAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# Run cargo as the user who invoked sudo (rustup installs cargo into that user's
+# ~/.cargo, which root's PATH does not see). A login shell picks up their PATH.
+# This also keeps target/ owned by the user instead of root.
+run_cargo() {
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    sudo -u "$SUDO_USER" -H bash -lc "cd '$REPO_ROOT' && cargo $*"
+  else
+    ( cd "$REPO_ROOT" && cargo "$@" )
+  fi
+}
+
 cleanup() {
   if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill "$DAEMON_PID" 2>/dev/null || true
@@ -63,15 +74,17 @@ missing=()
 command -v clang   >/dev/null 2>&1 || missing+=(clang)
 command -v bpftool >/dev/null 2>&1 || missing+=(bpftool)
 [[ -d /usr/include/bpf ]]          || missing+=(libbpf-dev)
-command -v cargo    >/dev/null 2>&1 || missing+=(cargo)
 if (( ${#missing[@]} )); then
   warn "missing: ${missing[*]}"
   warn "installing build tools via apt (clang libbpf-dev bpftool)..."
   apt-get update -y && apt-get install -y clang libbpf-dev bpftool || \
     die "could not install build tools; install ${missing[*]} and re-run."
 fi
-command -v cargo >/dev/null 2>&1 || die "cargo (Rust) not found; install rustup, then re-run."
-ok "clang, bpftool, libbpf, cargo present."
+# cargo belongs to the invoking user (rustup), not root — check it that way.
+if ! run_cargo --version >/dev/null 2>&1; then
+  die "cargo (Rust) not found for user '${SUDO_USER:-root}'. Install rustup as that user, then re-run."
+fi
+ok "clang, bpftool, libbpf present; cargo reachable as ${SUDO_USER:-root}."
 
 mkdir -p "$WORK"
 
@@ -96,10 +109,12 @@ install -d "$LSM_INSTALL_DIR"
 install -m 0644 "${BUILT[@]}" "$LSM_INSTALL_DIR/"
 ok "installed objects to $LSM_INSTALL_DIR"
 
-say "Step 4/7 — build the daemon (kernel feature)"
-cd "$REPO_ROOT"
-cargo build --release --features kernel_telemetry >/dev/null 2>&1 \
-  || die "daemon build failed; run 'cargo build --release --features kernel_telemetry' to see why."
+say "Step 4/7 — build the daemon (kernel feature, as ${SUDO_USER:-root})"
+if ! run_cargo build --release --features kernel_telemetry; then
+  die "daemon build failed; run 'cargo build --release --features kernel_telemetry' as ${SUDO_USER:-root} to see why."
+fi
+[[ -x "$REPO_ROOT/target/release/ts_cli" ]] \
+  || die "expected binary $REPO_ROOT/target/release/ts_cli not found after build."
 ok "built target/release/ts_cli"
 
 say "Step 5/7 — start the daemon in SAFE MODE (audit-only, blocks nothing)"
