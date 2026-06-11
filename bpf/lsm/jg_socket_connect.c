@@ -30,9 +30,21 @@ struct {
     __type(value, __u32);
 } runtime_controls SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} governed_scope SEC(".maps");
+
 
 SEC("lsm.s/socket_connect")
 int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, int addrlen) {
+    // Pass ungoverned tasks (e.g. the operator's desktop) straight through with
+    // no decision and no telemetry. Only the configured cgroup is enforced.
+    if (!jg_in_governed_scope(&governed_scope)) {
+        return 0;
+    }
     int audit_only = jg_audit_only_enabled(&runtime_controls);
     int sock_type = 0;
     __u16 family = 0;

@@ -37,6 +37,13 @@ struct {
     __type(value, __u32);
 } runtime_controls SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} governed_scope SEC(".maps");
+
 static __always_inline int jg_inode_basename_denied(const char *path)
 {
     struct jg_path_key key = {};
@@ -62,6 +69,11 @@ static __always_inline int jg_inode_dir_denied(struct inode *dir)
 
 SEC("lsm.s/inode_unlink")
 int BPF_PROG(jg_inode_unlink, struct inode *dir, struct dentry *dentry) {
+    // Pass ungoverned tasks (e.g. the operator's desktop) straight through with
+    // no decision and no telemetry. Only the configured cgroup is enforced.
+    if (!jg_in_governed_scope(&governed_scope)) {
+        return 0;
+    }
     int audit_only = jg_audit_only_enabled(&runtime_controls);
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;

@@ -12,17 +12,23 @@
 #   1. Build + full automated test suite      (always; no root, no Docker)
 #   2. Mandatory-mediation in Docker          (if Docker is installed)
 #   3. Kernel path resolution, AUDIT-ONLY     (if root + BPF-LSM; blocks nothing)
-#   4. Kernel ENFORCEMENT (allow/deny)        (only with --arm; SPARE MACHINE)
+#   4. Kernel ENFORCEMENT (allow/deny)        (only with --arm)
 #
 # SAFETY:
 #   Tiers 1-3 cannot block anything and cannot lock you out. Tier 4 arms real
-#   kernel denial and is OFF by default. Pass --arm ONLY on a disposable/spare
-#   machine (a reboot fully clears it). Do not --arm a machine you rely on.
+#   kernel denial, but enforcement is CGROUP-SCOPED to a dedicated test cgroup
+#   the suite creates and moves only its own probe processes into. Every other
+#   task on the host — including your desktop session — is structurally out of
+#   scope and passes through untouched. A wrong scope makes the test FAIL, not
+#   your machine. Belt-and-suspenders: a hard 10-minute watchdog tears the test
+#   down even if it hangs, and a reboot clears all kernel state regardless.
+#   Tier 4 still needs cgroup v2 (the default on modern Linux) and is OFF by
+#   default; pass --arm to enable it.
 #
 # USAGE:
 #   bash scripts/run_professor_validation.sh            # safe tiers (1-3)
 #   sudo bash scripts/run_professor_validation.sh       # add tier 3 (root)
-#   sudo bash scripts/run_professor_validation.sh --arm # add tier 4 (SPARE box)
+#   sudo bash scripts/run_professor_validation.sh --arm # add tier 4 (cgroup-scoped)
 #
 set -uo pipefail
 
@@ -66,7 +72,7 @@ c_info "cargo:       $([[ $HAS_CARGO -eq 1 ]] && echo "yes (user: $CARGO_USER)" 
 c_info "docker:      $([[ $HAS_DOCKER -eq 1 ]] && echo yes || echo 'no (tier 2 skipped)')"
 c_info "BPF-LSM:     $([[ $HAS_BPFLSM -eq 1 ]] && echo yes || echo 'no (tiers 3-4 skipped)')"
 c_info "clang:       $([[ $HAS_CLANG -eq 1 ]] && echo yes || echo 'no (tiers 3-4 skipped)')"
-c_info "arm tier 4:  $([[ $ARM -eq 1 ]] && echo 'YES (real denial — spare machine!)' || echo 'no (default; pass --arm to enable)')"
+c_info "arm tier 4:  $([[ $ARM -eq 1 ]] && echo 'YES (real denial — cgroup-scoped to the test only)' || echo 'no (default; pass --arm to enable)')"
 
 if [[ $HAS_CARGO -eq 0 ]]; then
   c_fail "cargo (Rust) is required even for tier 1. Install rustup as a normal user and re-run."
@@ -136,9 +142,14 @@ if [[ $ARM -eq 0 ]]; then
 elif [[ $IS_ROOT -eq 0 || $HAS_BPFLSM -eq 0 || $HAS_CLANG -eq 0 ]]; then
   c_skip "needs sudo + BPF-LSM + clang; skipping."
   mark T4 SKIP
+elif [[ ! -e /sys/fs/cgroup/cgroup.controllers ]]; then
+  c_skip "cgroup v2 not mounted at /sys/fs/cgroup; Tier 4 scoping needs it. Skipping."
+  mark T4 SKIP
 else
-  printf '\033[1;31m  WARNING: arming real kernel denial. Localhost networking and some\n'
-  printf '  process spawning are blocked during this tier. SPARE MACHINE ONLY.\033[0m\n'
+  printf '\033[1;33m  Arming real kernel denial, CGROUP-SCOPED to a dedicated test cgroup.\n'
+  printf '  Only the suite'\''s own probe processes are governed; the rest of this host\n'
+  printf '  (your desktop included) is out of scope. A 10-min watchdog + reboot are\n'
+  printf '  the safety net. cgroup v2 detected.\033[0m\n'
   if ! have bpftool; then c_info "installing bpftool..."; apt-get install -y bpftool >/dev/null 2>&1 || true; fi
   c_info "regenerating vmlinux.h, building + installing LSM objects..."
   ( cd bpf && bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null \

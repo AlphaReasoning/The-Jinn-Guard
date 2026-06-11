@@ -372,6 +372,11 @@ pub mod aya_backend {
     const JG_MAX_RESOURCE_LEN: usize = 128;
     const JG_CONTROL_KEY: u32 = 0;
     const JG_CONTROL_AUDIT_ONLY: u32 = 1;
+    // Key 0 of the per-object `governed_scope` array. Value 0 = govern every
+    // task (historical/deployed default); a non-zero cgroup-v2 id confines
+    // enforcement to that one cgroup so the operator's desktop is never denied.
+    const JG_SCOPE_KEY: u32 = 0;
+    const JG_SCOPE_GLOBAL: u64 = 0;
     const JG_SRC_INODE_CREATE: u32 = 1;
     const JG_SRC_INODE_UNLINK: u32 = 2;
     const JG_SRC_BPRM_CHECK_SECURITY: u32 = 3;
@@ -496,6 +501,10 @@ pub mod aya_backend {
         source_program: u32,
         verdicts: AyaHashMap<MapData, u64, VerdictPayload>,
         runtime_controls: Option<AyaArray<MapData, u32>>,
+        // Set once before attach (see load_lsm_object); retained only to keep the
+        // map handle owned for the object's lifetime.
+        #[allow(dead_code)]
+        governed_scope: Option<AyaArray<MapData, u64>>,
         ipv4_denylist: Option<AyaHashMap<MapData, u32, u8>>,
         allowed_exec_paths: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_basenames: Option<AyaHashMap<MapData, PathKey, u8>>,
@@ -521,6 +530,14 @@ pub mod aya_backend {
 
             let btf = Btf::from_sys_fs()
                 .map_err(|e| anyhow!("aya: failed to load kernel BTF from sysfs: {}", e))?;
+
+            // Resolve the enforcement scope ONCE, before any program attaches, so
+            // there is never a window in which hooks enforce host-wide. Default
+            // (env unset) is 0 = global, preserving the deployed behavior; setting
+            // JINNGUARD_GOVERN_CGROUP=<cgroup-v2 dir> confines enforcement to that
+            // cgroup. If a scope is requested but cannot be resolved we refuse to
+            // start rather than silently fall back to host-wide enforcement.
+            let governed_cgroup_id = resolve_governed_scope()?;
 
             let lsm_objects = [
                 (
@@ -567,6 +584,7 @@ pub mod aya_backend {
                     hook_name,
                     &btf,
                     safe_mode,
+                    governed_cgroup_id,
                     index == 0,
                 )?;
                 if object_requests.is_some() && requests.is_some() {
@@ -757,6 +775,7 @@ pub mod aya_backend {
         hook_name: &'static str,
         btf: &Btf,
         safe_mode: bool,
+        governed_cgroup_id: u64,
         take_requests: bool,
     ) -> Result<(LoadedLsmObject, Option<RingBuf<MapData>>)> {
         let data = std::fs::read(object_path)
@@ -795,6 +814,31 @@ pub mod aya_backend {
                 })?;
         }
 
+        // Confine enforcement to the requested cgroup BEFORE attaching, so the
+        // hook never runs host-wide. A value of 0 (default) means global. If a
+        // non-global scope is requested but the map is absent (older object),
+        // refuse to attach rather than enforce host-wide unexpectedly.
+        let mut governed_scope = optional_array_map(&mut bpf, "governed_scope", object_path)?;
+        match governed_scope.as_mut() {
+            Some(map) => {
+                map.set(JG_SCOPE_KEY, governed_cgroup_id, 0).map_err(|e| {
+                    anyhow!(
+                        "Failed to set governed_scope in {} to {}: {}",
+                        object_path,
+                        governed_cgroup_id,
+                        e
+                    )
+                })?;
+            }
+            None if governed_cgroup_id != JG_SCOPE_GLOBAL => {
+                return Err(anyhow!(
+                    "cgroup-scoped enforcement requested, but governed_scope map is missing in {} (rebuild the LSM objects)",
+                    object_path
+                ));
+            }
+            None => {}
+        }
+
         let prog: &mut Lsm = bpf
             .program_mut(prog_name)
             .ok_or_else(|| anyhow!("eBPF program '{}' not found in {}", prog_name, object_path))?
@@ -830,6 +874,7 @@ pub mod aya_backend {
                 source_program,
                 verdicts,
                 runtime_controls,
+                governed_scope,
                 ipv4_denylist,
                 allowed_exec_paths,
                 denied_basenames,
@@ -837,6 +882,72 @@ pub mod aya_backend {
             },
             requests,
         ))
+    }
+
+    /// Resolve the configured enforcement scope to a cgroup-v2 id (0 = global).
+    ///
+    /// `JINNGUARD_GOVERN_CGROUP` may name a cgroup-v2 directory (e.g.
+    /// `/sys/fs/cgroup/jinnguard`); only tasks in that cgroup are then governed.
+    /// Unset/empty means host-wide enforcement (the deployed default). A set but
+    /// unresolvable path is a hard error — we never silently widen the scope.
+    fn resolve_governed_scope() -> Result<u64> {
+        match std::env::var("JINNGUARD_GOVERN_CGROUP") {
+            Ok(path) if !path.is_empty() => {
+                let id = resolve_cgroup_id(&path)?;
+                eprintln!(
+                    "[eBPF LSM] enforcement confined to cgroup {path} (id {id}); all other tasks pass through"
+                );
+                Ok(id)
+            }
+            _ => Ok(JG_SCOPE_GLOBAL),
+        }
+    }
+
+    /// Return the cgroup-v2 id of a cgroup directory, matching the value the
+    /// kernel's `bpf_get_current_cgroup_id()` reports for tasks in it. The id is
+    /// the 64-bit kernfs node id encoded in the directory's NFS file handle.
+    fn resolve_cgroup_id(path: &str) -> Result<u64> {
+        #[repr(C)]
+        struct FileHandleBuf {
+            handle_bytes: libc::c_uint,
+            handle_type: libc::c_int,
+            f_handle: [u8; 128],
+        }
+
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|e| anyhow!("invalid cgroup path {}: {}", path, e))?;
+        let mut handle = FileHandleBuf {
+            handle_bytes: 128,
+            handle_type: 0,
+            f_handle: [0u8; 128],
+        };
+        let mut mount_id: libc::c_int = 0;
+        let ret = unsafe {
+            libc::name_to_handle_at(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                &mut handle as *mut FileHandleBuf as *mut libc::file_handle,
+                &mut mount_id,
+                0,
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow!(
+                "could not resolve cgroup id for {} (is it a cgroup-v2 directory?): {}",
+                path,
+                std::io::Error::last_os_error()
+            ));
+        }
+        if (handle.handle_bytes as usize) < std::mem::size_of::<u64>() {
+            return Err(anyhow!(
+                "unexpected cgroup file-handle size {} for {}",
+                handle.handle_bytes,
+                path
+            ));
+        }
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&handle.f_handle[..8]);
+        Ok(u64::from_le_bytes(id_bytes))
     }
 
     fn optional_array_map<V>(

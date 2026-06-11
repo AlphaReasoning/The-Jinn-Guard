@@ -59,6 +59,34 @@
     __jg_control_value && (*__jg_control_value & JG_CONTROL_AUDIT_ONLY); \
 })
 
+// Cgroup-scoped enforcement (the structural anti-lockout guarantee).
+//
+// The `governed_scope` array holds a single u64 at key 0:
+//   * 0  (JG_SCOPE_GLOBAL) or map missing -> govern every task on the host
+//     (the historical/deployed default; behavior is unchanged when nobody
+//     configures a scope).
+//   * non-zero -> a specific cgroup v2 id (the kernfs id returned by
+//     bpf_get_current_cgroup_id(), == the value name_to_handle_at() reports
+//     for the cgroup directory). ONLY tasks in that cgroup are subject to
+//     allow/deny; every other task is passed straight through (return 0).
+//
+// This lets armed enforcement be confined to a dedicated agent/test cgroup so
+// the operator's own desktop is never denied — the previous source of lockouts.
+#define JG_SCOPE_KEY 0
+#define JG_SCOPE_GLOBAL 0ULL
+
+#define jg_in_governed_scope(governed_scope) ({                    \
+    __u32 __jg_scope_key = JG_SCOPE_KEY;                           \
+    __u64 *__jg_scope_value =                                      \
+        bpf_map_lookup_elem((governed_scope), &__jg_scope_key);   \
+    int __jg_in_scope = 1;                                         \
+    if (__jg_scope_value && *__jg_scope_value != JG_SCOPE_GLOBAL) { \
+        __jg_in_scope =                                            \
+            (bpf_get_current_cgroup_id() == *__jg_scope_value);   \
+    }                                                             \
+    __jg_in_scope;                                                 \
+})
+
 struct jg_path_key {
     char path[JG_MAX_RESOURCE_LEN];
 };

@@ -69,6 +69,61 @@ fn operation_count() -> usize {
     count
 }
 
+/// A dedicated cgroup-v2 leaf used to confine kernel enforcement to this test
+/// process and its children. The daemon is told to govern only this cgroup
+/// (`JINNGUARD_GOVERN_CGROUP`), so arming real allow/deny here can never touch
+/// the rest of the host — the operator's desktop is structurally out of scope.
+struct CgroupScope {
+    path: PathBuf,
+}
+
+impl CgroupScope {
+    fn create(name: &str) -> Self {
+        let base = PathBuf::from("/sys/fs/cgroup");
+        assert!(
+            base.join("cgroup.controllers").exists(),
+            "cgroup v2 must be mounted at /sys/fs/cgroup to run the armed kernel tests"
+        );
+        let path = base.join(format!("jinnguard_test_{name}"));
+        let _ = fs::remove_dir(&path);
+        fs::create_dir(&path)
+            .unwrap_or_else(|err| panic!("create test cgroup {}: {err}", path.display()));
+        Self { path }
+    }
+
+    fn as_str(&self) -> &str {
+        self.path.to_str().expect("cgroup path is valid UTF-8")
+    }
+
+    /// Move this (whole) process into the scoped cgroup. Children spawned
+    /// afterwards inherit it, so their execve/connect/file ops are governed.
+    fn enter(&self) {
+        let pid = std::process::id().to_string();
+        fs::write(self.path.join("cgroup.procs"), &pid)
+            .unwrap_or_else(|err| panic!("move test process into {}: {err}", self.path.display()));
+    }
+
+    /// Return to the root cgroup. Idempotent; also lets the leaf be removed and
+    /// ensures any teardown work is no longer governed.
+    fn leave() {
+        let pid = std::process::id().to_string();
+        let _ = fs::write("/sys/fs/cgroup/cgroup.procs", pid);
+    }
+}
+
+impl Drop for CgroupScope {
+    fn drop(&mut self) {
+        Self::leave();
+        // The kernel removes the cgroup only once it is empty; retry briefly.
+        for _ in 0..50 {
+            if fs::remove_dir(&self.path).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 struct DaemonGuard {
     child: Child,
     socket_path: String,
@@ -76,6 +131,7 @@ struct DaemonGuard {
     lineage_path: String,
     audit_path: String,
     policy_path: String,
+    cgroup: CgroupScope,
 }
 
 impl DaemonGuard {
@@ -99,6 +155,10 @@ impl DaemonGuard {
         write_policy(&policy_path, fs_root);
         fs::write(&secret_path, TEST_SECRET).unwrap();
 
+        // Create the scoped cgroup BEFORE the daemon starts so the daemon can
+        // resolve its id and confine enforcement to it at attach time.
+        let cgroup = CgroupScope::create(name);
+
         let mcp_port = PORT_SEQ.fetch_add(1, Ordering::Relaxed).to_string();
         let mut command = Command::new(daemon_binary());
         command
@@ -117,12 +177,15 @@ impl DaemonGuard {
                 &mcp_port,
             ])
             .env("JINNGUARD_ENTERPRISE", "1")
+            .env("JINNGUARD_GOVERN_CGROUP", cgroup.as_str())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         for (key, value) in extra_env {
             command.env(key, value);
         }
 
+        // The daemon itself is spawned while we are still in the root cgroup, so
+        // the daemon is never governed by its own hooks.
         let child = command
             .spawn()
             .unwrap_or_else(|err| panic!("spawn enterprise daemon: {err}"));
@@ -130,6 +193,9 @@ impl DaemonGuard {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if std::path::Path::new(&socket_path).exists() {
+                // Hooks are attached and scoped; now move ourselves (and thus our
+                // future probe children) into the governed cgroup.
+                cgroup.enter();
                 return Self {
                     child,
                     socket_path,
@@ -137,6 +203,7 @@ impl DaemonGuard {
                     lineage_path,
                     audit_path,
                     policy_path,
+                    cgroup,
                 };
             }
             thread::sleep(Duration::from_millis(50));
@@ -150,6 +217,11 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        // Step out of the governed cgroup first so all teardown below (and the
+        // test harness afterwards) runs ungoverned, even though enforcement is
+        // still attached until the daemon dies. The `cgroup` field's own Drop
+        // then removes the now-empty leaf.
+        CgroupScope::leave();
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.socket_path);
