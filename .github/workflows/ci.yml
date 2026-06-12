@@ -17,7 +17,7 @@ jobs:
     name: Build (release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -112,7 +112,7 @@ jobs:
     name: Bench (compile check)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -147,7 +147,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -177,7 +177,7 @@ jobs:
     name: Format check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install rustfmt
         run: rustup component add rustfmt
@@ -192,12 +192,16 @@ jobs:
     name: Build eBPF LSM objects
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install clang, llvm, libbpf-dev, linux-tools-common
+      - name: Install clang, llvm, libbpf-dev, bpftool
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
+          # Standalone bpftool: a real libbpf-based binary that does NOT depend
+          # on a kernel-version-matched linux-tools package (the linux-tools-common
+          # wrapper has no usable bpftool on the runner kernel and exits non-zero).
+          sudo apt-get install -y clang llvm libbpf-dev bpftool
+          bpftool version
 
       # Generate vmlinux.h from the runner's own BTF, then compile each of the
       # five LSM objects the daemon actually loads, with the exact flags used in
