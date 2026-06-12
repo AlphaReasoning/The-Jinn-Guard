@@ -194,10 +194,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang, llvm, libbpf-dev, bpftool
+      - name: Install clang, llvm, libbpf-dev, linux-tools-common
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y clang llvm libbpf-dev bpftool
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
 
       # Generate vmlinux.h from the runner's own BTF, then compile each of the
       # five LSM objects the daemon actually loads, with the exact flags used in
