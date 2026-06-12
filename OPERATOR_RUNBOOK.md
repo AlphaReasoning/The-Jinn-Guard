@@ -1,0 +1,255 @@
+# Jinn Guard — Operator Runbook
+
+Operational guide for deploying, monitoring, upgrading, and recovering a Jinn
+Guard daemon. For the security model and scope see
+[`THREAT_MODEL.md`](THREAT_MODEL.md); for one-command validation see
+[`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md).
+
+> **Status:** validated research prototype / controlled-pilot MVP. Validated on
+> Debian / Linux 6.12. Treat any first deployment as a pilot.
+
+---
+
+## 1. What it is, operationally
+
+A single daemon (`/usr/sbin/jinnguard`) runs as the unprivileged `jinnguard`
+user. It listens on a Unix-domain socket for HMAC-signed *proposals* and returns
+allow/deny decisions, and (when the kernel feature is built and privileges
+allow) loads eBPF-LSM hooks that enforce decisions in the kernel. It is
+**fail-closed** for enterprise startup and **fail-safe** for the operator (safe
+mode and cgroup scoping below).
+
+---
+
+## 2. Paths & files
+
+| Path | Purpose | Perms |
+|---|---|---|
+| `/usr/sbin/jinnguard` | Daemon binary | 0755 |
+| `/etc/jinnguard/policy.yaml` | Policy (hot-reloadable) | 0640 root:jinnguard |
+| `/etc/jinnguard/secret` | HMAC-SHA256 secret | 0440 root:jinnguard |
+| `/usr/lib/jinnguard/lsm/*.o` | Compiled eBPF-LSM objects | 0644 |
+| `/run/jinnguard/jinnguard.sock` | Governance socket | 0750 dir |
+| `/var/lib/jinnguard/lineage.json(.db)` | Agent lineage state | — |
+| `/var/log/jinnguard/audit.log(.db)` | Hash-chained audit log | — |
+| `/etc/systemd/system/jinnguard.service` | systemd unit | 0644 |
+
+The secret is also loaded into the kernel keyring (`keyctl ... jinnguard_hmac_key
+@s`); the daemon falls back to the file if the keyring entry is absent.
+
+---
+
+## 3. Install
+
+From a checkout on the target host (needs root):
+
+```bash
+cargo build --release
+sudo bash deploy/install.sh        # creates user/dirs, generates secret, installs unit + binary
+sudo systemctl enable --now jinnguard
+```
+
+The installer refuses to proceed if the binary lacks the `JINNGUARD_SAFE_MODE`
+marker (a guard against shipping a build that cannot enter audit-only mode). To
+also install kernel enforcement objects, build them (`make -C bpf`, needs
+clang + bpftool) and install to `/usr/lib/jinnguard/lsm/`.
+
+---
+
+## 4. Configuration
+
+### Environment variables
+
+| Variable | Effect | Default |
+|---|---|---|
+| `JINNGUARD_SAFE_MODE=1` | **Audit-only**: hooks load but every decision returns allow. Nothing is blocked. | off |
+| `JINNGUARD_ENTERPRISE=1` | Fail-closed: startup *requires* kernel telemetry; refuse to run degraded. | set by unit |
+| `JINNGUARD_GOVERN_CGROUP=<dir>` | Confine kernel enforcement to one cgroup-v2; all other tasks pass through. | unset = global |
+| `JINNGUARD_HARDEN_CAPS=1` | After BPF load, set `no_new_privs` + drop dangerous caps from the bounding set. | off |
+| `JINNGUARD_METRICS_PORT=<port>` | Serve Prometheus metrics on `127.0.0.1:<port>/metrics`. | off |
+| `JINNGUARD_SECRET_FILE=<path>` | HMAC secret file location. | `/etc/jinnguard/secret` |
+| `ENABLE_EXPLAINABILITY=1` | Verbose per-decision explanations in the log. | off |
+
+CLI flags (set by the unit): `--socket-path --policy-file --secret-file
+--lineage-file --audit-log --mcp-port`.
+
+### Policy
+
+`/etc/jinnguard/policy.yaml` defines agents, allowlists, denylists, quotas,
+intents, the global safety ceiling, and optional `enforcement_scope`. It is
+**hot-reloaded on `SIGHUP`** — no restart needed:
+
+```bash
+sudo systemctl reload jinnguard    # or: sudo kill -HUP $(pidof jinnguard)
+```
+
+> Anti-lockout guard: base-system path prefixes are rejected at policy install
+> and re-excluded at lookup, so a bad policy cannot place the operator's own
+> system paths under governance.
+
+---
+
+## 5. Operating modes
+
+- **Audit-only (safe mode):** `JINNGUARD_SAFE_MODE=1`. Hooks observe and log but
+  block nothing. Use this for first bring-up on any host you care about.
+- **Enforcement:** safe mode off. The kernel actually denies. **Scope it** with
+  `JINNGUARD_GOVERN_CGROUP` so only the agent's cgroup is governed and the host
+  session is never affected. Global enforcement (scope unset) governs every
+  process — only do that on a dedicated host.
+
+---
+
+## 6. Start / stop / status
+
+```bash
+sudo systemctl start|stop|restart jinnguard
+sudo systemctl reload jinnguard          # SIGHUP: hot-reload policy only
+systemctl status jinnguard
+journalctl -u jinnguard -f               # live logs
+```
+
+---
+
+## 7. Monitoring & health
+
+### Prometheus metrics (opt-in)
+
+Set `JINNGUARD_METRICS_PORT` (e.g. add `Environment=JINNGUARD_METRICS_PORT=9095`
+to the unit). Endpoint is **loopback-only**; expose externally via a reverse
+proxy if needed.
+
+```bash
+curl -s 127.0.0.1:9095/metrics
+curl -s 127.0.0.1:9095/healthz          # "ok"
+```
+
+Key series:
+
+| Metric | Meaning |
+|---|---|
+| `jinnguard_uptime_seconds` | Daemon uptime |
+| `jinnguard_proposals_total` | Proposals received |
+| `jinnguard_decisions_total{verdict}` | Userspace allow/deny |
+| `jinnguard_denials_total{reason}` | Denials by reason (e.g. `DENY_REPLAY_ATTACK`) |
+| `jinnguard_kernel_decisions_total{verdict}` | Kernel-LSM allow/deny |
+| `jinnguard_build_info{version}` | Build version |
+
+Suggested alerts: daemon down (`up == 0` / no `uptime` scrape), a sudden spike in
+`jinnguard_denials_total`, or any rise in a `DENY_REPLAY_ATTACK` series.
+
+### Health checks
+
+- `systemctl is-active jinnguard` → `active`
+- Socket present: `test -S /run/jinnguard/jinnguard.sock`
+- `journalctl -u jinnguard | grep "JINN GUARD ACTIVE"` after start.
+
+### Audit log
+
+`/var/log/jinnguard/audit.log` is hash-chained (tamper-evident). Ship it to your
+log pipeline; back it up before rotation (§10).
+
+---
+
+## 8. Upgrade
+
+```bash
+# 1. Build + stage the new binary
+cargo build --release
+# 2. Quick pre-flight: the new binary must support safe mode
+grep -aq JINNGUARD_SAFE_MODE target/release/ts_cli || { echo "ABORT: bad build"; exit 1; }
+# 3. Swap and restart
+sudo install -m0755 target/release/ts_cli /usr/sbin/jinnguard
+sudo systemctl restart jinnguard
+# 4. Verify
+systemctl is-active jinnguard && journalctl -u jinnguard -n20 --no-pager
+```
+
+If kernel objects changed, rebuild + reinstall them (`make -C bpf`,
+`/usr/lib/jinnguard/lsm/`) before restart. The daemon clears any stale pinned
+ring buffer on startup, so a restart is safe.
+
+---
+
+## 9. Rollback
+
+```bash
+# Keep the previous binary as /usr/sbin/jinnguard.prev during upgrades.
+sudo install -m0755 /usr/sbin/jinnguard.prev /usr/sbin/jinnguard
+sudo systemctl restart jinnguard
+```
+
+Policy rollback: restore the previous `policy.yaml` and `systemctl reload`.
+Kernel state never persists across reboot, so a reboot is always a clean slate.
+
+---
+
+## 10. Incident response
+
+### Disable enforcement FAST (no lockout)
+
+Enforcement only exists while the daemon is alive and (for kernel denial) hooks
+are attached. To stop blocking immediately, in order of preference:
+
+```bash
+# 1. Drop to audit-only and reload (blocks nothing, keeps observability)
+sudo systemctl set-environment JINNGUARD_SAFE_MODE=1   # or edit the unit
+sudo systemctl restart jinnguard
+
+# 2. Or stop the daemon entirely — kernel hooks detach when it exits
+sudo systemctl stop jinnguard
+
+# 3. Last resort — reboot. bpffs is wiped on boot; nothing re-arms unless the
+#    service is enabled, so consider `systemctl disable jinnguard` first.
+sudo systemctl disable jinnguard && sudo reboot
+```
+
+Notes:
+- Kernel enforcement is **cgroup-scoped** when `JINNGUARD_GOVERN_CGROUP` is set,
+  so the operator session is structurally out of scope and a reboot is rarely
+  needed.
+- `SIGKILL` to the daemon is delivered by the kernel and is **not** subject to
+  the execve hook, so you can always kill the process even under global
+  enforcement.
+
+### Suspected key compromise
+
+Rotate the HMAC secret: write a new value to `/etc/jinnguard/secret`, update the
+keyring (`keyctl add user jinnguard_hmac_key "$(cat /etc/jinnguard/secret)" @s`),
+restart. All in-flight proposals signed with the old key are then rejected.
+
+---
+
+## 11. Troubleshooting
+
+### Exit codes (machine-parseable)
+
+On a startup failure the daemon prints `jinnguard: fatal code=<n> kind=<KIND>
+msg="..."` and exits:
+
+| Code | Kind | Cause / fix |
+|---|---|---|
+| 78 | `SECRET_MISSING` | No HMAC secret. Provide `--secret-file` or load the keyring key. |
+| 69 | `KERNEL_LSM_UNAVAILABLE` | Enterprise startup required kernel telemetry but the LSM load failed (no BPF-LSM, missing `/usr/lib/jinnguard/lsm/*.o`, or insufficient caps). |
+| 70 | `STARTUP_FAILED` | Other startup error; see the message + `journalctl`. |
+
+### Common issues
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Daemon exits 69 at start | BPF-LSM not enabled / objects missing | `cat /sys/kernel/security/lsm \| grep bpf`; install LSM objects; or run without `JINNGUARD_ENTERPRISE`. |
+| Hooks load but **no** telemetry events | Stale pinned ring buffer | Already auto-cleared on startup; if persistent, `rm /sys/fs/bpf/requests` and restart. |
+| `verifier` error on load | Kernel/BTF mismatch | Regenerate `vmlinux.h` from the host BTF and rebuild the objects. |
+| Everything denied unexpectedly | Global enforcement with a tight allowlist | Set `JINNGUARD_GOVERN_CGROUP`, or `JINNGUARD_SAFE_MODE=1` to confirm, then fix policy. |
+| Proposals rejected after a secret change | Key mismatch | Ensure file + keyring hold the same secret; restart. |
+
+---
+
+## 12. Backup & retention
+
+- **Audit log** (`/var/log/jinnguard/audit.log`): hash-chained; archive before
+  rotation to preserve the chain.
+- **Lineage DB** (`/var/lib/jinnguard/lineage.*`): per-agent sequence/replay
+  state; back up with the audit log so restored state stays consistent.
+- **Config** (`/etc/jinnguard/policy.yaml`, secret): keep in your secrets/config
+  management; the secret is sensitive (HMAC key).

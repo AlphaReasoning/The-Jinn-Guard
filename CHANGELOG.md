@@ -4,6 +4,19 @@ All notable changes to Jinn Guard are documented here. This project is a
 validated research prototype / controlled-pilot MVP; see
 [`THREAT_MODEL.md`](THREAT_MODEL.md) for the security model and honest scope.
 
+## [Unreleased]
+
+Operability (moving toward pilot-ready).
+
+### Added
+- **Prometheus `/metrics` endpoint** (opt-in via `JINNGUARD_METRICS_PORT`,
+  loopback-only). Dependency-free; exposes uptime, proposals, userspace
+  allow/deny (with denial reasons), kernel-LSM allow/deny, and build info. Adds a
+  `/healthz` liveness probe. No behavior change when unset.
+- **`OPERATOR_RUNBOOK.md`** — install, configuration, operating modes, start/stop,
+  monitoring, health checks, upgrade/rollback, incident response (disable
+  enforcement fast), exit-code reference, and troubleshooting.
+
 ## [v1.0.0-rc2] — 2026-06-11
 
 Productionization hardening (M7) and a green CI. No behavior change to the

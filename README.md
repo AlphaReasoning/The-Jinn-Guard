@@ -411,13 +411,15 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | eBPF compilation gated in CI (compiles all 5 LSM objects, fails the build on a BPF regression) | ✅ Done |
 | Structured, machine-parseable CLI exit codes for startup failures (`code=`/`kind=`) | ✅ Done |
 | Opt-in capability hardening after BPF load — `no_new_privs` + bounding-set drop (`JINNGUARD_HARDEN_CAPS=1`) | ✅ Done |
+| Prometheus `/metrics` + `/healthz` endpoint (opt-in `JINNGUARD_METRICS_PORT`, loopback) | ✅ Done |
+| Operator runbook ([`OPERATOR_RUNBOOK.md`](OPERATOR_RUNBOOK.md)): install, monitor, upgrade/rollback, incident response | ✅ Done |
 
 ### 🔴 Remaining gaps before 100%
 
 | Gap | Effort |
 |---|---|
 | mTLS for optional RootAI remote semantic service | Medium |
-| OpenTelemetry metrics export (Prometheus endpoint) | Medium |
+| OpenTelemetry export (the Prometheus endpoint exists; OTel/push not yet) | Medium |
 | Multi-distribution / multi-kernel validation matrix | Medium |
 | Full effective-set deprivilege after load (beyond the opt-in bounding-set hardening) | Medium |
 | Automated HMAC key rotation | Medium |

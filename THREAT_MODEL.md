@@ -201,7 +201,7 @@ the same observation history always yields the same decision.
 | Automated HMAC key rotation | Engineering |
 | mTLS/auth for the optional MCP/remote semantic service | Engineering |
 | Full effective-set deprivilege after load | Hardening |
-| Monitoring/metrics export (Prometheus/OTel) | Operability |
+| OpenTelemetry / push-based metrics (a loopback Prometheus `/metrics` endpoint already ships) | Operability |
 
 **Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup
 failures use structured machine-parseable exit codes; opt-in post-load

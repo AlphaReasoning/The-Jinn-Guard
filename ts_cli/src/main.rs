@@ -13,6 +13,7 @@ pub mod explainability;
 pub mod fleet_policy;
 pub mod governance;
 pub mod mcp_gateway;
+pub mod metrics;
 pub mod system_immunity;
 
 use anyhow::Result;
@@ -1013,6 +1014,7 @@ async fn write_framed_response(
     version: u8,
     data: &[u8],
 ) -> std::io::Result<()> {
+    metrics::record_response(data);
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&[version]).await?;
@@ -1074,6 +1076,7 @@ async fn handle_client_connection(
     secret_file: Option<String>,
     nonce_store: Arc<Mutex<HashSet<(String, u64)>>>,
 ) {
+    metrics::record_proposal();
     let Some(peer) = get_socket_peer_credentials(&stream) else {
         println!("[deny] failed to resolve kernel peer credentials");
         return;
@@ -2027,6 +2030,7 @@ fn run_lsm_verdict_loop(
             let policy_snapshot = active_policy.lock().unwrap().clone();
             let verdict = lsm_policy_verdict(&request, &policy_snapshot, safe_mode);
             let denied = matches!(verdict, Verdict::Deny);
+            metrics::record_kernel_decision(denied);
             emit_lsm_decision_explanation(&request, verdict);
 
             {
@@ -3454,6 +3458,19 @@ async fn run() -> Result<()> {
     let audit_logger = Arc::new(AuditLogger::new(&args.audit_log));
     let telemetry_store: TelemetryStore = Arc::new(Mutex::new(HashMap::new()));
     let nonce_store: Arc<Mutex<HashSet<(String, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Metrics: opt-in Prometheus endpoint on loopback (JINNGUARD_METRICS_PORT).
+    metrics::init();
+    if let Ok(port_str) = std::env::var("JINNGUARD_METRICS_PORT") {
+        match port_str.parse::<u16>() {
+            Ok(port) => {
+                tokio::spawn(metrics::serve(port));
+            }
+            Err(_) => eprintln!(
+                "[metrics] ignoring invalid JINNGUARD_METRICS_PORT={port_str:?} (want 1-65535)"
+            ),
+        }
+    }
 
     eprintln!("[startup] initializing LSM verdict loop");
     if let Err(err) =
