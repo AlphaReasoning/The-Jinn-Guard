@@ -8,6 +8,69 @@ Operating locally over high-throughput **UNIX domain sockets** on AlphaOS, the p
 
 ---
 
+## 📊 Performance & Security at a Glance (measured)
+
+Every number below comes from running the **real daemon** on a **real machine**
+(AMD Ryzen 5 7520U, 8 cores, Linux 6.12), with each request driven through the
+**complete decision pipeline** — nothing is faked or stubbed. Measured 2026-06-12.
+Reproduce locally:
+
+```bash
+cargo bench --bench stress_bench          # speed + throughput
+cargo test --release --test swarm_attack  # attack resistance
+```
+
+Full detail: [`BENCHMARKS-6-12-26.md`](BENCHMARKS-6-12-26.md).
+
+### ⚡ How fast is each decision?
+
+One "decision" = a full security check (verify signature → replay/identity/intent/
+quota gates → risk + Z3 math ceiling → audit). Across **10,000 requests**:
+
+| Half of requests finish under | 95% finish under | 99% finish under | Slowest |
+|:---:|:---:|:---:|:---:|
+| **257 µs** (P50) | **366 µs** (P95) | **463 µs** (P99) | 1.9 ms |
+
+> **In plain English:** a complete security decision takes about **a quarter of a
+> millisecond** — faster than the blink of an eye (~100 ms) by ~400×.
+
+### 🚀 How much can it handle?
+
+| Load | Throughput | Errors |
+|---|---|---|
+| 10–500 agents at once | **~6,500 decisions/sec** | **0** |
+| Single client | ~3,640 decisions/sec | 0 |
+| 5,000 mixed allow/deny | 100% classified correctly | 0 |
+
+> **In plain English:** it keeps up with **thousands of agent actions per second**
+> without a single dropped or wrong answer.
+
+### 🛡️ Can it be attacked or tricked?
+
+We ran **12 adversarial tests spanning 10 distinct attack types** against the live
+daemon (>1,200 hostile requests). All 12 passed — **0 fail-open** (it never once
+wrongly allowed an attack):
+
+| Attack | What it tries | Sent | Blocked |
+|---|---|:---:|:---:|
+| Replay storm | Re-send a captured valid request | 50 | 49 ✅ (1st allowed, rest blocked) |
+| Signature forgery | Tampered/forged signatures | 100 | 100 ✅ |
+| Intent injection | Call a forbidden action (`rm_all`) | 200 | 200 ✅ |
+| Quota exhaustion | Spam past the allowed limit | many | capped at exactly 5 ✅ |
+| Risk-ceiling breach | Push a too-risky action past the math limit | 50 | 50 ✅ |
+| Anonymous flood | Act with no identity | 200 | 200 ✅ |
+| Unknown agent | Impersonate an unregistered agent | 100 | 100 ✅ |
+| Bad protocol version | Malformed/old protocol | 50 | 50 ✅ |
+| Forged delegation | Fake a delegation token | 20 | 20 ✅ |
+| Path traversal (MCP) | Escape allowed paths | 20 | 20 ✅ |
+| **All 8 at once** (mixed) | Everything concurrently | 400 | 349 blocked + 50 real requests still correctly allowed ✅ |
+
+> **In plain English:** under a coordinated attack, it blocked every hostile
+> request, never failed open, stayed up, and *still* let a legitimate request
+> through correctly — in under a millisecond.
+
+---
+
 ## Rust Sandbox / Dev Environment
 
 This repository includes a reproducible Rust sandbox for development, CI-style
@@ -344,7 +407,7 @@ The merged object is loaded at runtime by the `aya-rs` backend inside the daemon
 ## 🧪 Development
 
 ```bash
-# Run all unit tests (4 Z3 + 12 governance)
+# Run the full suite (122 tests: 4 Z3 + 93 unit + 13 integration + 12 swarm-attack)
 cargo test
 
 # Run benchmarks
@@ -365,6 +428,11 @@ cargo check
 
 ## 📊 Validation status — validated research prototype / controlled-pilot MVP
 
+> **Looking for the headline numbers?** See
+> [📊 Performance & Security at a Glance](#-performance--security-at-a-glance-measured)
+> above, or [`BENCHMARKS-6-12-26.md`](BENCHMARKS-6-12-26.md) for full latency,
+> throughput, and attack-suite detail.
+>
 > **Independent reviewers:** see [`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md)
 > and run `bash scripts/run_professor_validation.sh` for a one-command, tiered
 > validation of everything below.
@@ -373,7 +441,7 @@ cargo check
 
 | Capability | How it was validated |
 |---|---|
-| Full automated suite (≈117 tests) | `cargo test --workspace` — Z3 engine, governance pipeline, 13 integration, 12 swarm-attack, anti-lockout + safe-mode invariants |
+| Full automated suite (122 tests) | `cargo test --workspace` — 4 Z3 + 93 unit + 13 integration + 12 swarm-attack, plus anti-lockout + safe-mode invariants |
 | Mandatory mediation | Docker locked-agent: 7/7 probes — direct network/`/etc`-write/shell blocked, broker-mediated actions succeed |
 | Kernel full-path resolution | eBPF-LSM hooks load + resolve absolute paths live (audit-only) |
 | Kernel allow/deny enforcement | `tests/kernel_lsm.rs` armed on a real 6.12 host: 2,500 enforced ops across execve/TCP/UDP/create/unlink, **0 fail-open, 0 incorrect decisions** (P50 8–473µs, P99 20–1038µs by surface); enforcement is **cgroup-scoped** so it runs safely without a spare machine |
