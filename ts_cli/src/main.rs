@@ -57,7 +57,9 @@ pub(crate) type TelemetryStore = Arc<Mutex<HashMap<u32, Vec<KernelTelemetryEvent
 
 #[derive(Debug, Clone)]
 pub(crate) struct KernelTelemetryEvent {
+    #[allow(dead_code)]
     pub event_type: String,
+    #[allow(dead_code)]
     pub resource: String,
     pub denied: bool,
 }
@@ -163,9 +165,12 @@ pub(crate) struct PolicyConfig {
     pub agent_nodes: HashMap<String, AgentNodePolicy>,
     pub deny_anonymous_agents: bool,
     pub allow_anonymous_override: bool,
+    #[allow(dead_code)]
     pub network_policy: NetworkPolicy,
     pub runtime_policy: RuntimePolicy,
+    #[allow(dead_code)]
     pub fleet_policy_min_version: u64,
+    #[allow(dead_code)]
     pub accept_cross_machine_lineage: bool,
 }
 
@@ -453,6 +458,9 @@ fn is_protected_system_path(path: &str) -> bool {
         || path.starts_with("/boot/")
 }
 
+// Exercised by the kernel_telemetry LSM verdict path and unit tests; dead in
+// the default user-space-only bin build.
+#[allow(dead_code)]
 fn is_trusted_process(request: &LsmRequest) -> bool {
     let path = request.process_path.as_deref().unwrap_or("");
 
@@ -2099,6 +2107,7 @@ fn lsm_policy_verdict(request: &LsmRequest, policy: &PolicyConfig, safe_mode: bo
     }
 }
 
+#[allow(dead_code)] // used by the kernel_telemetry verdict path + tests
 fn lsm_origin_gate_verdict(request: &LsmRequest) -> Option<Verdict> {
     let resource_path = request.effective_path();
 
@@ -2124,6 +2133,7 @@ fn lsm_origin_gate_verdict(request: &LsmRequest) -> Option<Verdict> {
     None
 }
 
+#[allow(dead_code)] // used by the kernel_telemetry verdict path + tests
 fn lsm_intent_response_verdict(
     request: &LsmRequest,
     risk: &explainability::IntentRiskLevel,
@@ -2192,6 +2202,7 @@ fn matches_network_entry(resource: &str, ip: &str, entries: &[String]) -> bool {
     })
 }
 
+#[allow(dead_code)] // used by the kernel_telemetry verdict path + tests
 fn lsm_exec_verdict(request: &LsmRequest, policy: &PolicyConfig) -> Verdict {
     let path = request.effective_path();
     if let Some(verdict) = lsm_origin_gate_verdict(request) {
@@ -2238,6 +2249,7 @@ where
     Verdict::Allow
 }
 
+#[allow(dead_code)] // used by the kernel_telemetry verdict path + tests
 fn path_matches_any(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         let pattern = pattern.trim();

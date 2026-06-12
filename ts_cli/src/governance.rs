@@ -814,6 +814,7 @@ pub struct RegistryData {
 pub struct LineageRegistry {
     db: Arc<Mutex<rusqlite::Connection>>,
     /// Legacy JSON path supplied by the caller (kept for backward-compat probing).
+    #[allow(dead_code)]
     file_path: String,
     pub data: RegistryData,
 }
@@ -822,10 +823,9 @@ pub struct LineageRegistry {
 /// If the path ends in `.json`, use `<stem>.db` alongside it.
 /// Otherwise use `<path>.db`.
 fn lineage_db_path(file_path: &str) -> String {
-    if file_path.ends_with(".json") {
-        format!("{}.db", &file_path[..file_path.len() - 5])
-    } else {
-        format!("{}.db", file_path)
+    match file_path.strip_suffix(".json") {
+        Some(stem) => format!("{stem}.db"),
+        None => format!("{file_path}.db"),
     }
 }
 

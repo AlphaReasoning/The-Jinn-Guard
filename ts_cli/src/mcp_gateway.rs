@@ -277,6 +277,10 @@ async fn write_http_response(
 // ---------------------------------------------------------------------------
 
 /// Handle a single incoming MCP gateway TCP connection.
+// A connection handler legitimately needs the full request context (transport,
+// peer, policy, registry, audit, telemetry, secret, upstream); bundling these
+// into a struct would not improve clarity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,

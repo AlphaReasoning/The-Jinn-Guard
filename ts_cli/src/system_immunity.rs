@@ -86,7 +86,7 @@ pub fn path_is_immune(path: &str) -> bool {
         return false;
     }
 
-    IMMUNE_EXACT_PATHS.iter().any(|allowed| trimmed == *allowed)
+    IMMUNE_EXACT_PATHS.contains(&trimmed)
         || IMMUNE_PATH_PREFIXES
             .iter()
             .any(|prefix| trimmed.starts_with(prefix))
@@ -94,7 +94,7 @@ pub fn path_is_immune(path: &str) -> bool {
 }
 
 pub fn process_name_is_immune(name: &str) -> bool {
-    IMMUNE_PROCESS_NAMES.iter().any(|allowed| name == *allowed)
+    IMMUNE_PROCESS_NAMES.contains(&name)
 }
 
 pub fn immunity_reason_for_observation(
