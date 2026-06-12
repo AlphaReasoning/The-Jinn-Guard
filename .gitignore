@@ -10,7 +10,9 @@ __pycache__/
 bpf/*.o
 bpf/*.bc
 bpf/lsm/*.o
-bpf/vmlinux.h
+# bpf/vmlinux.h is vendored (committed) so CI can compile the LSM objects without
+# bpftool/BTF on the runner. Regenerate with:
+#   bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
 target/
 release/
 validation/
