@@ -30,9 +30,13 @@ fi
 git archive --format=tar.gz --prefix=jinn-guard/ "$REF" -o "$NAME.tar.gz"
 git archive --format=zip    --prefix=jinn-guard/ "$REF" -o "$NAME.zip"
 
-# Sanity: the package must not contain build artifacts.
-if tar tzf "$NAME.tar.gz" | grep -qE "/target/|\.o$|\.bc$|vmlinux\.h$"; then
-  echo "ERROR: package unexpectedly contains build artifacts. Aborting."
+# Sanity: the package must not contain build artifacts, prebuilt binaries, or a
+# stale copy of itself. (.gitattributes export-ignore should already exclude the
+# known archives; this is a backstop.)
+if tar tzf "$NAME.tar.gz" | grep -qE "/target/|\.o$|\.bc$|vmlinux\.h$|\.tar\.gz$|\.zip$"; then
+  echo "ERROR: package unexpectedly contains build artifacts or archives. Aborting."
+  echo "Offending entries:"
+  tar tzf "$NAME.tar.gz" | grep -E "/target/|\.o$|\.bc$|vmlinux\.h$|\.tar\.gz$|\.zip$" | sed 's/^/  /'
   rm -f "$NAME.tar.gz" "$NAME.zip"
   exit 1
 fi

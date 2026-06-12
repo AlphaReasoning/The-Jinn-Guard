@@ -1,6 +1,9 @@
 build_debug.log
 *.log
 *.zip
+*.tar.gz
+jinn-guard-v1.0-review.tar.gz
+jinn-guard-v1.0-review.zip
 *.rlib
 *.pyc
 __pycache__/

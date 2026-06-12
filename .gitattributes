@@ -1,0 +1,8 @@
+# Keep release binaries and packaging artifacts OUT of `git archive` exports —
+# e.g. the reviewer package built by scripts/make_review_package.sh — while
+# leaving them in the working tree / history. The reviewer package is meant to be
+# clean, reviewable source; it should never bundle prebuilt binaries or a stale
+# copy of itself.
+Jinn-Guard-Enterprise17.2.zip export-ignore
+jinn-guard-v1.0-review.tar.gz export-ignore
+jinn-guard-v1.0-review.zip export-ignore
