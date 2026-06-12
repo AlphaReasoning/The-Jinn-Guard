@@ -194,24 +194,32 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install clang, llvm, libbpf-dev, bpftool
-        run: |
-          sudo apt-get update -qq
-          # Standalone bpftool: a real libbpf-based binary that does NOT depend
-          # on a kernel-version-matched linux-tools package (the linux-tools-common
-          # wrapper has no usable bpftool on the runner kernel and exits non-zero).
-          sudo apt-get install -y clang llvm libbpf-dev bpftool
-          bpftool version
-
-      # Generate vmlinux.h from the runner's own BTF, then compile each of the
-      # five LSM objects the daemon actually loads, with the exact flags used in
-      # scripts/validate_m2_path_resolution.sh. This GATES CI: a change that
-      # breaks BPF compilation (bad map, missing helper, etc.) now fails the build.
+      # Install clang/llvm/libbpf, obtain a working bpftool, generate vmlinux.h
+      # from the runner's own BTF, then compile each of the five LSM objects the
+      # daemon actually loads. This GATES CI: a change that breaks BPF compilation
+      # (bad map, missing helper, etc.) fails the build.
+      #
+      # bpftool is the fiddly part on GitHub runners: Ubuntu ships it inside
+      # linux-tools (no standalone package), and the /usr/sbin/bpftool wrapper
+      # dispatches by `uname -r` to the Azure-kernel tools, which may be absent.
+      # So we try the kernel-matched package, then the generic one, then locate
+      # the real binary directly — and verify it runs before relying on it.
       - name: Compile LSM objects (gating)
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y clang llvm libbpf-dev
+          sudo apt-get install -y "linux-tools-$(uname -r)" 2>/dev/null \
+            || sudo apt-get install -y linux-tools-generic linux-tools-common 2>/dev/null \
+            || true
+          BPFTOOL="$(command -v bpftool || true)"
+          if [ -z "$BPFTOOL" ] || ! "$BPFTOOL" version >/dev/null 2>&1; then
+            BPFTOOL="$(find /usr/lib /usr/sbin -type f -name bpftool 2>/dev/null | sort -V | tail -1)"
+          fi
+          echo "Using bpftool: ${BPFTOOL:-<none found>}"
+          "$BPFTOOL" version
           cd bpf
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+          "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
           for f in lsm/jg_socket_connect lsm/jg_socket_sendmsg \
                    lsm/jg_bprm_check_security lsm/jg_inode_create lsm/jg_inode_unlink; do
             echo "  CLANG   $f.o"
