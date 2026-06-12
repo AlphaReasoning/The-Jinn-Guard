@@ -4,9 +4,10 @@ All notable changes to Jinn Guard are documented here. This project is a
 validated research prototype / controlled-pilot MVP; see
 [`THREAT_MODEL.md`](THREAT_MODEL.md) for the security model and honest scope.
 
-## [Unreleased]
+## [v1.0.0-rc2] — 2026-06-11
 
-Post-rc1 productionization hardening (M7).
+Productionization hardening (M7) and a green CI. No behavior change to the
+governance or enforcement paths; everything validated in rc1 still holds.
 
 ### Added
 - **eBPF compilation gated in CI.** The `build-ebpf` job now installs `bpftool`,
@@ -22,6 +23,13 @@ Post-rc1 productionization hardening (M7).
   dangerous capabilities (CAP_SYS_MODULE, CAP_NET_ADMIN, CAP_SYS_BOOT, …) from
   the bounding set. Default off; never removes a capability the daemon needs at
   runtime (guarded by a unit test) so enforcement is unaffected.
+
+### Changed
+- **CI is fully green.** Resolved pre-existing `cargo fmt --check` and
+  `cargo clippy -- -D warnings` failures (manual suffix-strip → `strip_suffix`,
+  `iter().any()` → `Vec::contains`, an explicit `too_many_arguments` allow on the
+  MCP connection handler, and `dead_code` allows on items live only under the
+  `kernel_telemetry` verdict path / tests). No behavior change.
 
 ## [v1.0.0-rc1] — 2026-06-11
 
