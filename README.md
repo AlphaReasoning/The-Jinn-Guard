@@ -224,8 +224,22 @@ repo — happy to talk.
 
 - Linux kernel 5.16+
 - CONFIG_BPF_LSM=y
-- Boot parameter: lsm=bpf
-- bpftool installed (for vmlinux.h generation)
+- `bpf` present in the active LSM list (`cat /sys/kernel/security/lsm`)
+  - **Debian** cloud kernels often have it pre-armed.
+  - **Ubuntu** does not — append `bpf` to the existing list via the `lsm=` boot
+    parameter, then `update-grub` and reboot. For example, in
+    `/etc/default/grub`:
+    ```
+    GRUB_CMDLINE_LINUX="lsm=lockdown,capability,landlock,yama,apparmor,ima,evm,bpf"
+    ```
+    (List the modules already in `/sys/kernel/security/lsm` plus `bpf`; an
+    explicit `lsm=` replaces the kernel default, so include the full set.)
+- bpftool installed for `vmlinux.h` generation
+  (Debian: `bpftool`; Ubuntu: `linux-tools-generic`)
+
+Validated on two distributions / two kernel generations: **Debian 13 / kernel
+6.12** ([`BENCHMARKS-01.md`](BENCHMARKS-01.md), [`BENCHMARKS-02.md`](BENCHMARKS-02.md))
+and **Ubuntu 24.04 / kernel 6.17** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)).
 
 ---
 
@@ -260,11 +274,20 @@ strong as that allowlist.
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libz3-dev llvm clang libbpf-dev keyutils
+sudo apt install libz3-dev libssl-dev pkg-config llvm clang libbpf-dev keyutils
+
+# Ubuntu only: bpftool ships inside linux-tools (no standalone package)
+sudo apt install linux-tools-generic   # provides bpftool for vmlinux.h generation
 
 # Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
+
+> **Ubuntu note.** `libssl-dev` + `pkg-config` are required (the `openssl-sys`
+> dependency). And unlike Debian's cloud kernels, Ubuntu does **not** arm `bpf`
+> in its default LSM list — see [System Requirements](#system-requirements) to
+> enable it before running kernel enforcement. Validated end-to-end on Ubuntu
+> 24.04 / kernel 6.17 — see [`BENCHMARKS-03.md`](BENCHMARKS-03.md).
 
 ### Install (automated)
 
@@ -417,8 +440,10 @@ Options:
 ## 🧬 Building eBPF Programs
 
 ```bash
-# Prerequisites
-sudo apt install clang llvm libbpf-dev linux-headers-$(uname -r)
+# Prerequisites (Debian)
+sudo apt install clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+# On Ubuntu, bpftool comes from linux-tools-generic instead of a `bpftool` package:
+# sudo apt install clang llvm libbpf-dev linux-headers-$(uname -r) linux-tools-generic
 
 # Build all four programs and merge into jinnguard_ebpf.o
 cd bpf && make
@@ -464,14 +489,14 @@ cargo check
 > and run `bash scripts/run_professor_validation.sh` for a one-command, tiered
 > validation of everything below.
 
-**Validated on a real Linux 6.12 host:**
+**Validated on two real hosts — Debian 13 / kernel 6.12 and Ubuntu 24.04 / kernel 6.17:**
 
 | Capability | How it was validated |
 |---|---|
 | Full automated suite (122 tests) | `cargo test --workspace` — 4 Z3 + 93 unit + 13 integration + 12 swarm-attack, plus anti-lockout + safe-mode invariants |
 | Mandatory mediation | Docker locked-agent: 7/7 probes — direct network/`/etc`-write/shell blocked, broker-mediated actions succeed |
 | Kernel full-path resolution | eBPF-LSM hooks load + resolve absolute paths live (audit-only) |
-| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` armed on a real 6.12 host: 2,500 enforced ops across execve/TCP/UDP/create/unlink, **0 fail-open, 0 incorrect decisions** (P50 8–473µs, P99 20–1038µs by surface); enforcement is **cgroup-scoped** so it runs safely without a spare machine |
+| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` armed on a real 6.12 host: 2,500 enforced ops across execve/TCP/UDP/create/unlink, **0 fail-open, 0 incorrect decisions** (P50 8–473µs, P99 20–1038µs by surface); enforcement is **cgroup-scoped** so it runs safely without a spare machine. **Re-validated on Ubuntu 24.04 / kernel 6.17: 2,750 enforced ops, same 0 fail-open / 0 incorrect** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)) |
 | Anti-lockout guarantee | CI-enforced invariant tests **plus** in-kernel cgroup scoping (`bpf_get_current_cgroup_id`): only the governed cgroup is subject to allow/deny, every other task passes through; safe mode stays audit-only |
 
 This is **not** independently audited or enterprise-GA. It is a strong,
@@ -515,6 +540,6 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 |---|---|
 | mTLS for optional RootAI remote semantic service | Medium |
 | OpenTelemetry export (the Prometheus endpoint exists; OTel/push not yet) | Medium |
-| Multi-distribution / multi-kernel validation matrix | Medium |
+| Multi-distribution / multi-kernel validation matrix (Debian 13/6.12 + Ubuntu 24.04/6.17 done; RHEL-family next) | Medium |
 | Full effective-set deprivilege after load (beyond the opt-in bounding-set hardening) | Medium |
 | Automated HMAC key rotation | Medium |
