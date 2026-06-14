@@ -1,6 +1,7 @@
-# Jinn Guard — Benchmarks & Adversarial Results
+# Jinn Guard — Benchmark Run 01
 
-**Run date:** 2026-06-12
+**Test #:** 01 (baseline) · **Run date:** 2026-06-12 · **Host:** development laptop (Ryzen 5 7520U)
+**See also:** [`BENCHMARKS-02.md`](BENCHMARKS-02.md) — second host (Azure / Xeon).
 **Build:** `cargo build --release` (default features), end-to-end against the live daemon over the Unix-domain socket.
 
 > Every measurement below drives requests through the **full governance pipeline** —
@@ -28,6 +29,11 @@ cargo build --release
 cargo bench --bench stress_bench          # latency + throughput
 cargo test --release --test swarm_attack  # adversarial suite
 ```
+
+> The adversarial harness auto-detects the daemon binary (it prefers the build
+> profile the test was compiled with, then falls back to the other), so the
+> command above works on a clean checkout with no extra setup. To pin a specific
+> binary, set `JINNGUARD_TEST_BINARY=/path/to/ts_cli`.
 
 ---
 

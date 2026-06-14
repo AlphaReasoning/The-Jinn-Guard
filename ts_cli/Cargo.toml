@@ -34,7 +34,12 @@ aya = { version = "0.13", optional = true }
 [features]
 default = []
 kernel_telemetry = ["aya"]
-enterprise = ["kernel_telemetry"]
+# Signed fleet-policy client (pull + HMAC-verify + hot-reload a central bundle).
+# Off by default: the open-core build is single-node. The control-plane *server*
+# is not in this repo; this flag only compiles the client integration hook.
+fleet = []
+# Umbrella for the commercial build — turns on every enterprise integration.
+enterprise = ["kernel_telemetry", "fleet"]
 
 [[bench]]
 name = "throughput"

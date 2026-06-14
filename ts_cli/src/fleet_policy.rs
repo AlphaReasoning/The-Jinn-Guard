@@ -76,6 +76,47 @@ impl PolicyBundle {
     }
 }
 
+/// Outcome of evaluating an incoming bundle against the daemon's current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleDecision {
+    /// Newer, correctly-signed bundle — apply and ratchet the rollback floor.
+    Apply,
+    /// Version is below the rollback floor — refuse (rollback / replay attack).
+    RejectRollback,
+    /// Signature does not verify against the fleet key — refuse (tampered/forged).
+    RejectBadSignature,
+    /// Already running this exact version — no-op.
+    AlreadyApplied,
+}
+
+/// Decide what to do with a freshly-fetched bundle, given the daemon's current
+/// rollback floor (`min_version`) and the version it is already enforcing
+/// (`applied_version`). This is the single source of truth for the fleet
+/// accept/reject policy; the daemon's refresh loop calls it so the behaviour is
+/// exactly what these unit tests cover.
+///
+/// Rollback is checked **before** signature on purpose: a stale version is
+/// rejected as a rollback regardless of whether its signature is also bad, so a
+/// replay of an old (once-valid) bundle can never be applied. Both checks must
+/// pass before a bundle is eligible to apply, so the ordering is safe either way.
+pub fn evaluate_bundle(
+    bundle: &PolicyBundle,
+    min_version: u64,
+    applied_version: u64,
+    key: &[u8],
+) -> BundleDecision {
+    if bundle.version < min_version {
+        return BundleDecision::RejectRollback;
+    }
+    if !bundle.verify(key) {
+        return BundleDecision::RejectBadSignature;
+    }
+    if bundle.version == applied_version {
+        return BundleDecision::AlreadyApplied;
+    }
+    BundleDecision::Apply
+}
+
 // ---------------------------------------------------------------------------
 // Fleet policy fetcher
 // ---------------------------------------------------------------------------
@@ -272,6 +313,51 @@ mod tests {
     fn test_bundle_wrong_secret_fails_verify() {
         let bundle = make_bundle(42);
         assert!(!bundle.verify(b"wrong_secret"), "wrong secret should fail");
+    }
+
+    // ── evaluate_bundle: the daemon's accept/reject decision ──────────────
+    // These cover the exact path the refresh loop runs (it calls this fn).
+
+    #[test]
+    fn test_evaluate_apply_forward() {
+        // Newer, correctly-signed bundle than what we run -> apply.
+        let bundle = make_bundle(6);
+        let d = evaluate_bundle(&bundle, /*min*/ 5, /*applied*/ 3, TEST_SECRET);
+        assert_eq!(d, BundleDecision::Apply);
+    }
+
+    #[test]
+    fn test_evaluate_reject_rollback() {
+        // Validly-signed but BELOW the rollback floor -> refuse (replay attack).
+        let bundle = make_bundle(3);
+        let d = evaluate_bundle(&bundle, /*min*/ 5, /*applied*/ 0, TEST_SECRET);
+        assert_eq!(d, BundleDecision::RejectRollback);
+    }
+
+    #[test]
+    fn test_evaluate_reject_bad_signature() {
+        // New enough to clear the floor, but signed with the wrong key -> refuse.
+        let bundle = make_bundle(6);
+        let d = evaluate_bundle(&bundle, /*min*/ 5, /*applied*/ 0, b"wrong_key");
+        assert_eq!(d, BundleDecision::RejectBadSignature);
+    }
+
+    #[test]
+    fn test_evaluate_already_applied_is_noop() {
+        // Exactly the version we already enforce -> no-op (no needless reload).
+        let bundle = make_bundle(5);
+        let d = evaluate_bundle(&bundle, /*min*/ 5, /*applied*/ 5, TEST_SECRET);
+        assert_eq!(d, BundleDecision::AlreadyApplied);
+    }
+
+    #[test]
+    fn test_evaluate_rollback_takes_precedence_over_bad_signature() {
+        // A stale bundle with a bad signature is reported as a rollback: an old
+        // bundle can never be applied regardless of how it's (mis)signed.
+        let mut bundle = make_bundle(3);
+        bundle.signature = "deadbeef".to_string(); // also invalid
+        let d = evaluate_bundle(&bundle, /*min*/ 5, /*applied*/ 0, TEST_SECRET);
+        assert_eq!(d, BundleDecision::RejectRollback);
     }
 
     #[test]

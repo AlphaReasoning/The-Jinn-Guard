@@ -6,6 +6,16 @@
 
 Operating locally over high-throughput **UNIX domain sockets** on AlphaOS, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to guarantee absolute zero-trust process isolation and immutable anti-replay protection across the entire host subsystem.
 
+> ### ▶️ See it live in 5 minutes
+> ```bash
+> bash scripts/demo.sh        # or: bash scripts/demo.sh --auto
+> ```
+> A narrated dashboard that drives the **real daemon**: one legitimate request is
+> allowed, seven real attacks are blocked live, the daemon's own metrics are read
+> back, and the validated numbers + safety guarantees are walked through — plain
+> enough for a non-technical audience. Nothing is mocked. Presenter notes and
+> safety FAQ: [`DEMO.md`](DEMO.md).
+
 ---
 
 ## 📊 Performance & Security at a Glance (measured)
@@ -20,7 +30,7 @@ cargo bench --bench stress_bench          # speed + throughput
 cargo test --release --test swarm_attack  # attack resistance
 ```
 
-Full detail: [`BENCHMARKS-6-12-26.md`](BENCHMARKS-6-12-26.md).
+Full detail: [`BENCHMARKS-01.md`](BENCHMARKS-01.md).
 
 ### ⚡ How fast is each decision?
 
@@ -172,6 +182,23 @@ Kernel Layer (eBPF)
 | `bpf/` | eBPF C programs (execve, openat, connect, cap_capable) + Makefile |
 | `deploy/` | systemd unit + `install.sh` provisioner |
 | `tests/` | Integration test harness |
+
+---
+
+## 🏢 Fleet & Enterprise
+
+This repository is the **open-core, single-node** Jinn Guard: one host, local
+`policy.yaml`, governed by the kernel. It is fully functional standalone.
+
+Running Jinn Guard across **many hosts under one signed policy** — a control
+plane, central policy distribution with HMAC-signed bundles + rollback
+protection, hot-reload, and fleet dashboards — is the **enterprise** layer. The
+client side ships here as a stable integration hook compiled only with
+`--features enterprise` (off by default); the control-plane **server** and fleet
+tooling are distributed separately.
+
+Interested in fleet deployment or a pilot? Open an issue or reach out via the
+repo — happy to talk.
 
 ---
 
@@ -430,7 +457,7 @@ cargo check
 
 > **Looking for the headline numbers?** See
 > [📊 Performance & Security at a Glance](#-performance--security-at-a-glance-measured)
-> above, or [`BENCHMARKS-6-12-26.md`](BENCHMARKS-6-12-26.md) for full latency,
+> above, or [`BENCHMARKS-01.md`](BENCHMARKS-01.md) for full latency,
 > throughput, and attack-suite detail.
 >
 > **Independent reviewers:** see [`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md)

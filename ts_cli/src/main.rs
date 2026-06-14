@@ -10,6 +10,7 @@
 
 pub mod ebpf_monitor;
 pub mod explainability;
+#[cfg(feature = "fleet")]
 pub mod fleet_policy;
 pub mod governance;
 pub mod mcp_gateway;
@@ -109,6 +110,27 @@ struct CliArgs {
     /// Policy refresh interval in seconds
     #[arg(long, default_value_t = 60)]
     policy_refresh_secs: u64,
+    /// Signed fleet-policy bundle URL (open-core integration hook). The daemon
+    /// pulls a signed, versioned `PolicyBundle`, verifies its HMAC-SHA256
+    /// signature, enforces rollback protection, and hot-reloads it. The bundle
+    /// *server* (the fleet control plane) is external and pluggable — it is
+    /// deliberately not part of this open agent; this flag is the stable
+    /// integration point a fleet manager connects to. Compiled only with the
+    /// `fleet` feature (part of the `enterprise` build).
+    #[cfg(feature = "fleet")]
+    #[arg(long)]
+    fleet_policy_url: Option<String>,
+    /// Optional separate key file used to verify fleet bundle signatures.
+    /// Defaults to the admission secret (`--secret-file`) when unset.
+    #[cfg(feature = "fleet")]
+    #[arg(long)]
+    fleet_secret_file: Option<String>,
+    /// Optional path to cache the last verified fleet bundle, for offline
+    /// restart (the agent keeps enforcing the cached policy if the control
+    /// plane is unreachable).
+    #[cfg(feature = "fleet")]
+    #[arg(long)]
+    fleet_policy_cache: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +270,32 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
         fleet_policy_min_version: 0,
         accept_cross_machine_lineage: false,
     }
+}
+
+/// Parse policy YAML *content* (e.g., the `policy_yaml` field of a verified
+/// fleet bundle) into a `PolicyConfig`, applying the same enforcement-scope
+/// sync as a file load. Returns `None` when the content is not valid policy
+/// YAML, so a malformed push leaves the current policy untouched.
+#[cfg(feature = "fleet")]
+fn parse_policy_yaml(content: &str, allow_anonymous: bool) -> Option<PolicyConfig> {
+    let yaml = serde_yaml::from_str::<PolicyYaml>(content).ok()?;
+    let agent_nodes: HashMap<String, AgentNodePolicy> = yaml
+        .agent_nodes
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+    set_governed_scope_prefixes(&yaml.enforcement_scope.governed_path_prefixes);
+    Some(PolicyConfig {
+        upper_safety_boundary: yaml.global_safety_ceiling,
+        minimum_trust_score: 100.0 - yaml.global_safety_ceiling,
+        agent_nodes,
+        deny_anonymous_agents: yaml.deny_anonymous_agents || yaml.deny_anonymous,
+        allow_anonymous_override: allow_anonymous,
+        network_policy: yaml.network_policy,
+        runtime_policy: yaml.runtime_policy,
+        fleet_policy_min_version: yaml.fleet_policy_min_version,
+        accept_cross_machine_lineage: yaml.accept_cross_machine_lineage,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3577,6 +3625,141 @@ async fn run() -> Result<()> {
                         }
                     }
                     Err(e) => eprintln!("[policy-server] fetch error: {e}"),
+                }
+            }
+        });
+    }
+
+    // ── Optional: SIGNED fleet-policy bundle refresh (open-core hook) ─────────
+    // The daemon pulls a signed, versioned `PolicyBundle` from an external fleet
+    // control plane, verifies its HMAC-SHA256 signature against the fleet key,
+    // enforces rollback protection (the version must never regress), and
+    // hot-reloads. The control-plane *server* is intentionally NOT part of this
+    // open agent — this loop is the stable integration point a (commercial)
+    // fleet manager plugs into by speaking the bundle protocol. Every failure
+    // path keeps the current policy (fail-safe): a bad signature, a regressed
+    // version, an unreachable server, or unparseable content never weakens or
+    // clears the running policy.
+    #[cfg(feature = "fleet")]
+    if let Some(fleet_url) = args.fleet_policy_url.clone() {
+        let active_policy = Arc::clone(&active_policy);
+        let refresh_secs = args.policy_refresh_secs;
+        let allow_anonymous = args.allow_anonymous;
+        // Verify with a dedicated fleet key if provided, else the admission secret.
+        let fleet_key: Vec<u8> = match args.fleet_secret_file.as_deref() {
+            Some(path) => load_secret_from_file(Some(path)),
+            None => (*secret).clone(),
+        };
+        let cache_path = args.fleet_policy_cache.clone();
+        tokio::spawn(async move {
+            // Rollback floor: never accept a bundle older than this. Seeded from
+            // the active policy and ratcheted up as newer bundles are applied.
+            let mut min_version: u64 = active_policy.lock().unwrap().fleet_policy_min_version;
+            let mut applied_version: u64 = 0;
+
+            // Offline resilience: seed from the on-disk cache on startup.
+            if let Some(ref cp) = cache_path {
+                if let Some(bundle) = fleet_policy::load_cached_bundle(cp) {
+                    if bundle.version >= min_version && bundle.verify(&fleet_key) {
+                        if let Some(cfg) = parse_policy_yaml(&bundle.policy_yaml, allow_anonymous) {
+                            *active_policy.lock().unwrap() = cfg;
+                            applied_version = bundle.version;
+                            min_version = min_version.max(bundle.version);
+                            println!(
+                                "[fleet] seeded policy from cache (version={})",
+                                bundle.version
+                            );
+                        }
+                    }
+                }
+            }
+
+            let client = match reqwest::Client::builder().build() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[fleet] HTTP client build failed: {e}");
+                    return;
+                }
+            };
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
+
+                let resp = match client
+                    .get(&fleet_url)
+                    .header("accept", "application/json")
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[fleet] fetch error: {e}");
+                        continue;
+                    }
+                };
+                if !resp.status().is_success() {
+                    eprintln!("[fleet] server returned {}", resp.status());
+                    continue;
+                }
+                let body = match resp.text().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[fleet] read error: {e}");
+                        continue;
+                    }
+                };
+                let bundle: fleet_policy::PolicyBundle = match serde_json::from_str(&body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[fleet] bundle parse failed: {e}");
+                        continue;
+                    }
+                };
+                // Single source of truth for accept/reject (unit-tested in
+                // fleet_policy::tests). Rollback protection + signature
+                // verification both fail closed: the current policy is kept.
+                use fleet_policy::BundleDecision;
+                match fleet_policy::evaluate_bundle(
+                    &bundle,
+                    min_version,
+                    applied_version,
+                    &fleet_key,
+                ) {
+                    BundleDecision::RejectRollback => {
+                        eprintln!(
+                            "[fleet] REJECT bundle version {} < rollback floor {}",
+                            bundle.version, min_version
+                        );
+                        continue;
+                    }
+                    BundleDecision::RejectBadSignature => {
+                        eprintln!(
+                            "[fleet] REJECT bundle version {}: signature INVALID",
+                            bundle.version
+                        );
+                        continue;
+                    }
+                    BundleDecision::AlreadyApplied => continue,
+                    BundleDecision::Apply => {}
+                }
+                match parse_policy_yaml(&bundle.policy_yaml, allow_anonymous) {
+                    Some(cfg) => {
+                        *active_policy.lock().unwrap() = cfg;
+                        applied_version = bundle.version;
+                        min_version = min_version.max(bundle.version);
+                        if let Some(ref cp) = cache_path {
+                            if let Err(e) = fleet_policy::cache_bundle(&bundle, cp) {
+                                eprintln!("[fleet] cache write failed: {e}");
+                            }
+                        }
+                        println!(
+                            "[fleet] applied signed policy bundle version={} (rollback floor={})",
+                            bundle.version, min_version
+                        );
+                    }
+                    None => eprintln!(
+                        "[fleet] bundle version {} has unparseable policy_yaml; keeping current policy",
+                        bundle.version
+                    ),
                 }
             }
         });

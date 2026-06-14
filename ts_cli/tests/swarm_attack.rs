@@ -23,10 +23,30 @@ fn next_seq() -> u64 {
 const TEST_SECRET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn daemon_binary() -> String {
-    std::env::var("JINNGUARD_TEST_BINARY").unwrap_or_else(|_| {
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../target/debug/ts_cli", manifest)
-    })
+    // Explicit override always wins.
+    if let Ok(path) = std::env::var("JINNGUARD_TEST_BINARY") {
+        return path;
+    }
+    // Otherwise auto-detect, so both `cargo test` and `cargo test --release`
+    // work without setting JINNGUARD_TEST_BINARY: prefer the profile this test
+    // was built with, then fall back to the other if only one was compiled.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let release = format!("{manifest}/../target/release/ts_cli");
+    let debug = format!("{manifest}/../target/debug/ts_cli");
+    let (preferred, fallback) = if cfg!(debug_assertions) {
+        (debug, release)
+    } else {
+        (release, debug)
+    };
+    if std::path::Path::new(&preferred).exists() {
+        preferred
+    } else if std::path::Path::new(&fallback).exists() {
+        fallback
+    } else {
+        // Neither exists yet; return the preferred path so the spawn error names
+        // the binary the caller most likely intended to build.
+        preferred
+    }
 }
 
 fn write_policy(path: &str, quota: u64, allowed_intents: &[&str], deny_anon: bool) {

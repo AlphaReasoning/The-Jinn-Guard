@@ -18,3 +18,19 @@ release/
 validation/
 .devcontainer/.cache/
 .cargo/.package-cache/
+
+# ─── Open-core boundary: enterprise/fleet code is NOT in this public repo ─────
+# This PUBLIC repo is the single-node core. It ships only the client integration
+# HOOK — the signed `PolicyBundle` protocol behind the `fleet` Cargo feature
+# (part of `--features enterprise`). The fleet CONTROL PLANE (server), fleet ops,
+# customer policies, and signing keys live in the private `jinn-guard-enterprise`
+# repo. These patterns keep any such overlay out of the public repo if checked in
+# locally.
+/enterprise/
+/private/
+**/*.enterprise.rs
+# fleet signing keys + agent bundle caches must never be committed
+*.fleetkey
+fleet-secret*
+fleet.key
+*.bundle-cache.json

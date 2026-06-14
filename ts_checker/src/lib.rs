@@ -10,8 +10,21 @@ pub struct PolicyEngine<'a> {
 }
 
 impl<'a> PolicyEngine<'a> {
+    /// Per-`check()` solver timeout in milliseconds. Legitimate policy proofs
+    /// here involve a handful of linear constraints and resolve in microseconds;
+    /// this bound exists purely so a pathological or maliciously complex policy
+    /// cannot stall a decision indefinitely. On timeout Z3 returns
+    /// `SatResult::Unknown`, which every caller below treats as a DENY — so the
+    /// timeout fails *closed*, never open.
+    const SOLVER_TIMEOUT_MS: u32 = 250;
+
     pub fn new(ctx_ref: &'a Context) -> Self {
         let solver = Solver::new(ctx_ref);
+
+        // Bound worst-case solve time and fail closed on timeout (Unknown -> deny).
+        let mut params = z3::Params::new(ctx_ref);
+        params.set_u32("timeout", Self::SOLVER_TIMEOUT_MS);
+        solver.set_params(&params);
 
         Self {
             ctx: ctx_ref,

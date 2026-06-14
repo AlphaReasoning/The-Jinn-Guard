@@ -6,3 +6,11 @@
 Jinn-Guard-Enterprise17.2.zip export-ignore
 jinn-guard-v1.0-review.tar.gz export-ignore
 jinn-guard-v1.0-review.zip export-ignore
+
+# bpf/vmlinux.h is a 127k-line generated dump of kernel BTF, vendored only so CI
+# can compile the LSM objects without bpftool. It is not project source, so mark
+# it vendored + generated: GitHub Linguist then excludes it from the language
+# bar (which otherwise reports ~83% C from this one file instead of the
+# Rust-dominant reality) and collapses it in diffs.
+bpf/vmlinux.h linguist-vendored
+bpf/vmlinux.h linguist-generated

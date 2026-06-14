@@ -106,6 +106,51 @@ jobs:
         run: cargo test --bin ts_cli --features kernel_telemetry 2>&1
 
   # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2b: Fleet feature gate (open-core enterprise client)
+  # The signed-bundle client (`--fleet-policy-url`) compiles only with the
+  # `fleet` feature (off by default). The other jobs build feature-off; this one
+  # guarantees the gated code still compiles, lints, and that the accept/reject
+  # decision (apply-forward / reject-rollback / reject-bad-signature) is correct.
+  # ─────────────────────────────────────────────────────────────────────────────
+  fleet:
+    name: Fleet feature gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libz3-dev keyutils
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-fleet-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-fleet-
+
+      - name: Install clippy
+        run: rustup component add clippy
+
+      - name: Clippy (fleet feature, deny warnings)
+        run: cargo clippy -p ts_cli --features fleet -- -D warnings 2>&1
+
+      - name: Test fleet bundle accept/reject decision
+        run: cargo test -p ts_cli --features fleet --bin ts_cli fleet_policy 2>&1
+
+  # ─────────────────────────────────────────────────────────────────────────────
   # Job 3: Benchmark compilation check
   # ─────────────────────────────────────────────────────────────────────────────
   bench:
