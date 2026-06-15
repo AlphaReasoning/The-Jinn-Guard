@@ -98,12 +98,49 @@ generations**, including a RHEL-family host under SELinux Enforcing.
 
 ---
 
-## 5. Scope & honesty notes
+## 5. Userspace latency & throughput (CPU-isolated, tmpfs `/tmp`)
 
-- **Userspace latency/throughput not reported here.** Only the validation suite
-  and kernel enforcement were run on `jinn3`; the `stress_bench` harness was not.
-  (As established in [`BENCHMARKS-03.md`](BENCHMARKS-03.md) §4, a clean userspace
-  number on these small cloud VMs requires the audit log on fast storage/tmpfs.)
+`stress_bench` was run with the daemon's fsync'd audit log + lineage on tmpfs
+(as in [`BENCHMARKS-03.md`](BENCHMARKS-03.md) §4, to isolate the CPU/OS path from
+this VM's managed-disk write latency).
+
+> **Hardware note.** jinn3's 2 vCPU are a **newer/faster Azure generation** than
+> Runs 01–02 (Xeon E5-2673 v4 @ 2.3 GHz), so jinn3's **absolute** latencies are
+> lower — a CPU difference, not a distro one. What's comparable across distros is
+> **correctness** (identical) and the **shape** of the curves.
+
+### Single-client latency (10,000 sequential, full pipeline)
+
+| Percentile | jinn3 (AlmaLinux 9, tmpfs) |
+|---|---|
+| P50 | 475 µs |
+| P95 | 511 µs |
+| P99 | 531 µs |
+| Single-client RPS | ~2,075 |
+
+### Concurrent throughput (tmpfs `/tmp`; 0 errors at every level)
+
+| Agents | Total RPS | P50 |
+|---|---|---|
+| 10 | 6,061 | 315 µs |
+| 50 | 6,054 | 311 µs |
+| 100 | 6,039 | 310 µs |
+| 500 | 5,516 | 311 µs |
+
+Mixed 70/30 allow/deny: **3,500 / 1,500 classified correctly, 0 misclassifications**
+(2,274 RPS). Saturation: ~2,572–2,670 RPS across 2–16 threads, saturating at 32.
+
+> Same storage caveat as Run 03: the **on-disk** figure would be audit-fsync-bound
+> (tens of RPS on this VM's managed disk) — put `/var/log/jinnguard` and the
+> lineage file on fast local storage (SSD/NVMe) in production.
+
+---
+
+## 6. Scope & honesty notes
+
+- Absolute latencies above reflect jinn3's (faster) CPU; treat them as
+  representative of a small modern cloud node, not a universal guarantee. Kernel-
+  enforcement latencies (§2) are end-to-end per governed operation.
 - Single 2-vCPU VM; treat absolute latencies as representative of a small cloud
   node, not a universal guarantee. Kernel-enforcement latencies are end-to-end
   per governed operation.
@@ -112,7 +149,7 @@ generations**, including a RHEL-family host under SELinux Enforcing.
 
 ---
 
-## 6. What this run found and fixed — CVE-2026-003
+## 7. What this run found and fixed — CVE-2026-003
 
 On the **first** armed run, AlmaLinux 9 / 5.14 exposed a **fail-open** in
 `socket_connect`: a *variable* fraction (~30–55% under load) of denied TCP
