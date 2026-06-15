@@ -125,6 +125,7 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 |---|---|---|---|
 | **CVE-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual: sub-mount paths resolve relative to their mount root — root-fs paths (`/etc`,`/usr`,`/opt`) resolve absolutely (§7). |
 | **CVE-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
+| **CVE-2026-003** — load-window fail-open in LSM enforcement | High | **Fixed (code); re-validation pending** | Hooks were attached **before** the in-kernel deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`) were populated, so operations in that window consulted an empty policy and were **ALLOWED (fail-open)**. Surfaced on AlmaLinux 9 / kernel 5.14 — `socket_connect` leaked ~39% of denied connects under load (varied 97/60 ⇒ a race), `setenforce 0` ruled out SELinux, and a minimal standalone reproducer (`bpf/probe/connect_min/`) showed the kernel honors a sleepable `socket_connect -EPERM` **deterministically (1500/1500, 0 leak)** — i.e. the race was ours, **not the kernel/distro**. Fixed by **populate-then-attach**: `AyaLsmMonitor::load` now loads programs *without* attaching; attach is deferred to `attach_all()` and runs only after `configure_policy()` has filled the maps (`ebpf_monitor.rs`, `main.rs`). |
 
 ---
 
@@ -137,7 +138,12 @@ desktop). It is now addressed structurally in three layers:
 1. **Safe mode (audit-only).** The kernel programs set an audit-only control bit
    **before** they attach (`ebpf_monitor.rs`); every hook returns `0` (allow)
    regardless of the computed decision. A missing control map → refusal to load
-   (fail-safe). Invariant-tested (`safe_mode_invariants`).
+   (fail-safe). Invariant-tested (`safe_mode_invariants`). More generally, **all**
+   in-kernel policy maps (scope, the audit-only bit, and every deny-list) are
+   populated *before* any program attaches: `load` loads the programs and
+   `attach_all` attaches them only after `configure_policy` has filled the maps,
+   so a hook never enforces against an empty policy (populate-then-attach;
+   closes CVE-2026-003).
 2. **cgroup-scoped enforcement.** Each hook calls `bpf_get_current_cgroup_id()`
    and **passes through any task not in the governed cgroup** before doing any
    work — no decision, no telemetry. The scope id is written to the map *before*

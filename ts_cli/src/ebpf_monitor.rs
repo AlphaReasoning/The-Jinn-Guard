@@ -496,8 +496,12 @@ pub mod aya_backend {
     }
 
     struct LoadedLsmObject {
-        _bpf: Ebpf,
+        bpf: Ebpf,
         object_path: &'static str,
+        // Retained so the program can be attached later, after policy maps are
+        // populated (see AyaLsmMonitor::attach_all / the load-window fail-open fix).
+        prog_name: &'static str,
+        hook_name: &'static str,
         source_program: u32,
         verdicts: AyaHashMap<MapData, u64, VerdictPayload>,
         runtime_controls: Option<AyaArray<MapData, u32>>,
@@ -613,6 +617,36 @@ pub mod aya_backend {
                 program_routes,
                 pending_routes: StdHashMap::new(),
             })
+        }
+
+        /// Attach every loaded LSM program to its hook.
+        ///
+        /// MUST be called only AFTER [`configure_policy`](Self::configure_policy)
+        /// has populated the in-kernel deny maps. `load` deliberately loads the
+        /// programs without attaching them: attaching a hook before its policy
+        /// map is populated leaves a window in which the hook consults an empty
+        /// map and ALLOWS the operation (fail OPEN). Populate-then-attach removes
+        /// that window entirely. See THREAT_MODEL.md (load-window fail-open).
+        pub(crate) fn attach_all(&mut self) -> Result<()> {
+            for object in &mut self.objects {
+                let prog: &mut Lsm = object
+                    .bpf
+                    .program_mut(object.prog_name)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "eBPF program '{}' not found in {}",
+                            object.prog_name,
+                            object.object_path
+                        )
+                    })?
+                    .try_into()?;
+                prog.attach()?;
+                println!(
+                    "[eBPF LSM] Attached '{}' from '{}' to '{}' hook.",
+                    object.prog_name, object.object_path, object.hook_name
+                );
+            }
+            Ok(())
         }
 
         /// Populate in-kernel policy maps before hooks are used for enforcement.
@@ -768,6 +802,9 @@ pub mod aya_backend {
         }
     }
 
+    // Loads one LSM object (program + maps + scope) but does NOT attach it;
+    // attaching is deferred to AyaLsmMonitor::attach_all after policy load.
+    #[allow(clippy::too_many_arguments)]
     fn load_lsm_object(
         source_program: u32,
         object_path: &'static str,
@@ -839,15 +876,12 @@ pub mod aya_backend {
             None => {}
         }
 
-        let prog: &mut Lsm = bpf
-            .program_mut(prog_name)
-            .ok_or_else(|| anyhow!("eBPF program '{}' not found in {}", prog_name, object_path))?
-            .try_into()?;
-        prog.attach()?;
-        println!(
-            "[eBPF LSM] Attached '{}' from '{}' to '{}' hook.",
-            prog_name, object_path, hook_name
-        );
+        // NOTE: the program is intentionally NOT attached here. Attaching is
+        // deferred to AyaLsmMonitor::attach_all(), which the caller invokes only
+        // AFTER configure_policy() has populated the in-kernel deny maps. A hook
+        // attached before its policy map is populated would consult an empty map
+        // and ALLOW the operation (fail OPEN) for the duration of that window.
+        // See THREAT_MODEL.md (load-window fail-open).
 
         let requests = if take_requests {
             Some(RingBuf::try_from(bpf.take_map("requests").ok_or_else(
@@ -869,8 +903,10 @@ pub mod aya_backend {
 
         Ok((
             LoadedLsmObject {
-                _bpf: bpf,
+                bpf,
                 object_path,
+                prog_name,
+                hook_name,
                 source_program,
                 verdicts,
                 runtime_controls,

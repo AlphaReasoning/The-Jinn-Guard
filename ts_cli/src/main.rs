@@ -2023,7 +2023,15 @@ fn start_lsm_verdict_loop(
             anyhow::anyhow!("fail-closed: failed to configure in-kernel LSM policy maps: {err}")
         })?;
 
-    // LSM programs are now loaded, attached, and configured. Optionally shed the
+    // Attach the hooks ONLY now that the in-kernel deny maps are fully populated.
+    // Attaching before this point would leave a window in which a live hook
+    // consults an empty policy map and fails OPEN. See THREAT_MODEL.md
+    // (load-window fail-open) and AyaLsmMonitor::attach_all.
+    monitor.attach_all().map_err(|err| {
+        anyhow::anyhow!("fail-closed: failed to attach LSM hooks after policy load: {err}")
+    })?;
+
+    // LSM programs are now loaded, configured, and attached. Optionally shed the
     // privileges we no longer need (opt-in; never breaks enforcement).
     if capability_hardening::enabled() {
         capability_hardening::apply();
