@@ -131,6 +131,31 @@ this VM's managed-disk write latency).
 Mixed 70/30 allow/deny: **3,500 / 1,500 classified correctly, 0 misclassifications**
 (2,274 RPS). Saturation: ~2,572–2,670 RPS across 2–16 threads, saturating at 32.
 
+### Cross-distribution performance (effectively CPU-bound)
+
+Userspace numbers across all three validation hosts. jinn1 used fast local
+storage; jinn2/jinn3 placed the audit log + lineage on tmpfs `/tmp` — so all
+three are effectively CPU-bound, isolating the OS/pipeline from disk latency.
+
+| Host · distro / kernel | CPU (2 vCPU) | P50 | P95 | Single RPS | Peak concurrent RPS |
+|---|---|---:|---:|---:|---:|
+| jinn1 · Debian 13 / 6.12 (Run 02) | Xeon E5-2673 v4 @ 2.3 GHz | 707 µs | 1,065 µs | ~1,323 | ~3,074 |
+| jinn2 · Ubuntu 24.04 / 6.17 (Run 03) | Xeon E5-2673 v4 @ 2.3 GHz | 717 µs | 998 µs | ~1,343 | ~3,250 |
+| jinn3 · AlmaLinux 9 / 5.14 (Run 04) | Xeon Platinum 8272CL @ 2.6 GHz | **475 µs** | **511 µs** | **~2,075** | **~6,061** |
+
+Two reads, deliberately kept separate:
+
+- **Distribution independence (controlled — identical CPU).** jinn1 (Debian) and
+  jinn2 (Ubuntu) run the *same* Xeon E5-2673 v4: P50 **707 vs 717 µs** (~1.4%),
+  single-client **~1,323 vs ~1,343 RPS**, peak concurrent **~3,074 vs ~3,250 RPS**.
+  Within run-to-run noise → the governance pipeline performs the **same across
+  distributions**. This is the defensible cross-distro performance claim.
+- **CPU scaling (not a distro effect).** jinn3 (AlmaLinux) shows ~1.5× lower P50
+  and ~1.9× higher peak throughput — but on a newer **Xeon Platinum 8272CL
+  (Cascade Lake @ 2.6 GHz)**. That reflects the **hardware**, not the distribution;
+  it should **not** be read as "RHEL/AlmaLinux is faster." It does show the
+  pipeline scales cleanly with newer silicon.
+
 > Same storage caveat as Run 03: the **on-disk** figure would be audit-fsync-bound
 > (tens of RPS on this VM's managed disk) — put `/var/log/jinnguard` and the
 > lineage file on fast local storage (SSD/NVMe) in production.
