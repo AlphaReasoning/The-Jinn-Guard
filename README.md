@@ -237,9 +237,10 @@ repo — happy to talk.
 - bpftool installed for `vmlinux.h` generation
   (Debian: `bpftool`; Ubuntu: `linux-tools-generic`)
 
-Validated on two distributions / two kernel generations: **Debian 13 / kernel
-6.12** ([`BENCHMARKS-01.md`](BENCHMARKS-01.md), [`BENCHMARKS-02.md`](BENCHMARKS-02.md))
-and **Ubuntu 24.04 / kernel 6.17** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)).
+Validated on three distributions / three kernel generations: **Debian 13 / kernel
+6.12** ([`BENCHMARKS-01.md`](BENCHMARKS-01.md), [`BENCHMARKS-02.md`](BENCHMARKS-02.md)),
+**Ubuntu 24.04 / kernel 6.17** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)), and
+**AlmaLinux 9 / kernel 5.14 under SELinux Enforcing** ([`BENCHMARKS-04.md`](BENCHMARKS-04.md)).
 
 ---
 
@@ -489,14 +490,14 @@ cargo check
 > and run `bash scripts/run_professor_validation.sh` for a one-command, tiered
 > validation of everything below.
 
-**Validated on two real hosts — Debian 13 / kernel 6.12 and Ubuntu 24.04 / kernel 6.17:**
+**Validated on three real hosts — Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9 / kernel 5.14 (SELinux Enforcing):**
 
 | Capability | How it was validated |
 |---|---|
 | Full automated suite (122 tests) | `cargo test --workspace` — 4 Z3 + 93 unit + 13 integration + 12 swarm-attack, plus anti-lockout + safe-mode invariants |
 | Mandatory mediation | Docker locked-agent: 7/7 probes — direct network/`/etc`-write/shell blocked, broker-mediated actions succeed |
 | Kernel full-path resolution | eBPF-LSM hooks load + resolve absolute paths live (audit-only) |
-| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` armed on a real 6.12 host: 2,500 enforced ops across execve/TCP/UDP/create/unlink, **0 fail-open, 0 incorrect decisions** (P50 8–473µs, P99 20–1038µs by surface); enforcement is **cgroup-scoped** so it runs safely without a spare machine. **Re-validated on Ubuntu 24.04 / kernel 6.17: 2,750 enforced ops, same 0 fail-open / 0 incorrect** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)) |
+| Kernel allow/deny enforcement | `tests/kernel_lsm.rs` armed on a real 6.12 host: 2,500 enforced ops across execve/TCP/UDP/create/unlink, **0 fail-open, 0 incorrect decisions** (P50 8–473µs, P99 20–1038µs by surface); enforcement is **cgroup-scoped** so it runs safely without a spare machine. **Re-validated on Ubuntu 24.04 / kernel 6.17** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)) **and AlmaLinux 9 / kernel 5.14 under SELinux Enforcing** (2,750 ops, 0 fail-open / 0 incorrect; [`BENCHMARKS-04.md`](BENCHMARKS-04.md)) |
 | Anti-lockout guarantee | CI-enforced invariant tests **plus** in-kernel cgroup scoping (`bpf_get_current_cgroup_id`): only the governed cgroup is subject to allow/deny, every other task passes through; safe mode stays audit-only |
 
 This is **not** independently audited or enterprise-GA. It is a strong,
@@ -540,6 +541,6 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 |---|---|
 | mTLS for optional RootAI remote semantic service | Medium |
 | OpenTelemetry export (the Prometheus endpoint exists; OTel/push not yet) | Medium |
-| Multi-distribution / multi-kernel validation matrix (Debian 13/6.12 + Ubuntu 24.04/6.17 done; RHEL-family next) | Medium |
+| Multi-distribution / multi-kernel validation matrix (Debian 13/6.12 + Ubuntu 24.04/6.17 + AlmaLinux 9/5.14 done; broaden coverage over time) | Medium |
 | Full effective-set deprivilege after load (beyond the opt-in bounding-set hardening) | Medium |
 | Automated HMAC key rotation | Medium |

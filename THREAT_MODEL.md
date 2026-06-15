@@ -169,8 +169,16 @@ wraps armed runs in a hard 10-minute watchdog.
 
 1. **Not independently audited.** This document is a self-review. Third-party
    audit is the headline open item.
-2. **Single-distribution validation.** Validated on Debian/trixie, kernel 6.12.
-   Other distros/kernels are untested (BTF/CO-RE should port, but unproven).
+2. **Distribution coverage (three, broaden over time).** Enforcement is validated
+   on Debian 13/6.12, Ubuntu 24.04/6.17, and AlmaLinux 9/5.14 (SELinux Enforcing)
+   — three distros and three kernel lineages, all `fail_open=0` (BENCHMARKS-01..04).
+   Broader coverage (more distros/kernels, arm64) remains open.
+3. **`bpf_core_read` field-width discipline.** A `short` kernel field read into a
+   wider local caused a fail-open (CVE-2026-003, fixed). All current
+   `bpf_core_read`/`bpf_probe_read_kernel` scalar reads were audited and match
+   their source widths. Note: `denied_dir_inodes` keys on the low 32 bits of the
+   inode (consistent on both sides); a >32-bit-inode collision would *over-block*
+   (fail closed), never fail open.
 3. **Mount-boundary path resolution.** Inode hooks have no vfsmount; a file on a
    sub-mount (e.g. a tmpfs `/tmp`) resolves relative to that mount's root.
    Root-filesystem paths — the security-critical cases — resolve absolutely.
