@@ -46,7 +46,11 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
         return 0;
     }
     int audit_only = jg_audit_only_enabled(&runtime_controls);
-    int sock_type = 0;
+    // `struct socket.type` is a 2-byte `short`. Reading it into a 4-byte int and
+    // copying sizeof(int)=4 bytes pulls in 2 adjacent padding bytes; when those
+    // are non-zero, sock_type != SOCK_STREAM/SOCK_DGRAM and the gate below would
+    // fail OPEN (allow). Match the field width exactly. (CVE-2026-003)
+    short sock_type = 0;
     __u16 family = 0;
 
     bpf_core_read(&sock_type, sizeof(sock_type), &sock->type);
