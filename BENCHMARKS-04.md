@@ -17,7 +17,7 @@
 | | |
 |---|---|
 | Provider | Microsoft Azure |
-| CPU | 2 vCPU |
+| CPU | Intel Xeon Platinum 8272CL @ 2.60 GHz (Cascade Lake), **2 vCPU** |
 | Distribution | **AlmaLinux 9.8 (Olive Jaguar)** — RHEL 9 rebuild |
 | Kernel | **Linux 5.14.0-687.5.3.el9_8** (RHEL backport — a third kernel lineage vs Debian 6.12 / Ubuntu 6.17) |
 | LSM | `lockdown,capability,landlock,yama,selinux,bpf` — **SELinux Enforcing**, `bpf` **pre-armed** (no GRUB change needed) |
@@ -104,9 +104,10 @@ generations**, including a RHEL-family host under SELinux Enforcing.
 (as in [`BENCHMARKS-03.md`](BENCHMARKS-03.md) §4, to isolate the CPU/OS path from
 this VM's managed-disk write latency).
 
-> **Hardware note.** jinn3's 2 vCPU are a **newer/faster Azure generation** than
-> Runs 01–02 (Xeon E5-2673 v4 @ 2.3 GHz), so jinn3's **absolute** latencies are
-> lower — a CPU difference, not a distro one. What's comparable across distros is
+> **Hardware note.** jinn3 runs an **Intel Xeon Platinum 8272CL @ 2.6 GHz
+> (Cascade Lake)** — a newer microarchitecture and higher clock than Runs 01–02's
+> Xeon E5-2673 v4 @ 2.3 GHz (Broadwell). So jinn3's **absolute** latencies are
+> lower: a CPU difference, not a distro one. What's comparable across distros is
 > **correctness** (identical) and the **shape** of the curves.
 
 ### Single-client latency (10,000 sequential, full pipeline)
