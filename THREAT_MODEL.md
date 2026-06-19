@@ -127,7 +127,7 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 |---|---|---|---|
 | **JG-ADV-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual: sub-mount paths resolve relative to their mount root — root-fs paths (`/etc`,`/usr`,`/opt`) resolve absolutely (§7). |
 | **JG-ADV-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
-| **JG-ADV-2026-003** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (code); re-validation pending** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
+| **JG-ADV-2026-004** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (code); re-validation pending** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
 
 ---
 
@@ -145,7 +145,7 @@ desktop). It is now addressed structurally in three layers:
    populated *before* any program attaches: `load` loads the programs and
    `attach_all` attaches them only after `configure_policy` has filled the maps,
    so a hook never enforces against an empty policy (populate-then-attach;
-   closes JG-ADV-2026-003).
+   closes JG-ADV-2026-004).
 2. **cgroup-scoped enforcement.** Each hook calls `bpf_get_current_cgroup_id()`
    and **passes through any task not in the governed cgroup** before doing any
    work — no decision, no telemetry. The scope id is written to the map *before*
@@ -176,7 +176,7 @@ wraps armed runs in a hard 10-minute watchdog.
    — three distros and three kernel lineages, all `fail_open=0` (BENCHMARKS-01..04).
    Broader coverage (more distros/kernels, arm64) remains open.
 3. **`bpf_core_read` field-width discipline.** A `short` kernel field read into a
-   wider local caused a fail-open (JG-ADV-2026-003, fixed). All current
+   wider local caused a fail-open (JG-ADV-2026-004, fixed). All current
    `bpf_core_read`/`bpf_probe_read_kernel` scalar reads were audited and match
    their source widths. Note: `denied_dir_inodes` keys on the low 32 bits of the
    inode (consistent on both sides); a >32-bit-inode collision would *over-block*
