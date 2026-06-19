@@ -227,7 +227,7 @@ echo
 if (( nested_ok )); then
   printf '\033[1;32m############################################################\n'
   printf '#  M2 PASS — full multi-level path resolution works.        #\n'
-  printf '#  JG-ADV-2026-002 (basename-only blindness) is closed.        #\n'
+  printf '#  JG-ADV-2026-002 (basename-only blindness) is closed.     #\n'
   if (( rootfs_ok )); then
   printf '#  Absolute paths on the root filesystem resolve fully.     #\n'
   fi

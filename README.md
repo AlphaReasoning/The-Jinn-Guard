@@ -4,7 +4,7 @@
 
 **Jinn Guard** is an asynchronous, kernel-aware semantic firewall designed to enforce mathematical safety constraints on autonomous AI agents before any tool execution is permitted. It intercepts high-level natural language intents and processes them through a lifetime-anchored **Z3 SMT solver pipeline** — verifying state transitions and risk ceilings against formalized compliance models before granting or denying execution authority.
 
-Operating locally over high-throughput **UNIX domain sockets** on AlphaOS, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to enforce zero-trust process isolation and anti-replay protection for governed cgroups.
+Operating locally over high-throughput **UNIX domain sockets**, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to enforce zero-trust process isolation and anti-replay protection for governed cgroups.
 
 > ### ▶️ See it live in 5 minutes
 > ```bash
