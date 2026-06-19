@@ -1,4 +1,4 @@
-# 🛡️ Jinn Guard — Enterprise Semantic Firewall
+# 🛡️ Jinn Guard — Kernel-level enforcement firewall for autonomous AI agents (research prototype)
 
 [![CI](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml)
 
