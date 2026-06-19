@@ -126,7 +126,7 @@ elif [[ $HAS_BPFLSM -eq 0 || $HAS_CLANG -eq 0 ]]; then
 else
   c_info "Loading the LSM hooks in safe mode and confirming full-path resolution..."
   if bash scripts/validate_m2_path_resolution.sh >/tmp/jg-prof-m2.log 2>&1; then
-    c_ok "kernel resolves full file paths (CVE-2026-002 fix) — audit-only, nothing blocked"
+    c_ok "kernel resolves full file paths (JG-ADV-2026-002 fix) — audit-only, nothing blocked"
     mark T3 PASS
   else
     c_fail "audit-only path-resolution validation did not pass; see /tmp/jg-prof-m2.log"

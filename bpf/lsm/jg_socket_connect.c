@@ -49,7 +49,7 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
     // `struct socket.type` is a 2-byte `short`. Reading it into a 4-byte int and
     // copying sizeof(int)=4 bytes pulls in 2 adjacent padding bytes; when those
     // are non-zero, sock_type != SOCK_STREAM/SOCK_DGRAM and the gate below would
-    // fail OPEN (allow). Match the field width exactly. (CVE-2026-003)
+    // fail OPEN (allow). Match the field width exactly. (JG-ADV-2026-004)
     short sock_type = 0;
     __u16 family = 0;
 

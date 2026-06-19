@@ -87,7 +87,7 @@ int BPF_PROG(jg_inode_create, struct inode *dir, struct dentry *dentry, umode_t 
 
     // Check the in-kernel denylists on the basename first (cheap, preserves the
     // existing synchronous enforcement), then resolve the full path for the
-    // user-space request below (CVE-2026-002).
+    // user-space request below (JG-ADV-2026-002).
     jg_read_dentry_basename(dentry, resource_path, sizeof(resource_path));
     int decision = (jg_inode_dir_denied(dir) || jg_inode_basename_denied(resource_path))
         ? -JG_EPERM

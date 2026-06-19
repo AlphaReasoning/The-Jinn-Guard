@@ -49,7 +49,7 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
     // `struct socket.type` is a 2-byte `short`; reading sizeof(int)=4 bytes pulls
     // in adjacent padding and can make the gate below fail OPEN. Match the field
     // width exactly. Latent here (UDP sockets happened to zero-pad), real on
-    // socket_connect. (CVE-2026-003)
+    // socket_connect. (JG-ADV-2026-004)
     short sock_type = 0;
     struct sockaddr *address = 0;
     __u16 family = 0;
