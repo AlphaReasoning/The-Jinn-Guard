@@ -7,13 +7,20 @@ core asset — everything here aligns the rest of the repo up to that bar.
 
 ## Automated pass (branch `chore/launch-hygiene`)
 
-- [x] **A — Kill self-assigned CVE identifiers.** Renamed project-assigned
-      `CVE-2026-001/002/003` to internal advisory IDs `JG-ADV-2026-001/002/003`
-      (numeric mapping preserved) across all documentation, with a one-line
-      disclaimer at first use in `README.md` and `THREAT_MODEL.md`
-      ("`JG-ADV-*` are internal, self-identified advisory IDs, not CVE records
-      issued by a CNA"). Docs only — code/script comments deliberately left
-      untouched (see flag in the PR summary).
+- [x] **A — Kill self-assigned CVE identifiers.** Renamed project-assigned CVE
+      identifiers to internal `JG-ADV-*` advisory IDs across docs and (in the
+      follow-up pass) code comments + script output strings. Rename record:
+      - `CVE-2026-001` -> `JG-ADV-2026-001` (execve interpreter-chain bypass)
+      - `CVE-2026-002` -> `JG-ADV-2026-002` (filesystem relative-path bypass)
+      - `CVE-2026-003` -> `JG-ADV-2026-003` (agent impersonation / UID spoofing)
+      - `CVE-2026-003` -> `JG-ADV-2026-004` (socket-LSM fail-open — renumbered to
+        resolve the duplicate-`003` collision; the newer finding takes the new
+        number)
+
+      A one-line disclaimer was added at first use in `README.md` and
+      `THREAT_MODEL.md` ("`JG-ADV-*` are internal, self-identified advisory IDs,
+      not CVE records issued by a CNA"). Canonical registry:
+      [`SECURITY/ADVISORIES.md`](SECURITY/ADVISORIES.md).
 - [x] **B — Fix the register collision.** Retitled the README headline from
       "Enterprise Semantic Firewall" to "Kernel-level enforcement firewall for
       autonomous AI agents (research prototype)" to match the validation-status
