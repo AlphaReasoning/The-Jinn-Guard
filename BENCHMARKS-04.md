@@ -7,7 +7,7 @@
 > Purpose: extend coverage into the **RHEL family** (a third, distinct kernel
 > lineage) under **SELinux Enforcing**, and validate real eBPF-LSM allow/deny
 > enforcement there. This run also **found and fixed a real fail-open bug**
-> (CVE-2026-003) — see §6 — which is itself the strongest argument that a
+> (JG-ADV-2026-003) — see §6 — which is itself the strongest argument that a
 > distro-matrix is worth running.
 
 ---
@@ -70,7 +70,7 @@ SELinux denial**, enforcing allow/deny in-kernel. Each surface: 500 operations
 
 > **2,750 enforced operations on AlmaLinux 9 / kernel 5.14 under SELinux
 > Enforcing: 0 fail-open, 0 incorrect decisions, 0 timeouts** — *after* the
-> CVE-2026-003 fix (§6). The eBPF programs verified and loaded cleanly on a third
+> JG-ADV-2026-003 fix (§6). The eBPF programs verified and loaded cleanly on a third
 > kernel lineage; SELinux and the BPF-LSM coexisted without interference.
 
 ---
@@ -78,7 +78,7 @@ SELinux denial**, enforcing allow/deny in-kernel. Each surface: 500 operations
 ## 3. Kernel path resolution (Tier 3 — audit-only)
 
 LSM hooks loaded in safe mode and resolved full absolute file paths
-(CVE-2026-002 fix) on 5.14 — audit-only, nothing blocked. PASS.
+(JG-ADV-2026-002 fix) on 5.14 — audit-only, nothing blocked. PASS.
 
 ---
 
@@ -175,7 +175,7 @@ Two reads, deliberately kept separate:
 
 ---
 
-## 7. What this run found and fixed — CVE-2026-003
+## 7. What this run found and fixed — JG-ADV-2026-003
 
 On the **first** armed run, AlmaLinux 9 / 5.14 exposed a **fail-open** in
 `socket_connect`: a *variable* fraction (~30–55% under load) of denied TCP
@@ -195,5 +195,5 @@ connects were wrongly allowed, while UDP/exec/file held at 0. Investigation
      tripped a fail-open type gate. Fixed by reading the correct width. (This bug
      was **latent on every distro** — Debian/Ubuntu merely got zero padding.)
 
-Both fixes landed (CVE-2026-003) and this run is the **post-fix re-validation**:
+Both fixes landed (JG-ADV-2026-003) and this run is the **post-fix re-validation**:
 `fail_open=0` on every surface. The distro-matrix did exactly its job.

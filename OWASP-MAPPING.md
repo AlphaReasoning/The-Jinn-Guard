@@ -79,9 +79,9 @@ can cause.
 An agent generates, modifies, or runs code/commands unsafely.
 The kernel `bprm_check_security` LSM hook denies execution of non-allowlisted
 binaries for governed agents, with interpreter-chain mitigation
-(CVE-2026-001, `DENY_INTERPRETER_NOT_ALLOWED`). Enforcement is in the kernel and
+(JG-ADV-2026-001, `DENY_INTERPRETER_NOT_ALLOWED`). Enforcement is in the kernel and
 cannot be bypassed by the agent process.
-*Evidence:* `bpf/lsm/jg_bprm_check_security.c`; `CHANGELOG.md` (CVE-2026-001);
+*Evidence:* `bpf/lsm/jg_bprm_check_security.c`; `CHANGELOG.md` (JG-ADV-2026-001);
 Tier-4 armed validation.
 
 ### ASI06 — Memory and Context Poisoning · **Out of scope**

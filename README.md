@@ -246,7 +246,9 @@ Validated on three distributions / three kernel generations: **Debian 13 / kerne
 
 ## Known Limitations
 
-### Filesystem path resolution — mount boundaries (was CVE-2026-002, now fixed)
+> **Note on identifiers:** `JG-ADV-*` are internal, self-identified advisory IDs, not CVE records issued by a CNA.
+
+### Filesystem path resolution — mount boundaries (was JG-ADV-2026-002, now fixed)
 
 The BPF `inode_create`/`inode_unlink` hooks now resolve the **full absolute
 path** of a file operation in the kernel (a bounded `d_parent` walk), closing the
@@ -260,7 +262,7 @@ on a single-root install) — the security-critical cases — resolve to full
 absolute paths. Crossing mount boundaries requires path-family LSM hooks or
 `bpf_d_path` and is tracked for a future release.
 
-### Interpreter chains (CVE-2026-001, mitigated)
+### Interpreter chains (JG-ADV-2026-001, mitigated)
 
 An agent explicitly allowed to run an interpreter can invoke other tools through
 it. Jinn Guard denies known interpreters by policy for governed agents (any
