@@ -246,6 +246,8 @@ Validated on three distributions / three kernel generations: **Debian 13 / kerne
 
 ## Known Limitations
 
+> **Advisory registry:** the canonical list of `JG-ADV-*` IDs, status, and fix commits lives in [`SECURITY/ADVISORIES.md`](SECURITY/ADVISORIES.md).
+>
 > **Note on identifiers:** `JG-ADV-*` are internal, self-identified advisory IDs, not CVE records issued by a CNA.
 
 ### Filesystem path resolution — mount boundaries (was JG-ADV-2026-002, now fixed)
