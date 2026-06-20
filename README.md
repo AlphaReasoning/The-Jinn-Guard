@@ -1,4 +1,4 @@
-# 🛡️ Jinn Guard — Kernel-level enforcement firewall for autonomous AI agents (research prototype)
+# 🛡️ Jinn Guard — Kernel-enforced semantic firewall for autonomous AI agents (validated research prototype)
 
 [![CI](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml)
 
@@ -169,6 +169,12 @@ Kernel Layer (eBPF)
                                         │
                                         └─→ governance loop (telemetry feed)
 ```
+
+> **A note on languages.** The probes in `bpf/` are C — small, separately-compiled
+> eBPF programs loaded into the kernel. The governance core (the daemon, the Z3
+> verification pipeline, the policy engine, and the CLI) is **Rust**, under `ts_cli/`.
+> `bpf/**` is marked `linguist-vendored`, so GitHub's language bar reflects the Rust
+> core rather than the volume of low-level kernel C.
 
 ---
 
