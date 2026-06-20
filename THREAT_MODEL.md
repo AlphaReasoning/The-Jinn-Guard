@@ -210,6 +210,55 @@ wraps armed runs in a hard 10-minute watchdog.
    restrictive mode unless `--socket-mode 0660` is set; connecting is gated by
    HMAC + peer-UID regardless, but operators on shared hosts should set it.
 
+### Nested execution and sandbox escape
+
+Jinn Guard's enforcement boundary is **processes in a governed cgroup, as seen by
+the host kernel.** The userspace intent layer is opt-in; the floor that governs a
+process which *doesn't ask* is the host BPF-LSM, applied to governed cgroups. The
+guarantee therefore rests on three assumptions, and a nested execution context can
+attack each one: the governed tag is **un-sheddable**, the kernel's **namespace
+view is authoritative**, and **no second kernel** is introduced.
+
+| Vector | How it escapes | Severity |
+| --- | --- | --- |
+| Nested VM / microVM (qemu, Firecracker, gVisor, Kata, `/dev/kvm`) | Work runs under a **second kernel**; host BPF-LSM never sees the guest's syscalls | Critical |
+| cgroup migration | Process moves itself/a child to a cgroup outside `governed_scope`; LSM no longer gates it | Critical |
+| User namespace (`unshare`/`clone` `CLONE_NEWUSER`) | Unprivileged agent gains in-ns "root", then creates mount/cgroup/pid namespaces | High |
+| Mount namespace / `pivot_root` / bind-mount | Remaps the filesystem so a denied path looks allowed (generalizes the mount-boundary item above) | High |
+| Nested container runtime (runc/podman/nspawn) | Child runs in fresh namespaces + possibly a fresh cgroup → ungoverned unless the tag is inherited | High |
+| Interpreter chains (JG-ADV-2026-001) | A child interpreter performs the real work; a "soft sandbox" | Medium |
+
+**Hardening direction (tracked in the hardening backlog and §10):**
+
+1. **Un-sheddable governance tag.** Tag the *task* (BPF task-local storage)
+   inherited on `clone`/`fork`/`exec`, rather than relying on cgroup membership
+   alone; deny `cgroup.procs` writes that move a governed task out of scope. The
+   tag follows the process tree and cannot be dropped.
+2. **Deny the nesting primitives by default for governed agents.** Add LSM
+   mediation for `mount`/`move_mount`, `pivot_root`, `chroot`, `setns`, and
+   namespace-creating `clone`/`unshare` flags. A governed agent with no legitimate
+   need is denied these, collapsing most of the surface.
+3. **Treat VM launch as a hard boundary.** Host BPF-LSM cannot see inside a guest
+   kernel. Deny `/dev/kvm` and `/dev/vhost-*` and VMM binaries for governed
+   agents. A VM-capable governed agent is **outside the single-host enforcement
+   model unless a nested Jinn Guard instance governs the guest** (recursive
+   governance). This is stated as an explicit scope limit, not a claim.
+4. **Key path decisions on inode/superblock identity, not path strings**, so
+   bind-mount/`pivot_root` remapping cannot fool the denylist (deepens the
+   mount-boundary fix).
+5. **Drop nesting-enabling capabilities** (`CAP_SYS_ADMIN`, `CAP_SYS_CHROOT`) and
+   restrict unprivileged user-namespace creation for governed workloads.
+6. **Default-deny dangerous operations at the kernel floor for governed scope**, so
+   a nested process that never speaks the protocol still cannot exec/mount/connect
+   outside policy — i.e., non-cooperation is safe.
+7. **Detect even where permitted:** namespace/cgroup/mount/VM-device creation by a
+   governed agent is a high-signal event and is logged/alerted (canary-style).
+
+Until items 1–3 land, operators should run governed agents **without
+`CAP_SYS_ADMIN`** and with unprivileged user namespaces disabled
+(`kernel.unprivileged_userns_clone=0` where the workload permits), which blocks
+the high-severity namespace and mount vectors at the OS level today.
+
 ---
 
 ## 8. Threats to validity — the risk model and the formal guarantee
