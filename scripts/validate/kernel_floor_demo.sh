@@ -74,7 +74,17 @@ done
 
 # Resolve the build user (so cargo runs with the right toolchain/env).
 BUILD_USER="${SUDO_USER:-root}"
-BIN="target/debug/ts_cli"
+BIN="$REPO_ROOT/target/debug/ts_cli"
+
+# Run a cargo command as the build user (loads their PATH/CARGO_HOME/rustup), or
+# directly if there is no separate invoking user.
+run_cargo() {
+  if [[ "$BUILD_USER" != "root" ]]; then
+    sudo -u "$BUILD_USER" -H bash -lc "cd '$REPO_ROOT' && $*"
+  else
+    bash -lc "cd '$REPO_ROOT' && $*"
+  fi
+}
 
 if [[ $fail -ne 0 ]]; then
   c_bad "\n[preflight] environment not ready — fix the items above and re-run."
@@ -89,13 +99,8 @@ export PATH="$PATH:/usr/sbin"
 c_info "  make -C bpf install"
 make -C bpf install || { c_bad "  BPF install failed (clang/bpftool/vmlinux.h?)"; exit 3; }
 
-if [[ "$BUILD_USER" != "root" ]]; then
-  c_info "  building ts_cli as $BUILD_USER"
-  sudo -u "$BUILD_USER" -H bash -lc "cd '$REPO_ROOT' && cargo build -p ts_cli --features enterprise" \
-    || { c_bad "  cargo build failed"; exit 3; }
-else
-  cargo build -p ts_cli --features enterprise || { c_bad "  cargo build failed"; exit 3; }
-fi
+c_info "  building ts_cli (as $BUILD_USER)"
+run_cargo "cargo build -p ts_cli --features enterprise" || { c_bad "  cargo build failed"; exit 3; }
 [[ -x "$BIN" ]] || { c_bad "  built binary not found at $BIN"; exit 3; }
 c_ok  "  built: $BIN"
 
@@ -110,9 +115,25 @@ c_info "    • execve() a non-allowlisted binary→ expect kernel EPERM"
 c_info "  None of these go through the daemon socket. Enforcement is the kernel."
 echo
 
-sudo -E env "PATH=$PATH" "JINNGUARD_TEST_BINARY=$BIN" \
-  cargo test -p ts_cli --features enterprise --test kernel_lsm -- \
-  --ignored --test-threads=1 --nocapture
+# Compile the test binary as the build user (cargo + registry resolve there), then
+# run the raw binary as root — no cargo needed at root, no root-owned target churn.
+c_info "  compiling the kernel_lsm test binary (as $BUILD_USER)"
+run_cargo "cargo test -p ts_cli --features enterprise --test kernel_lsm --no-run" \
+  || { c_bad "  compiling kernel_lsm test failed"; exit 3; }
+
+TESTBIN="$(find "$REPO_ROOT/target/debug/deps" -maxdepth 1 -type f -executable \
+  -name 'kernel_lsm-*' ! -name '*.d' -printf '%T@ %p\n' 2>/dev/null \
+  | sort -rn | head -1 | cut -d' ' -f2-)"
+if [[ -z "$TESTBIN" || ! -x "$TESTBIN" ]]; then
+  c_bad "  could not locate the compiled kernel_lsm test binary under target/debug/deps"
+  exit 3
+fi
+c_ok  "  test binary: $TESTBIN"
+echo
+
+# Already root; execute the raw test binary directly.
+export PATH="$PATH:/usr/sbin"
+JINNGUARD_TEST_BINARY="$BIN" "$TESTBIN" --ignored --test-threads=1 --nocapture
 rc=$?
 
 c_head "[result]"
