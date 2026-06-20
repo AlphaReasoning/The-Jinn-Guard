@@ -259,6 +259,56 @@ Until items 1–3 land, operators should run governed agents **without
 (`kernel.unprivileged_userns_clone=0` where the workload permits), which blocks
 the high-severity namespace and mount vectors at the OS level today.
 
+### Confused deputy via privileged orchestrators
+
+A distinct and **higher-severity** class than the escapes above: instead of
+exercising privilege it has, a governed agent **borrows the authority of a
+more-privileged, ungoverned daemon** through an IPC channel. Capability-denial
+defenses (drop `CAP_SYS_ADMIN`, block `unshare`/`mount`, disable userns) do **not**
+help, because the agent is not performing the privileged operation — the deputy is.
+
+Canonical instance:
+
+```
+governed_agent ──connect()──▶ /var/run/docker.sock ──▶ dockerd (root, ungoverned cgroup)
+                                                        docker run -v /:/host … 'write to host'
+```
+
+`dockerd` performs the action with root, **in its own cgroup**, which the BPF-LSM
+floor — scoped to the *agent's* governed cgroup — never observes. The agent never
+left its sandbox; it commanded a deputy that lives outside it.
+
+**Current status (disclosed): this path is open.** The `socket_connect` /
+`socket_sendmsg` hooks mediate **AF_INET (IPv4) only**; `connect()` to an **AF_UNIX**
+orchestrator socket is not mediated. `systemd` and `dbus-daemon` are deliberately
+`IMMUNE` from governance (anti-lockout), which is correct for not bricking the host
+but leaves the agent→`systemd`/D-Bus channel — and `systemd-run` as a deputy — fully
+available. Viable deputies include `dockerd`/`containerd`, `podman`, `systemd`/D-Bus,
+`libvirtd`, CI/build runners, setuid helpers, and **privileged MCP tool servers**.
+
+**Hardening (the control channel is the chokepoint):**
+
+1. **Deny governed agents' IPC to privileged deputies** — extend `socket_connect`
+   (and `openat` on the socket path) to **denylist AF_UNIX paths**: `docker.sock`,
+   `containerd.sock`, the systemd/private D-Bus socket, `libvirt-sock`, podman.
+   AF_UNIX path mediation is the missing primitive today. Note: denying the agent's
+   *connect* does **not** govern the daemon, so there is **no anti-lockout
+   conflict** — the daemon stays immune; the agent simply cannot command it.
+2. **Deny-by-default IPC egress allowlist** for governed agents: only explicitly
+   permitted endpoints; orchestrator/init sockets denied by default.
+3. **Govern the deputy / propagate identity** (the complete but hard fix): the
+   deputy acts under the caller's capability rather than its ambient root
+   (designation = authority). Attribution across a shared daemon is genuinely hard.
+4. **Detect unconditionally:** a governed agent connecting to a container/VM/init
+   control socket is a high-signal event — log/alert even where it cannot yet be
+   blocked.
+
+**Architectural limit:** confused deputy via ambient-authority daemons is a
+fundamental limit of any per-process/per-cgroup model. Jinn Guard cannot govern an
+independent root daemon unless that daemon's **control channel is denied to the
+agent** or the **daemon is itself governed**. The tractable defense is (1): treat
+orchestrator/init IPC endpoints as denied resources for governed agents.
+
 ---
 
 ## 8. Threats to validity — the risk model and the formal guarantee
