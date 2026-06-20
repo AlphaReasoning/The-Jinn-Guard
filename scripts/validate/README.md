@@ -61,9 +61,19 @@ without trusting the daemon.
 **Does not prove here:** the **kernel-enforcement floor** — that the action is
 blocked even when a compromised agent bypasses the userspace socket. That is the
 property that makes the guarantee hold against a *non-cooperating* agent, and it
-requires BPF-LSM armed on the host (see the repo's kernel validation / the VM
-demo). This suite validates everything in the decision and audit path; the kernel
-floor is validated separately on a real kernel.
+requires BPF-LSM armed on the host. It is demonstrated by
+[`kernel_floor_demo.sh`](kernel_floor_demo.sh) on a real host/VM:
+
+```bash
+# On a BPF-LSM-armed host (root); NOT a container:
+sudo bash scripts/validate/kernel_floor_demo.sh
+```
+
+That demo arms enforcement scoped to a throwaway cgroup, then has a probe process
+enter the cgroup and attempt **direct** `connect()` / file / `execve()` operations
+that the policy denies — with **no socket and no signed intent** — and shows the
+kernel return `EPERM` on each. This suite validates everything in the decision and
+audit path; `kernel_floor_demo.sh` validates the kernel floor beneath it.
 
 ## Reading the result
 
