@@ -285,6 +285,17 @@ strong as that allowlist.
 
 ---
 
+## 🎓 Teaching lab — learn the governance model
+
+[`lab/`](lab/README.md) is a self-contained, dependency-free lab that teaches the
+Jinn Guard model — semantic intent → policy → decision → audit — **without** the
+kernel/eBPF layer. Students build a mini allow/deny/canary/human-review checker
+(`python3 lab/checker_starter.py`), then find and fix a planted audit-logging
+flaw. It is explicit about which verdicts the real daemon enforces today
+(`ALLOW`/`DENY`) versus which are taught as concepts (`CANARY_TRIGGERED`,
+`HUMAN_REVIEW`); the design path to close that gap is in
+[`docs/agent_governance_extensions.md`](docs/agent_governance_extensions.md).
+
 ## 🚀 Quick Start
 
 ### Prerequisites
