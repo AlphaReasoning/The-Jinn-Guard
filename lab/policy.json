@@ -1,0 +1,12 @@
+{
+  "_comment": "Jinn Guard Lab — mini policy table. Policy Team edits this file.",
+
+  "allowed_intents": ["read_public_file", "cleanup_workspace"],
+  "workspace_only_intents": ["cleanup_workspace"],
+  "denied_intents": ["delete_system_files"],
+  "review_intents": ["send_customer_data"],
+
+  "canary_paths": ["/admin/canary_secret.txt", "canary_secret.txt"],
+  "workspace_root": "/tmp/student_workspace",
+  "risk_ceiling": 70
+}
