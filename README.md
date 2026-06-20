@@ -22,6 +22,16 @@ Operating locally over high-throughput **UNIX domain sockets**, the platform bin
 > enough for a non-technical audience. Nothing is mocked. Presenter notes and
 > safety FAQ: [`DEMO.md`](DEMO.md).
 
+> ### 🔬 For evaluators — don't trust it, *verify* it
+> ```bash
+> python3 scripts/validate/validate.py        # attacks, determinism, audit-chain, tamper-proof
+> ```
+> A reproducible, dependency-free harness that drives the real daemon and lets you
+> **independently verify** every claim: re-run for determinism, recompute the
+> tamper-evident audit hash-chain yourself, corrupt the log and watch it get
+> caught, and bring your own attack. See [`scripts/validate/`](scripts/validate/)
+> and [`scripts/validate/CLAIMS.md`](scripts/validate/CLAIMS.md).
+
 ---
 
 ## 📊 Performance & Security at a Glance (measured)
