@@ -229,8 +229,16 @@ def _next_seq():
 
 
 def send(sock_path, intent, agent_id, risk, *, forge_sig=False, version=1,
-         reuse_seq=None):
-    """Send one proposal to the real daemon; return its first-line SIGNAL."""
+         reuse_seq=None, _attempts=6):
+    """Send one proposal to the real daemon; return its first-line SIGNAL.
+
+    A transport-level failure (a connection race while the daemon is still
+    warming up, or a short read) is *not* a governance verdict, so we retry a
+    few times with a short backoff instead of surfacing it as a result. A real
+    ALLOW/DENY verdict always returns on the first successful exchange, and an
+    errored attempt never reaches the scoreboard or the daemon's metrics. The
+    daemon's own anti-replay still guards against any double-delivery.
+    """
     seq = reuse_seq if reuse_seq is not None else _next_seq()
     agent_field = f',"agent_id":"{agent_id}"' if agent_id else ""
     payload = ('{"sequence_counter":%d,"intent_name":"%s",'
@@ -241,25 +249,32 @@ def send(sock_path, intent, agent_id, risk, *, forge_sig=False, version=1,
                      separators=(",", ":")).encode()
     pkt = struct.pack(">IB", len(env), version) + env
 
-    try:
-        s = socket.socket(socket.AF_UNIX)
-        s.settimeout(5)
-        s.connect(sock_path)
-        s.sendall(pkt)
-        hdr = s.recv(5)
-        if len(hdr) < 5:
-            return "TRANSPORT_ERROR", seq
-        ln = struct.unpack(">IB", hdr)[0]
-        body = b""
-        while len(body) < ln:
-            chunk = s.recv(ln - len(body))
-            if not chunk:
-                break
-            body += chunk
-        s.close()
-        return body.decode("utf-8", "replace").splitlines()[0].strip(), seq
-    except OSError as e:
-        return f"TRANSPORT_ERROR: {e}", seq
+    last_err = "TRANSPORT_ERROR"
+    for _ in range(_attempts):
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(5)
+            s.connect(sock_path)
+            s.sendall(pkt)
+            hdr = s.recv(5)
+            if len(hdr) < 5:
+                s.close()
+                last_err = "TRANSPORT_ERROR"
+                time.sleep(0.1)
+                continue
+            ln = struct.unpack(">IB", hdr)[0]
+            body = b""
+            while len(body) < ln:
+                chunk = s.recv(ln - len(body))
+                if not chunk:
+                    break
+                body += chunk
+            s.close()
+            return body.decode("utf-8", "replace").splitlines()[0].strip(), seq
+        except OSError as e:
+            last_err = f"TRANSPORT_ERROR: {e}"
+            time.sleep(0.1)
+    return last_err, seq
 
 
 # Running scoreboard.
