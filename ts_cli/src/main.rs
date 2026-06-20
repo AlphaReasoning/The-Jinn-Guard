@@ -1107,6 +1107,38 @@ fn system_immunity_intent(proposal: &ClientProposal, reason: &str) -> SemanticIn
     }
 }
 
+/// Record a denied decision in the tamper-evident audit log.
+///
+/// Identity/policy denials (replay, anonymous, unknown agent, disallowed intent,
+/// invalid delegation) otherwise return before the audit stage, so a blocked
+/// attack would leave no entry in the hash chain — you could not prove after the
+/// fact that it was caught. Logging here is best-effort and never affects the
+/// verdict: the deny happens regardless of whether the log write succeeds.
+fn audit_denied(
+    audit_logger: &AuditLogger,
+    observation: &ObservationRecord,
+    proposal: &ClientProposal,
+    reason: &str,
+) {
+    let assessment = denied_assessment(reason);
+    let intent = system_immunity_intent(proposal, reason);
+    let decision = PolicyDecision::deny(reason, &assessment);
+    let _ = audit_logger.log(observation, &intent, &assessment, &decision);
+}
+
+/// A maximal-risk assessment used only to tag a denied decision in the audit log.
+fn denied_assessment(reason: &str) -> RiskAssessment {
+    RiskAssessment {
+        observed_risk: 100.0,
+        semantic_risk: 100.0,
+        topology_risk: 0.0,
+        declared_risk: None,
+        fused_risk: 100.0,
+        trust_score: 0.0,
+        reasons: vec![reason.to_string()],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lineage check result
 // ---------------------------------------------------------------------------
@@ -1352,6 +1384,7 @@ async fn handle_client_connection(
                 Some(&agent_key),
                 None,
             );
+            audit_denied(&audit_logger, &observation, &proposal, "DENY_REPLAY_ATTACK");
             deny(&mut stream, b"SIGNAL: DENY_REPLAY_ATTACK\n").await;
             return;
         }
@@ -1373,6 +1406,7 @@ async fn handle_client_connection(
                 None,
                 None,
             );
+            audit_denied(&audit_logger, &observation, &proposal, "DENY_ANONYMOUS_AGENT_NOT_PERMITTED");
             deny(&mut stream, b"SIGNAL: DENY_ANONYMOUS_AGENT_NOT_PERMITTED\n").await;
             return;
         }
@@ -1393,6 +1427,7 @@ async fn handle_client_connection(
                     Some(id),
                     None,
                 );
+                audit_denied(&audit_logger, &observation, &proposal, "DENY_UNKNOWN_AGENT_ID");
                 deny(&mut stream, b"SIGNAL: DENY_UNKNOWN_AGENT_ID\n").await;
                 return;
             }
@@ -1419,6 +1454,7 @@ async fn handle_client_connection(
                         agent_id_opt.as_deref(),
                         None,
                     );
+                    audit_denied(&audit_logger, &observation, &proposal, "DENY_INTENT_NOT_ALLOWED");
                     deny(&mut stream, b"SIGNAL: DENY_INTENT_NOT_ALLOWED\n").await;
                     return;
                 }
@@ -1450,7 +1486,8 @@ async fn handle_client_connection(
                     agent_id_opt.as_deref(),
                     None,
                 );
-                deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
+                audit_denied(&audit_logger, &observation, &proposal, "DENY_DELEGATION_INVALID");
+            deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
                 return;
             }
 
@@ -1467,6 +1504,7 @@ async fn handle_client_connection(
                 agent_id_opt.as_deref(),
                 None,
             );
+            audit_denied(&audit_logger, &observation, &proposal, "DENY_DELEGATION_UNSUPPORTED");
             deny(&mut stream, b"SIGNAL: DENY_DELEGATION_UNSUPPORTED\n").await;
             return;
         }
