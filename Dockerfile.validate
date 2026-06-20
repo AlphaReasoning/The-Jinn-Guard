@@ -1,0 +1,44 @@
+# Jinn Guard — reproducible high-assurance validation image.
+#
+# Build once, then run the full validation suite against the REAL daemon with no
+# host dependencies. Everything is baked into the image, so it runs on an
+# air-gapped box. Nothing is mocked.
+#
+#   docker build -f Dockerfile.validate -t jinn-guard-validate .
+#   docker run --rm jinn-guard-validate
+#
+# Drop into a shell to run byo_attack.py / verify_audit_chain.py yourself:
+#   docker run --rm -it jinn-guard-validate bash
+#
+# Note: this image validates the userspace governance + audit-integrity
+# guarantees, which need no special kernel config. The kernel-enforcement floor
+# (BPF-LSM) is validated separately on a real host — see scripts/validate/README.md.
+FROM rust:1-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        cmake \
+        pkg-config \
+        python3 \
+        ca-certificates \
+        libbpf-dev \
+        libclang-dev \
+        libssl-dev \
+        libsqlite3-dev \
+        libz3-dev \
+        linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Build the real daemon (release — the benchmarked build). target/ is excluded
+# via .dockerignore, so this is a clean, reproducible build inside the image.
+RUN cargo build --release -p ts_cli
+
+ENV JINNGUARD_BENCH_BINARY=/src/target/release/ts_cli
+WORKDIR /src/scripts/validate
+CMD ["python3", "validate.py"]

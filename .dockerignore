@@ -10,3 +10,9 @@ bpf/*.o
 bpf/*.bc
 bpf/lsm/*.o
 bpf/vmlinux.h
+# Private / non-shippable material — never bake into an image
+gtm
+paper
+INTEGRATION.md
+**/validation_out
+**/__pycache__
