@@ -9,10 +9,12 @@ the code and, where possible, to an automated test or a live validation result.
 > This is a structured **self-review**, not a third-party audit. It is written to
 > be checked: a reviewer can run `scripts/run_professor_validation.sh` and map
 > each PASS back to the rows below. Independent audit remains the open item
-> (see §9). The historical white-box audit that first surfaced CVE-2026-001 and
-> CVE-2026-002 is preserved in [`red-team-report.md`](red-team-report.md); note
+> (see §9). The historical white-box audit that first surfaced JG-ADV-2026-001 and
+> JG-ADV-2026-002 is preserved in [`red-team-report.md`](red-team-report.md); note
 > that report describes an aspirational mTLS identity model — the shipped system
 > uses HMAC-SHA256 over a local Unix-domain socket, documented accurately here.
+>
+> **Note on identifiers:** `JG-ADV-*` are internal, self-identified advisory IDs, not CVE records issued by a CNA.
 
 ---
 
@@ -113,8 +115,8 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 | T8 | Invariant violation slips through | Z3 SMT invariants + hard global safety ceiling | STEP 12–13 | UT (Z3), IT |
 | T9 | Fail-open via "out-of-scope/immune" fast-path | Fast-paths moved **after** the full gate chain (STEP 11.5) | STEP 11.5 | IT, SW (regression fixed) |
 | T10 | Direct host action bypassing the proposal path | Kernel LSM enforces independently of user-space cooperation | 5 LSM hooks | K, D |
-| T11 | execve allowlist bypass via interpreters (CVE-2026-001) | Governed agents denied known interpreters → `DENY_INTERPRETER_NOT_ALLOWED` | `interpreter_bypass_denied()` | UT |
-| T12 | Filesystem policy bypass via relative paths (CVE-2026-002) | Kernel resolves full absolute path before the denylist check | `jg_read_dentry_path()` | AO, K |
+| T11 | execve allowlist bypass via interpreters (JG-ADV-2026-001) | Governed agents denied known interpreters → `DENY_INTERPRETER_NOT_ALLOWED` | `interpreter_bypass_denied()` | UT |
+| T12 | Filesystem policy bypass via relative paths (JG-ADV-2026-002) | Kernel resolves full absolute path before the denylist check | `jg_read_dentry_path()` | AO, K |
 | T13 | Repeat offender keeps probing | Deterministic, bounded, tighten-only risk penalty | `adaptive_risk_penalty()` (M6) | UT |
 | T14 | Mandatory mediation bypass | Locked agent: no network, RO fs, all caps dropped, seccomp, socket-only | Docker compose profile | D (7/7 probes) |
 | T15 | Audit tampering | Hash-chained audit log | governance audit log | UT |
@@ -123,9 +125,10 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 
 | CVE | Severity | Status | Resolution |
 |---|---|---|---|
-| **CVE-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual: sub-mount paths resolve relative to their mount root — root-fs paths (`/etc`,`/usr`,`/opt`) resolve absolutely (§7). |
-| **CVE-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
-| **CVE-2026-003** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (code); re-validation pending** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
+| **JG-ADV-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual: sub-mount paths resolve relative to their mount root — root-fs paths (`/etc`,`/usr`,`/opt`) resolve absolutely (§7). |
+| **JG-ADV-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
+| **JG-ADV-2026-003** — agent impersonation via UID spoofing | Critical | **Mitigated** | Identity is authenticated as the OS user via `SO_PEERCRED` (unforgeable) **and** the application `agent_id` via HMAC-SHA256 — not a spoofable UID, closing the placeholder identity model from [`red-team-report.md`](red-team-report.md). Residual: a single shared HMAC key is not bound per-agent/UID, so any principal able to read the key can sign as any `agent_id`; per-agent secrets / `agent_id`↔UID binding tracked in §7.8 and §10. |
+| **JG-ADV-2026-004** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (re-validated on AlmaLinux 9 / 5.14, Run 04)** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
 
 ---
 
@@ -143,7 +146,7 @@ desktop). It is now addressed structurally in three layers:
    populated *before* any program attaches: `load` loads the programs and
    `attach_all` attaches them only after `configure_policy` has filled the maps,
    so a hook never enforces against an empty policy (populate-then-attach;
-   closes CVE-2026-003).
+   closes JG-ADV-2026-004).
 2. **cgroup-scoped enforcement.** Each hook calls `bpf_get_current_cgroup_id()`
    and **passes through any task not in the governed cgroup** before doing any
    work — no decision, no telemetry. The scope id is written to the map *before*
@@ -174,7 +177,7 @@ wraps armed runs in a hard 10-minute watchdog.
    — three distros and three kernel lineages, all `fail_open=0` (BENCHMARKS-01..04).
    Broader coverage (more distros/kernels, arm64) remains open.
 3. **`bpf_core_read` field-width discipline.** A `short` kernel field read into a
-   wider local caused a fail-open (CVE-2026-003, fixed). All current
+   wider local caused a fail-open (JG-ADV-2026-004, fixed). All current
    `bpf_core_read`/`bpf_probe_read_kernel` scalar reads were audited and match
    their source widths. Note: `denied_dir_inodes` keys on the low 32 bits of the
    inode (consistent on both sides); a >32-bit-inode collision would *over-block*
@@ -182,7 +185,7 @@ wraps armed runs in a hard 10-minute watchdog.
 3. **Mount-boundary path resolution.** Inode hooks have no vfsmount; a file on a
    sub-mount (e.g. a tmpfs `/tmp`) resolves relative to that mount's root.
    Root-filesystem paths — the security-critical cases — resolve absolutely.
-4. **Interpreter chains (CVE-2026-001).** An agent explicitly allowed to run an
+4. **Interpreter chains (JG-ADV-2026-001).** An agent explicitly allowed to run an
    interpreter can drive other tools through it. Mitigated by denying
    interpreters for governed agents; not eliminated.
 5. **Root-equivalent adversary is out of scope** by assumption (§3).
@@ -285,7 +288,7 @@ the same observation history always yields the same decision.
 |---|---|
 | Independent third-party security audit | External review |
 | Daemon-authoritative risk scoring (replace keyword heuristic; cf. §8) | Engineering |
-| eBPF-traced interpreter child-process attribution (close CVE-2026-001 chains) | Engineering |
+| eBPF-traced interpreter child-process attribution (close JG-ADV-2026-001 chains) | Engineering |
 | Multi-distribution / multi-kernel validation matrix | Engineering |
 | Automated HMAC key rotation | Engineering |
 | Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |

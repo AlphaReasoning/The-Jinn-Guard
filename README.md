@@ -1,10 +1,10 @@
-# 🛡️ Jinn Guard — Enterprise Semantic Firewall
+# 🛡️ Jinn Guard — Kernel-enforced semantic firewall for autonomous AI agents (validated research prototype)
 
 [![CI](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml)
 
 **Jinn Guard** is an asynchronous, kernel-aware semantic firewall designed to enforce mathematical safety constraints on autonomous AI agents before any tool execution is permitted. It intercepts high-level natural language intents and processes them through a lifetime-anchored **Z3 SMT solver pipeline** — verifying state transitions and risk ceilings against formalized compliance models before granting or denying execution authority.
 
-Operating locally over high-throughput **UNIX domain sockets** on AlphaOS, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to guarantee absolute zero-trust process isolation and immutable anti-replay protection across the entire host subsystem.
+Operating locally over high-throughput **UNIX domain sockets**, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to enforce zero-trust process isolation and anti-replay protection for governed cgroups.
 
 > ### ▶️ See it live in 5 minutes
 > ```bash
@@ -170,6 +170,12 @@ Kernel Layer (eBPF)
                                         └─→ governance loop (telemetry feed)
 ```
 
+> **A note on languages.** The probes in `bpf/` are C — small, separately-compiled
+> eBPF programs loaded into the kernel. The governance core (the daemon, the Z3
+> verification pipeline, the policy engine, and the CLI) is **Rust**, under `ts_cli/`.
+> `bpf/**` is marked `linguist-vendored`, so GitHub's language bar reflects the Rust
+> core rather than the volume of low-level kernel C.
+
 ---
 
 ## 📦 Components
@@ -246,7 +252,11 @@ Validated on three distributions / three kernel generations: **Debian 13 / kerne
 
 ## Known Limitations
 
-### Filesystem path resolution — mount boundaries (was CVE-2026-002, now fixed)
+> **Advisory registry:** the canonical list of `JG-ADV-*` IDs, status, and fix commits lives in [`SECURITY/ADVISORIES.md`](SECURITY/ADVISORIES.md).
+>
+> **Note on identifiers:** `JG-ADV-*` are internal, self-identified advisory IDs, not CVE records issued by a CNA.
+
+### Filesystem path resolution — mount boundaries (was JG-ADV-2026-002, now fixed)
 
 The BPF `inode_create`/`inode_unlink` hooks now resolve the **full absolute
 path** of a file operation in the kernel (a bounded `d_parent` walk), closing the
@@ -260,7 +270,7 @@ on a single-root install) — the security-critical cases — resolve to full
 absolute paths. Crossing mount boundaries requires path-family LSM hooks or
 `bpf_d_path` and is tracked for a future release.
 
-### Interpreter chains (CVE-2026-001, mitigated)
+### Interpreter chains (JG-ADV-2026-001, mitigated)
 
 An agent explicitly allowed to run an interpreter can invoke other tools through
 it. Jinn Guard denies known interpreters by policy for governed agents (any

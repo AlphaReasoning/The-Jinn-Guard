@@ -14,3 +14,11 @@ jinn-guard-v1.0-review.zip export-ignore
 # Rust-dominant reality) and collapses it in diffs.
 bpf/vmlinux.h linguist-vendored
 bpf/vmlinux.h linguist-generated
+
+# Jinn Guard is pitched and built as a Rust project; the eBPF/BPF-LSM C objects
+# under bpf/ are the in-kernel enforcement layer, but by byte count they dominate
+# GitHub's language bar and misrepresent the repo as a C codebase. Mark the whole
+# bpf/ tree linguist-vendored so the language bar reflects the Rust-primary
+# reality. The source stays in the repo and fully visible — this only affects
+# Linguist's stats, and GitHub re-indexes the language bar on the next push.
+bpf/** linguist-vendored

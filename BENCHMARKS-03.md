@@ -96,7 +96,7 @@ expected-deny); safe mode ran 250 (all expected-allow, audit-only).
 ## 3. Kernel path resolution (Tier 3 — audit-only)
 
 The LSM hooks loaded in safe mode and resolved **full absolute file paths**
-(the CVE-2026-002 fix) on 6.17 — audit-only, nothing blocked. PASS.
+(the JG-ADV-2026-002 fix) on 6.17 — audit-only, nothing blocked. PASS.
 
 ---
 

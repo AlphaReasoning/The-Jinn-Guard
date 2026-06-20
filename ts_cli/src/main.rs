@@ -725,7 +725,7 @@ pub(crate) fn intent_is_dangerous(intent: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Interpreter-bypass mitigation (M4 / CVE-2026-001).
+// Interpreter-bypass mitigation (M4 / JG-ADV-2026-001).
 //
 // An agent permitted to run one binary can smuggle arbitrary execution through
 // an interpreter (sh -c, python -c, etc.). On the broker/proposal path we have
@@ -3930,7 +3930,7 @@ mod adaptive_floor_tests {
     }
 }
 
-/// Interpreter-bypass mitigation (M4 / CVE-2026-001).
+/// Interpreter-bypass mitigation (M4 / JG-ADV-2026-001).
 #[cfg(test)]
 mod interpreter_bypass_tests {
     use super::{interpreter_bypass_denied, AgentNodePolicy};

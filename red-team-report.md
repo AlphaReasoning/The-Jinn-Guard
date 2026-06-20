@@ -23,7 +23,7 @@ This section verifies that the implemented user-space logic correctly reflects t
 
 This section details logical vulnerabilities found in the new implementation.
 
-### CVE-2026-001: Process Execution Bypass via Interpreters (Shebang Bypass)
+### JG-ADV-2026-001: Process Execution Bypass via Interpreters (Shebang Bypass)
 
 *   **Severity:** **High**
 *   **Description:** An agent can bypass `execve` restrictions on specific tools (e.g., `/usr/bin/curl`) by invoking them through an allowed interpreter (e.g., `/bin/bash`). If an agent is allowed to execute `/bin/bash`, it can run a script that internally calls any other tool.
@@ -34,7 +34,7 @@ This section details logical vulnerabilities found in the new implementation.
     4.  The kernel executes `/bin/bash`, which then executes the `curl` command. No further `execve` is triggered for `curl`, so Jinn Guard's process control is bypassed.
 *   **Mitigation:** This is a classic endpoint security challenge. A robust mitigation requires recursively inspecting script contents or monitoring for process ancestry and applying the parent's policy to child processes. For Jinn Guard, the simplest mitigation is to adopt a very restrictive `allowed_executables` policy that denies common interpreters like `/bin/bash`, `/bin/sh`, `/usr/bin/python`, etc.
 
-### CVE-2026-002: Filesystem Policy Bypass via Relative Paths
+### JG-ADV-2026-002: Filesystem Policy Bypass via Relative Paths
 
 *   **Severity:** **Critical**
 *   **Description:** The BPF hooks for filesystem operations (`inode_create`, `inode_unlink`) were implemented to only send the filename (`dentry->d_name.name`) to user-space, not the full, resolved path. The user-space policy checks for denied prefixes (e.g., `/etc/`) against only the filename.
@@ -45,7 +45,7 @@ This section details logical vulnerabilities found in the new implementation.
     4.  The daemon checks if `"new_config"` starts with `"/etc/"`. The check is false, and the write is incorrectly permitted.
 *   **Mitigation:** The BPF filesystem hooks **must** be re-written to capture the full path. This is a non-trivial task in BPF and typically requires iterating through the `dentry` parent pointers in a bounded loop. This vulnerability renders the entire filesystem enforcement feature non-functional.
 
-### CVE-2026-003: Agent Impersonation via UID Spoofing
+### JG-ADV-2026-003: Agent Impersonation via UID Spoofing
 
 *   **Severity:** **Critical**
 *   **Description:** The new mTLS identity model was implemented with a placeholder function (`get_agent_id_from_mtls_socket`) that uses the client's UID for identity. This was done for simulation purposes, but it highlights a critical implementation dependency.

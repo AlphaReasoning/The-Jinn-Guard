@@ -124,10 +124,10 @@ Linux 6.12 host across all four validation tiers.
   log, and disclosed residual risks.
 
 ### Fixed
-- **CVE-2026-002 (Critical) — filesystem policy bypass via relative paths.**
+- **JG-ADV-2026-002 (Critical) — filesystem policy bypass via relative paths.**
   Kernel now resolves the full absolute path before the denylist check
   (`jg_read_dentry_path`, depth-12 dentry walk). Verified audit-only and armed.
-- **CVE-2026-001 (High) — execve bypass via interpreter chains.** Governed agents
+- **JG-ADV-2026-001 (High) — execve bypass via interpreter chains.** Governed agents
   are denied known interpreters (`DENY_INTERPRETER_NOT_ALLOWED`).
 - **Fail-open regression (enterprise18).** The `system_immunity` and
   "out-of-scope" ALLOW fast-paths ran *before* the gate chain, letting

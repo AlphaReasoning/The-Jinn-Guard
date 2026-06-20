@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# validate_m2_path_resolution.sh — AUDIT-ONLY validation for M2 (CVE-2026-002).
+# validate_m2_path_resolution.sh — AUDIT-ONLY validation for M2 (JG-ADV-2026-002).
 #
 # WHAT THIS DOES, IN PLAIN WORDS:
 #   It loads the Jinn Guard kernel programs in SAFE MODE (audit-only). In safe
@@ -207,7 +207,7 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-echo "Multi-level resolution (the CVE-2026-002 fix):"
+echo "Multi-level resolution (the JG-ADV-2026-002 fix):"
 if (( nested_ok )); then
   ok "resolved the full nested chain: ...$NESTED_SUFFIX"
   grep -F "$NESTED_SUFFIX" "$LOG" | grep -iE "resource=|Target:" | head -4
@@ -227,7 +227,7 @@ echo
 if (( nested_ok )); then
   printf '\033[1;32m############################################################\n'
   printf '#  M2 PASS — full multi-level path resolution works.        #\n'
-  printf '#  CVE-2026-002 (basename-only blindness) is closed.        #\n'
+  printf '#  JG-ADV-2026-002 (basename-only blindness) is closed.     #\n'
   if (( rootfs_ok )); then
   printf '#  Absolute paths on the root filesystem resolve fully.     #\n'
   fi

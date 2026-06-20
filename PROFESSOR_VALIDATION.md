@@ -43,7 +43,7 @@ then prints a PASS/SKIP/FAIL summary. Skipped tiers tell you what they need.
 |------|----------------|--------------|------------------|
 | **1. Build + tests** | The full automated suite passes (≈117 tests: Z3 engine, governance pipeline, 13 integration, 12 swarm-attack). | Rust (`cargo`) | No |
 | **2. Mandatory mediation** | A maximally-locked agent container (no network, read-only FS, all capabilities dropped, seccomp, socket-only) **cannot** act directly; only broker-mediated actions through Jinn Guard succeed. | Docker | No (containers) |
-| **3. Kernel path resolution** | The eBPF-LSM hooks load and resolve **full file paths** in the kernel (the CVE-2026-002 fix), in **audit-only** mode. | root + BPF-LSM + clang | **No** (audit-only) |
+| **3. Kernel path resolution** | The eBPF-LSM hooks load and resolve **full file paths** in the kernel (the JG-ADV-2026-002 fix), in **audit-only** mode. | root + BPF-LSM + clang | **No** (audit-only) |
 | **4. Kernel enforcement** | Real allow/deny across execve, TCP, UDP, file create, and file unlink. | root + `--arm` + cgroup v2 | **Only inside a dedicated test cgroup** — see below |
 
 ---
@@ -117,7 +117,7 @@ denied operation was actually denied, and every allowed operation succeeded.
   security-critical cases — resolve to full absolute paths.
 - **Interpreter chains.** An agent explicitly allowed to run an interpreter can
   invoke other tools through it; Jinn Guard denies interpreters by policy for
-  governed agents (CVE-2026-001 mitigation), but per-binary execve limits are
+  governed agents (JG-ADV-2026-001 mitigation), but per-binary execve limits are
   only as strong as the allowlist.
 - **Not independently audited; single-distribution validated (Debian).**
 

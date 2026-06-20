@@ -232,7 +232,7 @@ static __always_inline void jg_read_dentry_basename(
 #define JG_PATH_MAX_DEPTH 12
 #define JG_PATH_COMP_LEN 40
 
-// Resolve the absolute path of `dentry` into `out` (CVE-2026-002). Two cheap
+// Resolve the absolute path of `dentry` into `out` (JG-ADV-2026-002). Two cheap
 // passes keep verifier work tiny: first collect the dentry chain leaf->root as
 // bare pointers (no string work), then write each component root->leaf with a
 // single bpf_probe_read_kernel_str per level. A guard before each write proves
