@@ -1,0 +1,38 @@
+[package]
+name = "ts_wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: the fuzz crate needs nightly + libFuzzer and is intentionally
+# excluded from the main workspace (see the root Cargo.toml `exclude`), so a
+# normal `cargo build` never requires the fuzz toolchain.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ts_wire = { path = "../ts_wire" }
+
+[[bin]]
+name = "frame_header"
+path = "fuzz_targets/frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_packet"
+path = "fuzz_targets/wire_packet.rs"
+test = false
+doc = false
+bench = false

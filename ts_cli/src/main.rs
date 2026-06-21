@@ -25,10 +25,8 @@ use governance::{
     ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment, SemanticAnalysisService,
     SemanticIntent,
 };
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -44,14 +42,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use ts_checker::PolicyEngine;
+use ts_wire::{BodyReject, FrameReject, SignedEnvelope};
 use z3::{Config as Z3Config, Context as Z3Context};
 
 use ebpf_monitor::{LsmRequest, Verdict};
 
 #[cfg(feature = "kernel_telemetry")]
 use ebpf_monitor::{LsmPathResolutionCache, LsmRequestType};
-
-type HmacSha256 = Hmac<Sha256>;
 
 // TelemetryStore maps kernel PID → list of kernel telemetry events
 // Feature-gated: in non-kernel-telemetry builds this is a stub.
@@ -342,28 +339,11 @@ fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// HMAC envelope verification
+// Wire decoding (frame + signed envelope) lives in the `ts_wire` crate so the
+// externally reachable parsers can be fuzzed in isolation; the daemon calls
+// them below. See ts_wire::{decode_frame_header, classify_frame_header,
+// parse_body, verify_envelope}.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SignedEnvelope {
-    payload: String,
-    signature: String,
-}
-
-fn verify_envelope(envelope: &SignedEnvelope, secret: &[u8]) -> bool {
-    let provided = match hex::decode(envelope.signature.trim()) {
-        Ok(sig) => sig,
-        Err(_) => return false,
-    };
-    let mut mac = match HmacSha256::new_from_slice(secret) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(envelope.payload.as_bytes());
-    let expected = mac.finalize().into_bytes();
-    constant_time_eq::constant_time_eq(expected.as_slice(), provided.as_slice())
-}
 
 fn runtime_policy_denial(
     runtime_policy: &RuntimePolicy,
@@ -1235,37 +1215,37 @@ async fn handle_client_connection(
             return;
         }
 
-        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let version = header[4];
-
-        if version != 1 {
-            emit_daemon_decision_explanation(
-                "DENY",
-                "DENY_BAD_VERSION",
-                "protocol_integrity",
-                &peer_source,
-                None,
-                None,
-                None,
-            );
-            deny(&mut stream, b"SIGNAL: DENY_BAD_VERSION\n").await;
-            return;
-        }
-
-        // STEP 2: Read payload bytes of declared length.
-        if length > 4 * 1024 * 1024 {
-            emit_daemon_decision_explanation(
-                "DENY",
-                "DENY_PAYLOAD_TOO_LARGE",
-                "protocol_integrity",
-                &peer_source,
-                None,
-                None,
-                None,
-            );
-            deny(&mut stream, b"SIGNAL: DENY_PAYLOAD_TOO_LARGE\n").await;
-            return;
-        }
+        // STEP 2: Validate the frame header (version + length bound) via the
+        // fuzzable ts_wire decoder, then read exactly `length` body bytes.
+        let length = match ts_wire::classify_frame_header(ts_wire::decode_frame_header(&header)) {
+            Ok(len) => len,
+            Err(FrameReject::BadVersion) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_BAD_VERSION",
+                    "protocol_integrity",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
+                deny(&mut stream, b"SIGNAL: DENY_BAD_VERSION\n").await;
+                return;
+            }
+            Err(FrameReject::PayloadTooLarge) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_PAYLOAD_TOO_LARGE",
+                    "protocol_integrity",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
+                deny(&mut stream, b"SIGNAL: DENY_PAYLOAD_TOO_LARGE\n").await;
+                return;
+            }
+        };
 
         let mut buffer = vec![0u8; length];
         if let Err(e) = stream.read_exact(&mut buffer).await {
@@ -1273,9 +1253,12 @@ async fn handle_client_connection(
             return;
         }
 
-        let raw_wire_packet = match std::str::from_utf8(&buffer) {
-            Ok(s) => s,
-            Err(_) => {
+        // STEP 3: Decode the body into a SignedEnvelope (UTF-8 + JSON) via the
+        // fuzzable ts_wire decoder. Encoding vs. structural failures map to the
+        // same distinct verdicts as before.
+        let envelope: SignedEnvelope = match ts_wire::parse_body(&buffer) {
+            Ok(e) => e,
+            Err(BodyReject::Encoding) => {
                 emit_daemon_decision_explanation(
                     "DENY",
                     "DENY_ENCODING_ERROR",
@@ -1288,12 +1271,7 @@ async fn handle_client_connection(
                 deny(&mut stream, b"SIGNAL: DENY_ENCODING_ERROR\n").await;
                 return;
             }
-        };
-
-        // STEP 3: Parse outer SignedEnvelope.
-        let envelope: SignedEnvelope = match serde_json::from_str(raw_wire_packet) {
-            Ok(e) => e,
-            Err(_) => {
+            Err(BodyReject::Malformed) => {
                 emit_daemon_decision_explanation(
                     "DENY",
                     "DENY_MALFORMED_PAYLOAD",
@@ -1310,7 +1288,7 @@ async fn handle_client_connection(
 
         // STEP 4: Verify HMAC signature against the inner payload string.
         let secret = load_secret_from_file(secret_file.as_deref());
-        if !verify_envelope(&envelope, &secret) {
+        if !ts_wire::verify_envelope(&envelope, &secret) {
             println!("[deny] pid={} HMAC verification failed", observation.pid);
             emit_daemon_decision_explanation(
                 "DENY",
