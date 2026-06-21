@@ -1040,6 +1040,10 @@ pub struct AuditLogger {
     file_path: String,
     /// SQLite connection for structured queryable storage.
     db: Arc<Mutex<rusqlite::Connection>>,
+    /// Serializes the whole append (read-last-index → hash → JSONL → SQLite).
+    /// Without this, two concurrent governed decisions can both read the same
+    /// last index and produce duplicate audit indices / a broken hash chain.
+    write_guard: Mutex<()>,
 }
 
 impl AuditLogger {
@@ -1069,6 +1073,7 @@ impl AuditLogger {
         Self {
             file_path: file_path.to_string(),
             db: Arc::new(Mutex::new(conn)),
+            write_guard: Mutex::new(()),
         }
     }
 
@@ -1079,6 +1084,13 @@ impl AuditLogger {
         assessment: &RiskAssessment,
         decision: &PolicyDecision,
     ) -> Result<()> {
+        // Serialize the entire append. The index read + hash + JSONL write +
+        // SQLite insert must be atomic, or concurrent decisions can share an
+        // index and corrupt the tamper-evident chain.
+        let _write_guard = self
+            .write_guard
+            .lock()
+            .map_err(|_| anyhow!("AuditLogger: write mutex poisoned"))?;
         let (next_index, prev_hash) = self.get_last_entry_info()?;
         let now = now_unix_secs();
         let current_hash = AuditEntry::calculate_hash(
@@ -1423,6 +1435,65 @@ mod tests {
         assert_eq!(entries[1].hash, recalculated);
 
         // Clean up.
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_audit_logger_concurrent_indices_unique() {
+        // Regression: index read + write must be atomic. Under concurrency, a
+        // non-atomic logger produces duplicate indices and a broken chain (caught
+        // by the validation suite in a container). Hammer it from many threads
+        // and assert the indices are exactly 0..N with no gaps or duplicates.
+        let path = "/tmp/test_audit_logger_concurrent.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = std::sync::Arc::new(AuditLogger::new(path));
+        let obs = observation();
+        let semantic = SemanticIntent {
+            class: IntentClass::ReadOnly,
+            confidence: 0.9,
+            risk_score: 20.0,
+            signals: vec!["read_only".to_string()],
+        };
+        let capability = CapabilityProfile::from_observation(&obs, &[]);
+        let assessment = RiskAssessment::assess(&obs, &semantic, &capability, Some(20.0));
+        let decision = PolicyDecision::allow(&assessment);
+
+        const THREADS: usize = 8;
+        const PER: usize = 40;
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let l = std::sync::Arc::clone(&logger);
+            let (o, s, a, d) =
+                (obs.clone(), semantic.clone(), assessment.clone(), decision.clone());
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER {
+                    let _ = l.log(&o, &s, &a, &d);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let content = fs::read_to_string(path).unwrap();
+        let mut indices: Vec<u64> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap().index)
+            .collect();
+        let total = THREADS * PER;
+        assert_eq!(indices.len(), total, "every append must be recorded once");
+        indices.sort_unstable();
+        let expected: Vec<u64> = (0..total as u64).collect();
+        assert_eq!(
+            indices, expected,
+            "audit indices must be a contiguous 0..N with no duplicates (race-free)"
+        );
+
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(&db_path);
     }
