@@ -280,12 +280,19 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # Job 7: Real-kernel LSM enforcement (self-hosted, privileged)
+  # Job 7: Real-kernel LSM enforcement matrix (self-hosted, privileged)
   # GitHub-hosted runners cannot enable the BPF LSM (boot param) or attach LSM
   # programs as root, so the #[ignore]d kernel_lsm tests — the actual allow/deny
   # enforcement proofs, including #54 default-deny IPv4 egress and #55 the AF_UNIX
-  # deputy denylist — can only execute on a self-hosted runner labelled `bpf-lsm`
-  # whose kernel was booted with `lsm=...,bpf` and cgroup v2 mounted.
+  # deputy denylist — can only execute on self-hosted runners whose kernel was
+  # booted with `lsm=...,bpf` and cgroup v2 mounted.
+  #
+  # Fans out across the validated distro/kernel runners (each registered with the
+  # shared `bpf-lsm` label plus a per-host label): AlphaOS 6.12, Ubuntu 24.04 6.17
+  # (jinn2), AlmaLinux 9.8 5.14 (jinn3). 5.14 is the floor that exercises the
+  # oldest supported verifier. fail-fast: false so one distro's failure still lets
+  # the others report. The steps are package-manager agnostic (build deps are baked
+  # into each runner image), so no per-distro branching is needed.
   #
   # Manually dispatched (workflow_dispatch) so normal push/PR CI is never queued
   # against a self-hosted runner that may be offline. Mirrors the proven incantation
@@ -294,11 +301,29 @@ jobs:
   # churn). JINNGUARD_TEST_BINARY must be ABSOLUTE.
   # ─────────────────────────────────────────────────────────────────────────────
   kernel-lsm-real:
-    name: Real-kernel LSM enforcement (self-hosted)
+    name: Real-kernel LSM (${{ matrix.distro }} k${{ matrix.kernel }})
     if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, bpf-lsm]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: AlphaOS
+            label: alphaos
+            kernel: "6.12"
+          - distro: Ubuntu 24.04
+            label: jinn2
+            kernel: "6.17"
+          - distro: AlmaLinux 9.8
+            label: jinn3
+            kernel: "5.14"
+    runs-on: [self-hosted, bpf-lsm, "${{ matrix.label }}"]
     steps:
       - uses: actions/checkout@v5
+
+      - name: Show host kernel / distro
+        run: |
+          echo "matrix: ${{ matrix.distro }} (expected kernel ${{ matrix.kernel }}, label ${{ matrix.label }})"
+          uname -a
 
       - name: Build + install LSM objects (-> /usr/lib/jinnguard/lsm)
         run: sudo make -C bpf install
