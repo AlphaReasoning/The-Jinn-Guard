@@ -372,6 +372,8 @@ pub mod aya_backend {
     const JG_MAX_RESOURCE_LEN: usize = 128;
     const JG_CONTROL_KEY: u32 = 0;
     const JG_CONTROL_AUDIT_ONLY: u32 = 1;
+    // Bit 1: deny non-allowlisted governed-scope network egress (#54).
+    const JG_CONTROL_CONNECT_DEFAULT_DENY: u32 = 2;
     // Key 0 of the per-object `governed_scope` array. Value 0 = govern every
     // task (historical/deployed default); a non-zero cgroup-v2 id confines
     // enforcement to that one cgroup so the operator's desktop is never denied.
@@ -510,6 +512,10 @@ pub mod aya_backend {
         #[allow(dead_code)]
         governed_scope: Option<AyaArray<MapData, u64>>,
         ipv4_denylist: Option<AyaHashMap<MapData, u32, u8>>,
+        // #54: IPv4 egress allowlist, consulted by socket_connect under default-deny.
+        ipv4_allowlist: Option<AyaHashMap<MapData, u32, u8>>,
+        // #55: AF_UNIX orchestrator/control-socket denylist for socket_connect.
+        unix_denylist: Option<AyaHashMap<MapData, PathKey, u8>>,
         allowed_exec_paths: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_basenames: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_dir_inodes: Option<AyaHashMap<MapData, u64, u8>>,
@@ -658,11 +664,17 @@ pub mod aya_backend {
             policy: &PolicyConfig,
             safe_mode: bool,
         ) -> Result<()> {
-            self.configure_runtime_controls(safe_mode)?;
+            self.configure_runtime_controls(safe_mode, policy.network_policy.default_deny)?;
 
             for object in &mut self.objects {
                 if let Some(map) = object.ipv4_denylist.as_mut() {
                     configure_ipv4_denylist(map, policy, object.object_path)?;
+                }
+                if let Some(map) = object.ipv4_allowlist.as_mut() {
+                    configure_ipv4_allowlist(map, policy, object.object_path)?;
+                }
+                if let Some(map) = object.unix_denylist.as_mut() {
+                    configure_unix_denylist(map, policy, object.object_path)?;
                 }
                 if let Some(map) = object.allowed_exec_paths.as_mut() {
                     configure_allowed_exec_paths(map, policy, object.object_path)?;
@@ -688,8 +700,14 @@ pub mod aya_backend {
             Ok(())
         }
 
-        fn configure_runtime_controls(&mut self, safe_mode: bool) -> Result<()> {
-            let control_value = if safe_mode { JG_CONTROL_AUDIT_ONLY } else { 0 };
+        fn configure_runtime_controls(&mut self, safe_mode: bool, default_deny: bool) -> Result<()> {
+            let mut control_value = 0u32;
+            if safe_mode {
+                control_value |= JG_CONTROL_AUDIT_ONLY;
+            }
+            if default_deny {
+                control_value |= JG_CONTROL_CONNECT_DEFAULT_DENY;
+            }
             for object in &mut self.objects {
                 let Some(map) = object.runtime_controls.as_mut() else {
                     if safe_mode {
@@ -897,6 +915,8 @@ pub mod aya_backend {
         )?;
 
         let ipv4_denylist = optional_hash_map(&mut bpf, "ipv4_denylist", object_path)?;
+        let ipv4_allowlist = optional_hash_map(&mut bpf, "ipv4_allowlist", object_path)?;
+        let unix_denylist = optional_hash_map(&mut bpf, "unix_denylist", object_path)?;
         let allowed_exec_paths = optional_hash_map(&mut bpf, "allowed_exec_paths", object_path)?;
         let denied_basenames = optional_hash_map(&mut bpf, "denied_basenames", object_path)?;
         let denied_dir_inodes = optional_hash_map(&mut bpf, "denied_dir_inodes", object_path)?;
@@ -912,6 +932,8 @@ pub mod aya_backend {
                 runtime_controls,
                 governed_scope,
                 ipv4_denylist,
+                ipv4_allowlist,
+                unix_denylist,
                 allowed_exec_paths,
                 denied_basenames,
                 denied_dir_inodes,
@@ -1046,6 +1068,83 @@ pub mod aya_backend {
                 anyhow!(
                     "Failed to populate ipv4_denylist entry '{}' in {}: {}",
                     entry,
+                    object_path,
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// #54: populate the IPv4 egress allowlist from `network_policy.allowed_ips`.
+    /// Only consulted in-kernel when default-deny is enabled, so it is harmless
+    /// (and cheap) to populate unconditionally.
+    fn configure_ipv4_allowlist(
+        map: &mut AyaHashMap<MapData, u32, u8>,
+        policy: &PolicyConfig,
+        object_path: &str,
+    ) -> Result<()> {
+        for entry in &policy.network_policy.allowed_ips {
+            let Some(key) = ipv4_policy_key(entry) else {
+                eprintln!(
+                    "[eBPF LSM] skipping unsupported IPv4 allowlist entry '{}' for {}",
+                    entry, object_path
+                );
+                continue;
+            };
+            map.insert(key, 1, 0).map_err(|e| {
+                anyhow!(
+                    "Failed to populate ipv4_allowlist entry '{}' in {}: {}",
+                    entry,
+                    object_path,
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Built-in orchestrator / init control sockets a governed agent must never
+    /// reach directly — connecting to one lets the agent borrow that daemon's
+    /// ungoverned root authority (the confused-deputy path, #55). Both the
+    /// `/run` and legacy `/var/run` locations are listed because `/var/run` is a
+    /// symlink to `/run` on most distros but agents may use either literal path.
+    const ORCHESTRATOR_CONTROL_SOCKETS: &[&str] = &[
+        "/run/docker.sock",
+        "/var/run/docker.sock",
+        "/run/containerd/containerd.sock",
+        "/var/run/containerd/containerd.sock",
+        "/run/podman/podman.sock",
+        "/var/run/podman/podman.sock",
+        "/run/crio/crio.sock",
+        "/var/run/crio/crio.sock",
+        "/run/libvirt/libvirt-sock",
+        "/var/run/libvirt/libvirt-sock",
+        "/run/libvirt/libvirt-sock-ro",
+        "/var/run/libvirt/libvirt-sock-ro",
+        "/run/dbus/system_bus_socket",
+        "/var/run/dbus/system_bus_socket",
+        "/run/systemd/private",
+        "/var/run/systemd/private",
+    ];
+
+    /// #55: populate the AF_UNIX deputy-socket denylist (built-in orchestrator
+    /// sockets). Exact pathname match; abstract-namespace sockets are out of
+    /// scope (a documented limitation).
+    fn configure_unix_denylist(
+        map: &mut AyaHashMap<MapData, PathKey, u8>,
+        _policy: &PolicyConfig,
+        object_path: &str,
+    ) -> Result<()> {
+        for path in ORCHESTRATOR_CONTROL_SOCKETS {
+            let key = path_key(path);
+            if key.path[0] == 0 {
+                continue;
+            }
+            map.insert(key, 1, 0).map_err(|e| {
+                anyhow!(
+                    "Failed to populate unix_denylist entry '{}' in {}: {}",
+                    path,
                     object_path,
                     e
                 )
