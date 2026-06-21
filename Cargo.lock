@@ -1902,7 +1902,20 @@ dependencies = [
  "signal-hook",
  "tokio",
  "ts_checker",
+ "ts_wire",
  "z3",
+]
+
+[[package]]
+name = "ts_wire"
+version = "0.1.0"
+dependencies = [
+ "constant_time_eq",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

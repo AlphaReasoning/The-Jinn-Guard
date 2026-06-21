@@ -23,6 +23,25 @@ struct {
     __type(value, __u8);
 } ipv4_denylist SEC(".maps");
 
+// #54: explicit IPv4 egress allowlist, consulted only when default-deny is on.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
+} ipv4_allowlist SEC(".maps");
+
+// #55: AF_UNIX deputy-socket denylist. Keyed by the full connect path so a
+// governed agent cannot reach an orchestrator/init control socket (docker.sock,
+// containerd.sock, the systemd/D-Bus private sockets, libvirt, podman, crio)
+// and borrow that daemon's ungoverned root authority (confused deputy).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct jg_path_key);
+    __type(value, __u8);
+} unix_denylist SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -66,7 +85,16 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
 
     struct jg_request *req = bpf_ringbuf_reserve(&requests, sizeof(*req), 0);
     if (!req) {
-        return audit_only ? 0 : -JG_EPERM;
+        // barrier_var stops clang -O2 from lowering `cond ? -EPERM : 0` to
+        // `-(cond & 1)` (BPF_NEG), whose result the verifier cannot bound to
+        // [-4095, 0] at exit once it has been spilled to stack in this larger
+        // program. Forcing a real branch makes each arm return a literal.
+        int deny = !audit_only;
+        barrier_var(deny);
+        if (deny) {
+            return -JG_EPERM;
+        }
+        return 0;
     }
     __builtin_memset(req, 0, sizeof(*req));
 
@@ -76,6 +104,7 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
     req->source_program = JG_SRC_SOCKET_CONNECT;
     req->family = family;
     int denied = 0;
+    int default_deny = jg_connect_default_deny_enabled(&runtime_controls);
 
     switch (family) {
     case AF_INET: {
@@ -85,6 +114,12 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
         __u8 *entry = bpf_map_lookup_elem(&ipv4_denylist, &req->dest.v4.addr);
         if (entry && *entry) {
             denied = 1;
+        } else if (default_deny && !jg_ipv4_is_loopback(req->dest.v4.addr)) {
+            // #54: deny non-loopback IPv4 egress unless explicitly allow-listed.
+            __u8 *allow = bpf_map_lookup_elem(&ipv4_allowlist, &req->dest.v4.addr);
+            if (!(allow && *allow)) {
+                denied = 1;
+            }
         }
         break;
     }
@@ -92,11 +127,26 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
         struct sockaddr_in6 *sa = (struct sockaddr_in6 *)address;
         bpf_core_read(&req->dest.v6.addr, sizeof(req->dest.v6.addr), &sa->sin6_addr);
         bpf_core_read(&req->dest.v6.port, sizeof(req->dest.v6.port), &sa->sin6_port);
+        // #54: there is no IPv6 allowlist yet, so under default-deny IPv6 egress
+        // fails closed rather than offering an un-allowlisted bypass of the v4
+        // lockdown. (IPv6 allowlisting is tracked for a follow-up.)
+        if (default_deny) {
+            denied = 1;
+        }
         break;
     }
     case AF_UNIX: {
         struct sockaddr_un *sa = (struct sockaddr_un *)address;
         bpf_probe_read_kernel_str(&req->dest.path, sizeof(req->dest.path), &sa->sun_path);
+        // #55: deny connects to denylisted orchestrator/init control sockets.
+        // (Pathname sockets only; an abstract socket reads as "" and is not
+        // matched — documented limitation.)
+        struct jg_path_key unix_key;
+        jg_copy_path_key(&unix_key, req->dest.path);
+        __u8 *unix_entry = bpf_map_lookup_elem(&unix_denylist, &unix_key);
+        if (unix_entry && *unix_entry) {
+            denied = 1;
+        }
         break;
     }
     default:
@@ -105,7 +155,14 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
     }
 
     bpf_ringbuf_submit(req, 0);
-    return audit_only ? 0 : (denied ? -JG_EPERM : 0);
+    // See the note above: barrier_var forces a real branch so each exit returns
+    // a literal the verifier can bound, instead of a `-(cond & 1)` negation.
+    int deny = !audit_only && denied;
+    barrier_var(deny);
+    if (deny) {
+        return -JG_EPERM;
+    }
+    return 0;
 }
 
 char LICENSE_socket_connect[] SEC("license") = "GPL";

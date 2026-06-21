@@ -1439,7 +1439,12 @@ async fn handle_client_connection(
                 None,
                 None,
             );
-            audit_denied(&audit_logger, &observation, &proposal, "DENY_ANONYMOUS_AGENT_NOT_PERMITTED");
+            audit_denied(
+                &audit_logger,
+                &observation,
+                &proposal,
+                "DENY_ANONYMOUS_AGENT_NOT_PERMITTED",
+            );
             deny(&mut stream, b"SIGNAL: DENY_ANONYMOUS_AGENT_NOT_PERMITTED\n").await;
             return;
         }
@@ -1460,7 +1465,12 @@ async fn handle_client_connection(
                     Some(id),
                     None,
                 );
-                audit_denied(&audit_logger, &observation, &proposal, "DENY_UNKNOWN_AGENT_ID");
+                audit_denied(
+                    &audit_logger,
+                    &observation,
+                    &proposal,
+                    "DENY_UNKNOWN_AGENT_ID",
+                );
                 deny(&mut stream, b"SIGNAL: DENY_UNKNOWN_AGENT_ID\n").await;
                 return;
             }
@@ -1484,7 +1494,12 @@ async fn handle_client_connection(
                 agent_id_opt.as_deref(),
                 None,
             );
-            audit_denied(&audit_logger, &observation, &proposal, "DENY_CANARY_TRIPWIRE");
+            audit_denied(
+                &audit_logger,
+                &observation,
+                &proposal,
+                "DENY_CANARY_TRIPWIRE",
+            );
             deny(&mut stream, b"SIGNAL: DENY_CANARY_TRIPWIRE\n").await;
             return;
         }
@@ -1510,7 +1525,12 @@ async fn handle_client_connection(
                         agent_id_opt.as_deref(),
                         None,
                     );
-                    audit_denied(&audit_logger, &observation, &proposal, "DENY_INTENT_NOT_ALLOWED");
+                    audit_denied(
+                        &audit_logger,
+                        &observation,
+                        &proposal,
+                        "DENY_INTENT_NOT_ALLOWED",
+                    );
                     deny(&mut stream, b"SIGNAL: DENY_INTENT_NOT_ALLOWED\n").await;
                     return;
                 }
@@ -1542,8 +1562,13 @@ async fn handle_client_connection(
                     agent_id_opt.as_deref(),
                     None,
                 );
-                audit_denied(&audit_logger, &observation, &proposal, "DENY_DELEGATION_INVALID");
-            deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
+                audit_denied(
+                    &audit_logger,
+                    &observation,
+                    &proposal,
+                    "DENY_DELEGATION_INVALID",
+                );
+                deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
                 return;
             }
 
@@ -1560,7 +1585,12 @@ async fn handle_client_connection(
                 agent_id_opt.as_deref(),
                 None,
             );
-            audit_denied(&audit_logger, &observation, &proposal, "DENY_DELEGATION_UNSUPPORTED");
+            audit_denied(
+                &audit_logger,
+                &observation,
+                &proposal,
+                "DENY_DELEGATION_UNSUPPORTED",
+            );
             deny(&mut stream, b"SIGNAL: DENY_DELEGATION_UNSUPPORTED\n").await;
             return;
         }
@@ -4380,7 +4410,7 @@ mod decision_property_tests {
         let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
         for _ in 0..100_000 {
             let ceiling = 1.0 + rng.frac(98.0); // (1, 99)
-            // Mostly finite risks, occasionally NaN / +inf to probe the guard.
+                                                // Mostly finite risks, occasionally NaN / +inf to probe the guard.
             let fused = match rng.next() % 16 {
                 0 => f64::NAN,
                 1 => f64::INFINITY,
@@ -4447,7 +4477,10 @@ mod decision_property_tests {
                 !c.is_empty() && (intent.contains(c) || path.contains(c))
             });
             let got = proposal_trips_canary(&proposal, &canaries).is_some();
-            assert_eq!(got, expected, "intent={intent:?} path={path:?} canaries={canaries:?}");
+            assert_eq!(
+                got, expected,
+                "intent={intent:?} path={path:?} canaries={canaries:?}"
+            );
         }
     }
 
