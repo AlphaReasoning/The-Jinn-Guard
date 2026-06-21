@@ -821,5 +821,8 @@ fn test_wire_layer_attack_classes() {
     // Resilience: after the whole barrage, a legitimate request still succeeds.
     let good = build_packet(next_seq(), "read_file", Some("test_agent"), 5.0, 1);
     let r = daemon.send_recv(&good);
-    assert!(r.contains("ALLOW"), "daemon must survive wire-layer barrage -> {r}");
+    assert!(
+        r.contains("ALLOW"),
+        "daemon must survive wire-layer barrage -> {r}"
+    );
 }

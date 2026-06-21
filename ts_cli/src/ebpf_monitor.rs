@@ -700,7 +700,11 @@ pub mod aya_backend {
             Ok(())
         }
 
-        fn configure_runtime_controls(&mut self, safe_mode: bool, default_deny: bool) -> Result<()> {
+        fn configure_runtime_controls(
+            &mut self,
+            safe_mode: bool,
+            default_deny: bool,
+        ) -> Result<()> {
             let mut control_value = 0u32;
             if safe_mode {
                 control_value |= JG_CONTROL_AUDIT_ONLY;

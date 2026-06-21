@@ -195,26 +195,41 @@ mod tests {
     fn header_decode_is_total() {
         assert_eq!(
             decode_frame_header(&[0x00, 0x00, 0x00, 0x05, 1]),
-            FrameHeader { length: 5, version: 1 }
+            FrameHeader {
+                length: 5,
+                version: 1
+            }
         );
         assert_eq!(
             decode_frame_header(&[0xFF, 0xFF, 0xFF, 0xFF, 0xAB]),
-            FrameHeader { length: u32::MAX as usize, version: 0xAB }
+            FrameHeader {
+                length: u32::MAX as usize,
+                version: 0xAB
+            }
         );
     }
 
     #[test]
     fn header_rules() {
         assert_eq!(
-            classify_frame_header(FrameHeader { length: 10, version: 2 }),
+            classify_frame_header(FrameHeader {
+                length: 10,
+                version: 2
+            }),
             Err(FrameReject::BadVersion)
         );
         assert_eq!(
-            classify_frame_header(FrameHeader { length: MAX_PAYLOAD_LEN + 1, version: 1 }),
+            classify_frame_header(FrameHeader {
+                length: MAX_PAYLOAD_LEN + 1,
+                version: 1
+            }),
             Err(FrameReject::PayloadTooLarge)
         );
         assert_eq!(
-            classify_frame_header(FrameHeader { length: MAX_PAYLOAD_LEN, version: 1 }),
+            classify_frame_header(FrameHeader {
+                length: MAX_PAYLOAD_LEN,
+                version: 1
+            }),
             Ok(MAX_PAYLOAD_LEN)
         );
     }
@@ -223,7 +238,10 @@ mod tests {
     fn parse_body_negatives() {
         assert_eq!(parse_body(&[0xff, 0xfe, 0x00]), Err(BodyReject::Encoding));
         assert_eq!(parse_body(b"not json"), Err(BodyReject::Malformed));
-        assert_eq!(parse_body(b"{\"payload\":\"p\"}"), Err(BodyReject::Malformed)); // missing signature
+        assert_eq!(
+            parse_body(b"{\"payload\":\"p\"}"),
+            Err(BodyReject::Malformed)
+        ); // missing signature
         assert_eq!(parse_body(b"[]"), Err(BodyReject::Malformed));
     }
 
@@ -245,10 +263,16 @@ mod tests {
         tampered.payload = "hellp".to_string();
         assert!(!verify_envelope(&tampered, SECRET));
         // Non-hex signature never panics.
-        let bad = SignedEnvelope { payload: "x".into(), signature: "zzzz".into() };
+        let bad = SignedEnvelope {
+            payload: "x".into(),
+            signature: "zzzz".into(),
+        };
         assert!(!verify_envelope(&bad, SECRET));
         // All-zero signature.
-        let zero = SignedEnvelope { payload: "x".into(), signature: "00".repeat(32) };
+        let zero = SignedEnvelope {
+            payload: "x".into(),
+            signature: "00".repeat(32),
+        };
         assert!(!verify_envelope(&zero, SECRET));
     }
 
@@ -262,7 +286,10 @@ mod tests {
         // Wrong secret -> BadSignature.
         assert_eq!(classify_packet(&pkt, b"nope"), WireOutcome::BadSignature);
         // Truncated header.
-        assert_eq!(classify_packet(&[0, 0, 0], SECRET), WireOutcome::ShortHeader);
+        assert_eq!(
+            classify_packet(&[0, 0, 0], SECRET),
+            WireOutcome::ShortHeader
+        );
         // Bad version.
         assert_eq!(
             classify_packet(&[0, 0, 0, 1, 9, b'x'], SECRET),
@@ -316,7 +343,11 @@ mod tests {
             if buf.len() >= HEADER_LEN && next() & 1 == 0 {
                 let declared = (next() % 80) as u32;
                 buf[0..4].copy_from_slice(&declared.to_be_bytes());
-                buf[4] = if next() & 1 == 0 { PROTOCOL_VERSION } else { (next() & 0xff) as u8 };
+                buf[4] = if next() & 1 == 0 {
+                    PROTOCOL_VERSION
+                } else {
+                    (next() & 0xff) as u8
+                };
             }
             // Must return *some* verdict; the assert is simply that we got here.
             let _ = classify_packet(&buf, SECRET);
