@@ -444,6 +444,13 @@ pub(crate) fn policy_decision(
     assessment: &RiskAssessment,
     policy: &PolicyConfig,
 ) -> PolicyDecision {
+    // Fail closed on non-finite risk/trust: a NaN compares false against every
+    // bound, so without this guard a NaN `fused_risk` would slip past the
+    // ceiling check below and be ALLOWed. Non-finite values never represent a
+    // safe action, so they are denied.
+    if !assessment.fused_risk.is_finite() || !assessment.trust_score.is_finite() {
+        return PolicyDecision::deny("non_finite_risk_signal", assessment);
+    }
     // Hard deny: risk above ceiling or trust below floor.
     if assessment.fused_risk > policy.upper_safety_boundary {
         return PolicyDecision::deny("risk_ceiling_exceeded", assessment);
@@ -4297,5 +4304,175 @@ mod canary_tests {
         // every proposal (an empty needle is a substring of everything).
         let p = proposal(Some("read_customer_record"), None);
         assert_eq!(proposal_trips_canary(&p, &canaries(&["", "   "])), None);
+    }
+}
+
+/// Property-based tests for the core decision invariants. These use a tiny,
+/// deterministic PRNG (no external crates) so they run on stable Rust in CI and
+/// reproduce identically on every machine, while still exploring tens of
+/// thousands of adversarial inputs per invariant.
+#[cfg(test)]
+mod decision_property_tests {
+    use super::{
+        is_base_system_path, path_is_governed, policy_decision, proposal_trips_canary,
+        NetworkPolicy, PolicyConfig, RuntimePolicy,
+    };
+    use crate::governance::{ClientProposal, PolicyVerdict, ProposedAction, RiskAssessment};
+    use std::collections::HashMap;
+
+    /// xorshift64* — deterministic, dependency-free.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// A float in [0, hi).
+        fn frac(&mut self, hi: f64) -> f64 {
+            (self.next() % 1_000_001) as f64 / 1_000_000.0 * hi
+        }
+        /// A short string over a tiny alphabet (so substrings collide often).
+        fn token(&mut self, max_len: usize) -> String {
+            const ALPHABET: &[u8] = b"ab_/.0";
+            let len = (self.next() as usize) % (max_len + 1);
+            (0..len)
+                .map(|_| ALPHABET[(self.next() as usize) % ALPHABET.len()] as char)
+                .collect()
+        }
+    }
+
+    fn policy(ceiling: f64) -> PolicyConfig {
+        PolicyConfig {
+            upper_safety_boundary: ceiling,
+            minimum_trust_score: 100.0 - ceiling,
+            agent_nodes: HashMap::new(),
+            deny_anonymous_agents: false,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
+        }
+    }
+
+    fn assess(fused: f64, trust: f64) -> RiskAssessment {
+        RiskAssessment {
+            observed_risk: fused,
+            semantic_risk: fused,
+            topology_risk: 0.0,
+            declared_risk: None,
+            fused_risk: fused,
+            trust_score: trust,
+            reasons: vec![],
+        }
+    }
+
+    /// INVARIANT: an action whose fused risk exceeds the ceiling, whose trust is
+    /// below the floor, or whose risk/trust is non-finite is NEVER allowed.
+    /// This is the fail-closed core of the policy decision.
+    #[test]
+    fn prop_policy_decision_is_fail_closed() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..100_000 {
+            let ceiling = 1.0 + rng.frac(98.0); // (1, 99)
+            // Mostly finite risks, occasionally NaN / +inf to probe the guard.
+            let fused = match rng.next() % 16 {
+                0 => f64::NAN,
+                1 => f64::INFINITY,
+                _ => rng.frac(200.0),
+            };
+            let trust = match rng.next() % 16 {
+                0 => f64::NAN,
+                _ => rng.frac(100.0),
+            };
+            let d = policy_decision(&assess(fused, trust), &policy(ceiling));
+
+            if !fused.is_finite() || !trust.is_finite() {
+                assert_eq!(d.verdict, PolicyVerdict::Deny, "non-finite must deny");
+                continue;
+            }
+            if fused > ceiling {
+                assert_eq!(
+                    d.verdict,
+                    PolicyVerdict::Deny,
+                    "risk {fused} over ceiling {ceiling} must deny"
+                );
+            }
+            if trust < 100.0 - ceiling {
+                assert!(!d.is_allow(), "trust below floor must not allow");
+            }
+            // The cardinal fail-open check: never ALLOW above the ceiling.
+            if d.is_allow() {
+                assert!(fused <= ceiling, "ALLOW implies risk within ceiling");
+                assert!(trust >= 100.0 - ceiling, "ALLOW implies trust above floor");
+            }
+        }
+    }
+
+    /// INVARIANT: the canary tripwire fires for a proposal iff some configured,
+    /// non-blank decoy is a substring of the proposal's resource surface.
+    /// Checked against an independent reference computed here.
+    #[test]
+    fn prop_canary_trips_iff_decoy_present() {
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        for _ in 0..100_000 {
+            let intent = rng.token(6);
+            let path = rng.token(6);
+            let proposal = ClientProposal {
+                sequence_counter: 1,
+                intent_name: Some(intent.clone()),
+                action_risk_score: Some(1.0),
+                session_privilege_bit: None,
+                prompt: None,
+                plan: None,
+                source_code: None,
+                requested_capabilities: vec![],
+                proposed_action: Some(ProposedAction::FileWrite {
+                    path: path.clone(),
+                    contents: String::new(),
+                }),
+                context_vars: HashMap::new(),
+            };
+            let n = (rng.next() as usize) % 3;
+            let canaries: Vec<String> = (0..n).map(|_| rng.token(3)).collect();
+
+            // Reference: trips iff a non-blank canary is a substring of intent or path.
+            let expected = canaries.iter().any(|c| {
+                let c = c.trim();
+                !c.is_empty() && (intent.contains(c) || path.contains(c))
+            });
+            let got = proposal_trips_canary(&proposal, &canaries).is_some();
+            assert_eq!(got, expected, "intent={intent:?} path={path:?} canaries={canaries:?}");
+        }
+    }
+
+    /// ANTI-LOCKOUT INVARIANT: no path under a base-system directory is ever
+    /// governed, regardless of the random suffix appended.
+    #[test]
+    fn prop_base_system_paths_never_governed() {
+        const BASES: &[&str] = &[
+            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/boot", "/sys", "/proc", "/dev",
+            "/run",
+        ];
+        let mut rng = Rng(0xF00D_F00D_1234_5678);
+        for _ in 0..50_000 {
+            let base = BASES[(rng.next() as usize) % BASES.len()];
+            let suffix = rng.token(12);
+            let path = if suffix.is_empty() {
+                base.to_string()
+            } else {
+                format!("{base}/{suffix}")
+            };
+            assert!(is_base_system_path(&path), "{path} should be base-system");
+            assert!(
+                !path_is_governed(&path),
+                "ANTI-LOCKOUT: base-system path {path} must never be governed"
+            );
+        }
     }
 }
