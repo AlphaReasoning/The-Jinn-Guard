@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  # Manual trigger for the privileged real-kernel enforcement job, which can only
+  # run on a self-hosted BPF-LSM runner (see the kernel-lsm-real job below).
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -104,6 +107,14 @@ jobs:
       # operator fails CI.
       - name: Run kernel-feature safety invariants
         run: cargo test --bin ts_cli --features kernel_telemetry 2>&1
+
+      # The privileged kernel_lsm enforcement tests (incl. #54 default-deny egress
+      # and #55 AF_UNIX deputy denylist) need BPF LSM + root, so they cannot run on
+      # a GitHub-hosted runner — they execute on the self-hosted kernel-lsm-real job
+      # below. Compile them here under --features enterprise so a change that breaks
+      # the harness (or the daemon-side enforcement wiring) fails PR CI immediately.
+      - name: Compile kernel_lsm enforcement tests (gating, no-run)
+        run: cargo test -p ts_cli --features enterprise --test kernel_lsm --no-run 2>&1
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Job 2b: Fleet feature gate (open-core enterprise client)
@@ -267,3 +278,51 @@ jobs:
           name: jinnguard-lsm-objects-${{ github.sha }}
           path: bpf/lsm/*.o
           if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 7: Real-kernel LSM enforcement (self-hosted, privileged)
+  # GitHub-hosted runners cannot enable the BPF LSM (boot param) or attach LSM
+  # programs as root, so the #[ignore]d kernel_lsm tests — the actual allow/deny
+  # enforcement proofs, including #54 default-deny IPv4 egress and #55 the AF_UNIX
+  # deputy denylist — can only execute on a self-hosted runner labelled `bpf-lsm`
+  # whose kernel was booted with `lsm=...,bpf` and cgroup v2 mounted.
+  #
+  # Manually dispatched (workflow_dispatch) so normal push/PR CI is never queued
+  # against a self-hosted runner that may be offline. Mirrors the proven incantation
+  # from scripts/validate/kernel_floor_demo.sh: compile the test binary as the build
+  # user, then exec the raw binary as root (no cargo at root, no root-owned target
+  # churn). JINNGUARD_TEST_BINARY must be ABSOLUTE.
+  # ─────────────────────────────────────────────────────────────────────────────
+  kernel-lsm-real:
+    name: Real-kernel LSM enforcement (self-hosted)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, bpf-lsm]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build + install LSM objects (-> /usr/lib/jinnguard/lsm)
+        run: sudo make -C bpf install
+
+      - name: Build enterprise daemon
+        run: cargo build -p ts_cli --features enterprise
+
+      - name: Compile kernel_lsm test binary (as build user)
+        run: cargo test -p ts_cli --features enterprise --test kernel_lsm --no-run
+
+      - name: Run armed kernel-LSM enforcement tests (root)
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug/ts_cli"
+          test -x "$BIN" || { echo "enterprise daemon not built at $BIN"; exit 1; }
+          TESTBIN="$(find "$PWD/target/debug/deps" -maxdepth 1 -type f -executable \
+            -name 'kernel_lsm-*' ! -name '*.d' -printf '%T@ %p\n' \
+            | sort -rn | head -1 | cut -d' ' -f2-)"
+          test -n "$TESTBIN" && test -x "$TESTBIN" \
+            || { echo "kernel_lsm test binary not found under target/debug/deps"; exit 1; }
+          echo "  daemon:   $BIN"
+          echo "  testbin:  $TESTBIN"
+          export PATH="$PATH:/usr/sbin"
+          # Runs the whole #[ignore]d kernel_lsm suite — the 6 baseline surfaces plus
+          # the new #54 default-deny egress and #55 deputy-denylist enforcement tests.
+          sudo -E env "PATH=$PATH" JINNGUARD_TEST_BINARY="$BIN" \
+            "$TESTBIN" --ignored --test-threads=1 --nocapture
