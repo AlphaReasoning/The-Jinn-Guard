@@ -1,0 +1,8 @@
+# Jinn Guard security contact (RFC 9116)
+# https://github.com/AlphaReasoning/The-Jinn-Guard
+
+Contact: https://github.com/AlphaReasoning/The-Jinn-Guard/security/advisories/new
+Contact: mailto:security@alpha-reasoning.org
+Policy: https://github.com/AlphaReasoning/The-Jinn-Guard/blob/main/SECURITY.md
+Preferred-Languages: en
+Expires: 2027-06-20T00:00:00.000Z

@@ -210,6 +210,105 @@ wraps armed runs in a hard 10-minute watchdog.
    restrictive mode unless `--socket-mode 0660` is set; connecting is gated by
    HMAC + peer-UID regardless, but operators on shared hosts should set it.
 
+### Nested execution and sandbox escape
+
+Jinn Guard's enforcement boundary is **processes in a governed cgroup, as seen by
+the host kernel.** The userspace intent layer is opt-in; the floor that governs a
+process which *doesn't ask* is the host BPF-LSM, applied to governed cgroups. The
+guarantee therefore rests on three assumptions, and a nested execution context can
+attack each one: the governed tag is **un-sheddable**, the kernel's **namespace
+view is authoritative**, and **no second kernel** is introduced.
+
+| Vector | How it escapes | Severity |
+| --- | --- | --- |
+| Nested VM / microVM (qemu, Firecracker, gVisor, Kata, `/dev/kvm`) | Work runs under a **second kernel**; host BPF-LSM never sees the guest's syscalls | Critical |
+| cgroup migration | Process moves itself/a child to a cgroup outside `governed_scope`; LSM no longer gates it | Critical |
+| User namespace (`unshare`/`clone` `CLONE_NEWUSER`) | Unprivileged agent gains in-ns "root", then creates mount/cgroup/pid namespaces | High |
+| Mount namespace / `pivot_root` / bind-mount | Remaps the filesystem so a denied path looks allowed (generalizes the mount-boundary item above) | High |
+| Nested container runtime (runc/podman/nspawn) | Child runs in fresh namespaces + possibly a fresh cgroup → ungoverned unless the tag is inherited | High |
+| Interpreter chains (JG-ADV-2026-001) | A child interpreter performs the real work; a "soft sandbox" | Medium |
+
+**Hardening direction (tracked in the hardening backlog and §10):**
+
+1. **Un-sheddable governance tag.** Tag the *task* (BPF task-local storage)
+   inherited on `clone`/`fork`/`exec`, rather than relying on cgroup membership
+   alone; deny `cgroup.procs` writes that move a governed task out of scope. The
+   tag follows the process tree and cannot be dropped.
+2. **Deny the nesting primitives by default for governed agents.** Add LSM
+   mediation for `mount`/`move_mount`, `pivot_root`, `chroot`, `setns`, and
+   namespace-creating `clone`/`unshare` flags. A governed agent with no legitimate
+   need is denied these, collapsing most of the surface.
+3. **Treat VM launch as a hard boundary.** Host BPF-LSM cannot see inside a guest
+   kernel. Deny `/dev/kvm` and `/dev/vhost-*` and VMM binaries for governed
+   agents. A VM-capable governed agent is **outside the single-host enforcement
+   model unless a nested Jinn Guard instance governs the guest** (recursive
+   governance). This is stated as an explicit scope limit, not a claim.
+4. **Key path decisions on inode/superblock identity, not path strings**, so
+   bind-mount/`pivot_root` remapping cannot fool the denylist (deepens the
+   mount-boundary fix).
+5. **Drop nesting-enabling capabilities** (`CAP_SYS_ADMIN`, `CAP_SYS_CHROOT`) and
+   restrict unprivileged user-namespace creation for governed workloads.
+6. **Default-deny dangerous operations at the kernel floor for governed scope**, so
+   a nested process that never speaks the protocol still cannot exec/mount/connect
+   outside policy — i.e., non-cooperation is safe.
+7. **Detect even where permitted:** namespace/cgroup/mount/VM-device creation by a
+   governed agent is a high-signal event and is logged/alerted (canary-style).
+
+Until items 1–3 land, operators should run governed agents **without
+`CAP_SYS_ADMIN`** and with unprivileged user namespaces disabled
+(`kernel.unprivileged_userns_clone=0` where the workload permits), which blocks
+the high-severity namespace and mount vectors at the OS level today.
+
+### Confused deputy via privileged orchestrators
+
+A distinct and **higher-severity** class than the escapes above: instead of
+exercising privilege it has, a governed agent **borrows the authority of a
+more-privileged, ungoverned daemon** through an IPC channel. Capability-denial
+defenses (drop `CAP_SYS_ADMIN`, block `unshare`/`mount`, disable userns) do **not**
+help, because the agent is not performing the privileged operation — the deputy is.
+
+Canonical instance:
+
+```
+governed_agent ──connect()──▶ /var/run/docker.sock ──▶ dockerd (root, ungoverned cgroup)
+                                                        docker run -v /:/host … 'write to host'
+```
+
+`dockerd` performs the action with root, **in its own cgroup**, which the BPF-LSM
+floor — scoped to the *agent's* governed cgroup — never observes. The agent never
+left its sandbox; it commanded a deputy that lives outside it.
+
+**Current status (disclosed): this path is open.** The `socket_connect` /
+`socket_sendmsg` hooks mediate **AF_INET (IPv4) only**; `connect()` to an **AF_UNIX**
+orchestrator socket is not mediated. `systemd` and `dbus-daemon` are deliberately
+`IMMUNE` from governance (anti-lockout), which is correct for not bricking the host
+but leaves the agent→`systemd`/D-Bus channel — and `systemd-run` as a deputy — fully
+available. Viable deputies include `dockerd`/`containerd`, `podman`, `systemd`/D-Bus,
+`libvirtd`, CI/build runners, setuid helpers, and **privileged MCP tool servers**.
+
+**Hardening (the control channel is the chokepoint):**
+
+1. **Deny governed agents' IPC to privileged deputies** — extend `socket_connect`
+   (and `openat` on the socket path) to **denylist AF_UNIX paths**: `docker.sock`,
+   `containerd.sock`, the systemd/private D-Bus socket, `libvirt-sock`, podman.
+   AF_UNIX path mediation is the missing primitive today. Note: denying the agent's
+   *connect* does **not** govern the daemon, so there is **no anti-lockout
+   conflict** — the daemon stays immune; the agent simply cannot command it.
+2. **Deny-by-default IPC egress allowlist** for governed agents: only explicitly
+   permitted endpoints; orchestrator/init sockets denied by default.
+3. **Govern the deputy / propagate identity** (the complete but hard fix): the
+   deputy acts under the caller's capability rather than its ambient root
+   (designation = authority). Attribution across a shared daemon is genuinely hard.
+4. **Detect unconditionally:** a governed agent connecting to a container/VM/init
+   control socket is a high-signal event — log/alert even where it cannot yet be
+   blocked.
+
+**Architectural limit:** confused deputy via ambient-authority daemons is a
+fundamental limit of any per-process/per-cgroup model. Jinn Guard cannot govern an
+independent root daemon unless that daemon's **control channel is denied to the
+agent** or the **daemon is itself governed**. The tractable defense is (1): treat
+orchestrator/init IPC endpoints as denied resources for governed agents.
+
 ---
 
 ## 8. Threats to validity — the risk model and the formal guarantee
