@@ -1467,8 +1467,12 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..THREADS {
             let l = std::sync::Arc::clone(&logger);
-            let (o, s, a, d) =
-                (obs.clone(), semantic.clone(), assessment.clone(), decision.clone());
+            let (o, s, a, d) = (
+                obs.clone(),
+                semantic.clone(),
+                assessment.clone(),
+                decision.clone(),
+            );
             handles.push(std::thread::spawn(move || {
                 for _ in 0..PER {
                     let _ = l.log(&o, &s, &a, &d);

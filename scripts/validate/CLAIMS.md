@@ -18,6 +18,7 @@ Run the whole thing first: `python3 validate.py`. Then reproduce any single line
 | 8 | **Deterministic & fail-closed** — same input → same verdict, no attack ever allowed | Nondeterministic bypass | identical verdicts twice, `fail-opens: 0` | `validate.py` runs the battery twice |
 | 9 | **Tamper-evident audit** — the decision log can't be silently altered | Evidence tampering | verifier reports `CAUGHT` | `python3 verify_audit_chain.py <edited log>` |
 | 10 | **Transparency** — verdicts reconcile with the daemon's own counters | Hidden behavior | `allow`/`deny` totals match | `validate.py` step 5 / `curl /metrics` |
+| 11 | **Canary tripwire** — touching a decoy resource is denied *before* the allowlist, as a compromise signal | Recon / compromised agent probing | `DENY_CANARY_TRIPWIRE` | `python3 byo_attack.py --agent claims_agent --intent read_canary_decoy_a91f` |
 
 ## What "verify the audit chain yourself" means (claim 9)
 

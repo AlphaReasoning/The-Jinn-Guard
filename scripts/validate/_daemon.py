@@ -29,6 +29,8 @@ global_safety_ceiling: 90.0
 deny_anonymous_agents: true
 enforcement_scope:
   governed_path_prefixes: []
+canary_resources:
+  - "canary_decoy_a91f"
 agent_nodes:
   - id: "claims_agent"
     privilege_tier: 2

@@ -752,3 +752,77 @@ fn print_attack_summary() {
     println!("  ║ **Mixed: 50 legitimate ALLOWs excluded           ║");
     println!("  ╚══════════════════════════════════════════════════╝");
 }
+
+// ── Wire / integrity layer attack classes (ATTACK 13) ─────────────────────────
+// These exercise the parsers and integrity gate *before* any policy logic, using
+// the same real daemon. Each hostile frame must produce the correct verdict and
+// must never crash the daemon — verified by a valid request afterward.
+
+fn raw_framed(version: u8, body: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5 + body.len());
+    p.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    p.push(version);
+    p.extend_from_slice(body);
+    p
+}
+
+fn header_only(declared_len: u32, version: u8) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5);
+    p.extend_from_slice(&declared_len.to_be_bytes());
+    p.push(version);
+    p
+}
+
+#[test]
+fn test_wire_layer_attack_classes() {
+    let daemon = DaemonGuard::spawn("wire_layer", 0, &["read_file"], false);
+
+    // 1. Oversized declared length (> 4 MiB) is refused before any body alloc.
+    let r = daemon.send_recv(&header_only(5 * 1024 * 1024, 1));
+    assert!(
+        r.contains("DENY_PAYLOAD_TOO_LARGE"),
+        "oversized frame -> {r}"
+    );
+
+    // 2. Non-UTF-8 body.
+    let r = daemon.send_recv(&raw_framed(1, &[0xff, 0xfe, 0xfd, 0x00]));
+    assert!(r.contains("DENY_ENCODING_ERROR"), "non-utf8 body -> {r}");
+
+    // 3. Well-formed UTF-8 that is not a SignedEnvelope.
+    for body in [b"not json".as_slice(), b"[]", b"{}", br#"{"payload":"p"}"#] {
+        let r = daemon.send_recv(&raw_framed(1, body));
+        assert!(
+            r.contains("DENY_MALFORMED_PAYLOAD"),
+            "malformed envelope {:?} -> {r}",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // 4. Empty signature must fail the HMAC gate (not be treated as "no check").
+    let payload = r#"{"sequence_counter":1,"intent_name":"read_file","agent_id":"test_agent"}"#;
+    let env = serde_json::json!({ "payload": payload, "signature": "" }).to_string();
+    let r = daemon.send_recv(&raw_framed(1, env.as_bytes()));
+    assert!(r.contains("DENY_TAMPERED_TOKEN"), "empty signature -> {r}");
+
+    // 5. Deeply nested JSON must be rejected without a stack overflow / hang.
+    let nested = format!("{}{}", "[".repeat(2000), "]".repeat(2000));
+    let r = daemon.send_recv(&raw_framed(1, nested.as_bytes()));
+    assert!(
+        r.contains("DENY_MALFORMED_PAYLOAD"),
+        "deeply nested json -> {r}"
+    );
+
+    // 6. Truncated frame (partial header, then close) must not wedge the daemon.
+    if let Ok(mut s) = UnixStream::connect(&daemon.socket_path) {
+        let _ = s.write_all(&[0u8, 0, 0]); // 3 of 5 header bytes
+        drop(s);
+    }
+
+    // Resilience: after the whole barrage, a legitimate request still succeeds.
+    let good = build_packet(next_seq(), "read_file", Some("test_agent"), 5.0, 1);
+    let r = daemon.send_recv(&good);
+    assert!(
+        r.contains("ALLOW"),
+        "daemon must survive wire-layer barrage -> {r}"
+    );
+}

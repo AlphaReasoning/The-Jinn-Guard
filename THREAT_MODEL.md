@@ -278,24 +278,34 @@ governed_agent ──connect()──▶ /var/run/docker.sock ──▶ dockerd (
 floor — scoped to the *agent's* governed cgroup — never observes. The agent never
 left its sandbox; it commanded a deputy that lives outside it.
 
-**Current status (disclosed): this path is open.** The `socket_connect` /
-`socket_sendmsg` hooks mediate **AF_INET (IPv4) only**; `connect()` to an **AF_UNIX**
-orchestrator socket is not mediated. `systemd` and `dbus-daemon` are deliberately
-`IMMUNE` from governance (anti-lockout), which is correct for not bricking the host
-but leaves the agent→`systemd`/D-Bus channel — and `systemd-run` as a deputy — fully
-available. Viable deputies include `dockerd`/`containerd`, `podman`, `systemd`/D-Bus,
-`libvirtd`, CI/build runners, setuid helpers, and **privileged MCP tool servers**.
+**Current status (disclosed): the canonical AF_UNIX path is now mediated
+(#55); pending validation on a BPF-LSM host.** The `socket_connect` hook now
+builds a path key from the `AF_UNIX` `sun_path` and denies governed-scope
+connects to a built-in denylist of orchestrator/init control sockets
+(`docker.sock`, `containerd.sock`, `podman.sock`, `crio.sock`, `libvirt-sock`,
+the D-Bus system bus, `systemd/private` — both `/run` and `/var/run`). `systemd`
+and `dbus-daemon` remain deliberately `IMMUNE` from governance (anti-lockout):
+denying the *agent's connect* does not govern the daemon, so there is no
+conflict. **Residual:** exact pathname match only — abstract-namespace sockets
+and socket paths bind-mounted to non-standard locations inside a container are
+not yet matched; and the deputy, once reached by a non-denylisted channel, still
+acts with ambient root. Viable deputies still include CI/build runners, setuid
+helpers, and **privileged MCP tool servers** reachable by non-denylisted paths.
 
 **Hardening (the control channel is the chokepoint):**
 
-1. **Deny governed agents' IPC to privileged deputies** — extend `socket_connect`
-   (and `openat` on the socket path) to **denylist AF_UNIX paths**: `docker.sock`,
-   `containerd.sock`, the systemd/private D-Bus socket, `libvirt-sock`, podman.
-   AF_UNIX path mediation is the missing primitive today. Note: denying the agent's
-   *connect* does **not** govern the daemon, so there is **no anti-lockout
-   conflict** — the daemon stays immune; the agent simply cannot command it.
-2. **Deny-by-default IPC egress allowlist** for governed agents: only explicitly
-   permitted endpoints; orchestrator/init sockets denied by default.
+1. **Deny governed agents' IPC to privileged deputies** — **IMPLEMENTED (#55):**
+   `socket_connect` denylists the AF_UNIX control sockets above for governed
+   scope. Denying the agent's *connect* does **not** govern the daemon, so there
+   is **no anti-lockout conflict** — the daemon stays immune; the agent simply
+   cannot command it. (Companion #54: governed-scope IPv4 egress is now
+   default-deny under `network_policy.default_deny`, allow-listed destinations
+   plus loopback only, with IPv6 failing closed — so a non-cooperating nested
+   process cannot reach the network off an allowlist either.)
+2. **Deny-by-default IPC egress allowlist** for governed agents (#56, future):
+   only explicitly permitted AF_UNIX endpoints; all others denied by default
+   (today AF_UNIX is denylist-based so the agent can still reach the Jinn Guard
+   socket and other non-denylisted endpoints).
 3. **Govern the deputy / propagate identity** (the complete but hard fix): the
    deputy acts under the caller's capability rather than its ambient root
    (designation = authority). Attribution across a shared daemon is genuinely hard.

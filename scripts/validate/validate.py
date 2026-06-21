@@ -33,6 +33,10 @@ ATTACKS = [
     ("anonymous agent",                  "DENY_ANONYMOUS_AGENT_NOT_PERMITTED", dict(intent="read_customer_record", agent_id=None, risk="10")),
     ("intent not on allowlist",          "DENY_INTENT_NOT_ALLOWED",        dict(intent="wipe_database", agent_id="claims_agent", risk="10")),
     ("risk over ceiling (Z3-blocked)",   "DENY_RISK_CEILING_EXCEEDED",     dict(intent="read_customer_record", agent_id="claims_agent", risk="95")),
+    # Canary tripwire fires *before* the allowlist: a known agent whose proposal
+    # references a decoy resource is denied as a compromise signal, not merely
+    # because the intent is unlisted.
+    ("canary tripwire (decoy)",          "DENY_CANARY_TRIPWIRE",           dict(intent="read_canary_decoy_a91f", agent_id="claims_agent", risk="10")),
 ]
 
 

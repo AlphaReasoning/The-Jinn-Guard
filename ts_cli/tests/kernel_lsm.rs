@@ -6,13 +6,20 @@
 //   export PATH="$PATH:/usr/sbin"
 //   sudo PATH="$PATH" make -C bpf install
 //   cargo build -p ts_cli --features enterprise
-//   sudo -E env "PATH=$PATH" JINNGUARD_TEST_BINARY=target/debug/ts_cli \
+//   sudo -E env "PATH=$PATH" JINNGUARD_TEST_BINARY="$PWD/target/debug/ts_cli" \
 //     cargo test -p ts_cli --features enterprise --test kernel_lsm -- \
 //     --ignored --test-threads=1 --nocapture
+//
+// NOTE: `JINNGUARD_TEST_BINARY` must be ABSOLUTE. `cargo test -p ts_cli` runs the
+// test binary with its cwd set to the package dir (ts_cli/), not the workspace
+// root, so a relative `target/debug/ts_cli` resolves to a nonexistent
+// `ts_cli/target/debug/ts_cli`. Omitting the var entirely also works (the
+// daemon_binary() fallback uses an absolute CARGO_MANIFEST_DIR-relative path).
 
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -140,6 +147,28 @@ impl DaemonGuard {
     }
 
     fn spawn_with_env(name: &str, fs_root: &str, extra_env: &[(&str, &str)]) -> Self {
+        Self::spawn_full(name, fs_root, extra_env, None)
+    }
+
+    /// Like `spawn_with_env`, but writes a caller-supplied policy YAML verbatim.
+    /// Used by the default-deny egress test, which needs `network_policy` knobs
+    /// (`default_deny`, `allowed_ips`) the default `write_policy` helper does
+    /// not emit.
+    fn spawn_with_policy(
+        name: &str,
+        fs_root: &str,
+        policy_yaml: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_full(name, fs_root, extra_env, Some(policy_yaml))
+    }
+
+    fn spawn_full(
+        name: &str,
+        fs_root: &str,
+        extra_env: &[(&str, &str)],
+        policy_override: Option<&str>,
+    ) -> Self {
         let socket_path = format!("/tmp/jg_kernel_lsm_{name}.sock");
         let secret_path = format!("/tmp/jg_kernel_lsm_{name}.secret");
         let lineage_path = format!("/tmp/jg_kernel_lsm_{name}.lineage.json");
@@ -152,7 +181,11 @@ impl DaemonGuard {
         let _ = fs::remove_file(format!("{lineage_path}.db"));
         let _ = fs::remove_file(&audit_path);
         let _ = fs::remove_file(format!("{audit_path}.db"));
-        write_policy(&policy_path, fs_root);
+        match policy_override {
+            Some(yaml) => fs::write(&policy_path, yaml)
+                .unwrap_or_else(|err| panic!("write policy {policy_path}: {err}")),
+            None => write_policy(&policy_path, fs_root),
+        }
         fs::write(&secret_path, TEST_SECRET).unwrap();
 
         // Create the scoped cgroup BEFORE the daemon starts so the daemon can
@@ -379,6 +412,53 @@ fn spawn_accept_loop(listener: TcpListener) -> (Arc<AtomicBool>, thread::JoinHan
 fn finish_accept_loop(running: Arc<AtomicBool>, handle: thread::JoinHandle<()>) {
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();
+}
+
+/// AF_UNIX analogue of `spawn_accept_loop` for the deputy-denylist test's
+/// allowed (non-denylisted) socket. Accepted streams are dropped immediately;
+/// the test only needs completed connects.
+fn spawn_unix_accept_loop(listener: UnixListener) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+    listener.set_nonblocking(true).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let accept_running = Arc::clone(&running);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let _ = ready_tx.send(());
+        while accept_running.load(Ordering::Relaxed) {
+            loop {
+                match listener.accept() {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("unix accept loop ready");
+    (running, handle)
+}
+
+/// Discover a non-loopback IPv4 address assigned to this host. The default-deny
+/// egress test needs it to exercise the *allowlist* path: loopback (127.0.0.0/8)
+/// is exempt from default-deny in-kernel, so it can never prove an allowlisted
+/// non-loopback destination is permitted. The discovery socket is only
+/// `connect()`ed (which just selects a source address via the routing table) —
+/// no packets are sent — so this needs a configured default route, not network
+/// reachability.
+fn primary_non_loopback_ipv4() -> Ipv4Addr {
+    let probe = UdpSocket::bind("0.0.0.0:0").expect("bind discovery socket");
+    probe
+        .connect("198.51.100.1:9")
+        .expect("select source address on discovery socket");
+    match probe.local_addr().expect("discovery local_addr").ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => ip,
+        other => panic!(
+            "default-deny egress test requires a non-loopback IPv4 on this host; found {other}"
+        ),
+    }
 }
 
 fn command_status_success(mut command: Command) -> io::Result<()> {
@@ -646,4 +726,127 @@ fn test_kernel_filesystem_unlink_blocking_percentiles() {
     drop(daemon);
     let _ = fs::remove_dir_all(denied_root);
     let _ = fs::remove_dir_all(allowed_root);
+}
+
+/// #54 — default-deny IPv4 egress. With `network_policy.default_deny: true`, a
+/// governed connect to a non-loopback IPv4 is denied unless the destination is
+/// in `allowed_ips`; loopback (127.0.0.0/8) stays exempt for anti-lockout.
+/// Three surfaces per iteration:
+///   * ALLOW — connect to an allowlisted non-loopback host IP (exercises the
+///     allowlist hit; loopback alone could not, since it bypasses the lookup).
+///   * ALLOW — connect to 127.0.0.2 (loopback exemption / anti-lockout).
+///   * DENY  — connect to 198.51.100.9 (RFC 5737 TEST-NET-2: not allowlisted,
+///     not loopback, with no listener). The LSM verdict precedes the TCP layer,
+///     so EPERM returns immediately; were enforcement off, the connect would
+///     instead hit a non-routable sink and time out, failing the test.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_default_deny_egress_percentiles() {
+    let root = fs_root("default_deny_egress");
+    let host_ip = primary_non_loopback_ipv4();
+
+    let policy = format!(
+        r#"
+global_safety_ceiling: 90.0
+network_policy:
+  default_deny: true
+  allowed_ips:
+    - "{host_ip}"
+agent_nodes:
+  - id: "kernel_agent"
+    privilege_tier: 1
+    max_sequence_quota: 0
+    allowed_intents: []
+    allowed_executables:
+      - "/bin/echo"
+      - "/usr/bin/echo"
+    denied_write_paths:
+      - "{root}"
+    denied_unlink_paths:
+      - "{root}"
+    invariants: []
+"#,
+        host_ip = host_ip,
+        root = root.to_str().unwrap(),
+    );
+
+    let daemon =
+        DaemonGuard::spawn_with_policy("default_deny_egress", root.to_str().unwrap(), &policy, &[]);
+
+    // Allowlisted, non-loopback listener (the host's own IP; the connection is
+    // routed internally but the LSM sees the non-loopback destination address).
+    let allowed_listener = TcpListener::bind((host_ip, 0)).unwrap();
+    let allowed_addr = allowed_listener.local_addr().unwrap();
+    let (allowed_running, allowed_thread) = spawn_accept_loop(allowed_listener);
+
+    // Loopback listener — exempt from default-deny regardless of the allowlist.
+    let loopback_listener = TcpListener::bind("127.0.0.2:0").unwrap();
+    let loopback_addr = loopback_listener.local_addr().unwrap();
+    let (loopback_running, loopback_thread) = spawn_accept_loop(loopback_listener);
+
+    // Non-allowlisted, non-loopback sink; no listener (LSM denies first).
+    let denied_addr: SocketAddr = "198.51.100.9:9".parse().unwrap();
+
+    let mut stats = DecisionStats::default();
+    for _ in 0..operation_count() {
+        stats.record(ExpectedDecision::Allow, || {
+            TcpStream::connect_timeout(&allowed_addr, Duration::from_millis(250)).map(|_| ())
+        });
+        stats.record(ExpectedDecision::Allow, || {
+            TcpStream::connect_timeout(&loopback_addr, Duration::from_millis(250)).map(|_| ())
+        });
+        stats.record(ExpectedDecision::Deny, || {
+            TcpStream::connect_timeout(&denied_addr, Duration::from_millis(250)).map(|_| ())
+        });
+    }
+
+    finish_accept_loop(allowed_running, allowed_thread);
+    finish_accept_loop(loopback_running, loopback_thread);
+    stats.assert_expected_and_report("DEFAULT_DENY_EGRESS");
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// #55 — AF_UNIX deputy-socket denylist. A governed connect to a built-in
+/// orchestrator control socket (`/run/docker.sock`) is denied, closing the
+/// confused-deputy path (agent -> dockerd -> ungoverned root); a connect to an
+/// ordinary, non-denylisted unix socket is allowed, so the agent can still
+/// reach the Jinn Guard control socket (anti-lockout). The denylist verdict
+/// precedes path resolution, so the deny holds whether or not a real docker
+/// socket is present — the test never creates or clobbers one.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_unix_deputy_blocking_percentiles() {
+    let root = fs_root("unix_deputy");
+    let daemon = DaemonGuard::spawn("unix_deputy", root.to_str().unwrap());
+
+    // Ordinary, non-denylisted unix socket the governed process may reach.
+    let allowed_sock = "/tmp/jg_kernel_lsm_unix_deputy_allowed.sock";
+    let _ = fs::remove_file(allowed_sock);
+    let allowed_listener = UnixListener::bind(allowed_sock).unwrap();
+    let (allowed_running, allowed_thread) = spawn_unix_accept_loop(allowed_listener);
+
+    // Built-in denylisted orchestrator socket (see ORCHESTRATOR_CONTROL_SOCKETS
+    // in ebpf_monitor.rs). Connecting yields EPERM from the LSM before the path
+    // is resolved, so no live docker daemon is required.
+    let denied_sock = "/run/docker.sock";
+
+    let mut stats = DecisionStats::default();
+    for idx in 0..operation_count() {
+        if idx % 2 == 0 {
+            stats.record(ExpectedDecision::Allow, || {
+                UnixStream::connect(allowed_sock).map(|_| ())
+            });
+        } else {
+            stats.record(ExpectedDecision::Deny, || {
+                UnixStream::connect(denied_sock).map(|_| ())
+            });
+        }
+    }
+
+    finish_accept_loop(allowed_running, allowed_thread);
+    stats.assert_expected_and_report("UNIX_DEPUTY_DENYLIST");
+    let _ = fs::remove_file(allowed_sock);
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
 }

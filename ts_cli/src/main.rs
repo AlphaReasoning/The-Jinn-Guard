@@ -25,10 +25,8 @@ use governance::{
     ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment, SemanticAnalysisService,
     SemanticIntent,
 };
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -44,14 +42,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use ts_checker::PolicyEngine;
+use ts_wire::{BodyReject, FrameReject, SignedEnvelope};
 use z3::{Config as Z3Config, Context as Z3Context};
 
 use ebpf_monitor::{LsmRequest, Verdict};
 
 #[cfg(feature = "kernel_telemetry")]
 use ebpf_monitor::{LsmPathResolutionCache, LsmRequestType};
-
-type HmacSha256 = Hmac<Sha256>;
 
 // TelemetryStore maps kernel PID → list of kernel telemetry events
 // Feature-gated: in non-kernel-telemetry builds this is a stub.
@@ -195,6 +192,11 @@ pub(crate) struct PolicyConfig {
     pub fleet_policy_min_version: u64,
     #[allow(dead_code)]
     pub accept_cross_machine_lineage: bool,
+    /// Decoy ("canary") resource identifiers. A governed proposal that references
+    /// any of these honeytokens trips the tripwire and is denied before the
+    /// allowlist is consulted — no legitimate intent ever names a canary, so a
+    /// single hit is treated as a compromise/probe signal.
+    pub canary_resources: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +219,9 @@ struct PolicyYaml {
     accept_cross_machine_lineage: bool,
     #[serde(default)]
     enforcement_scope: EnforcementScopeYaml,
+    /// Decoy resource identifiers watched by the canary tripwire (WS3).
+    #[serde(default)]
+    canary_resources: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -253,6 +258,7 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
                 runtime_policy: yaml.runtime_policy,
                 fleet_policy_min_version: yaml.fleet_policy_min_version,
                 accept_cross_machine_lineage: yaml.accept_cross_machine_lineage,
+                canary_resources: yaml.canary_resources,
             };
         }
     }
@@ -269,6 +275,7 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
         runtime_policy: RuntimePolicy::default(),
         fleet_policy_min_version: 0,
         accept_cross_machine_lineage: false,
+        canary_resources: Vec::new(),
     }
 }
 
@@ -295,6 +302,7 @@ fn parse_policy_yaml(content: &str, allow_anonymous: bool) -> Option<PolicyConfi
         runtime_policy: yaml.runtime_policy,
         fleet_policy_min_version: yaml.fleet_policy_min_version,
         accept_cross_machine_lineage: yaml.accept_cross_machine_lineage,
+        canary_resources: yaml.canary_resources,
     })
 }
 
@@ -331,28 +339,11 @@ fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// HMAC envelope verification
+// Wire decoding (frame + signed envelope) lives in the `ts_wire` crate so the
+// externally reachable parsers can be fuzzed in isolation; the daemon calls
+// them below. See ts_wire::{decode_frame_header, classify_frame_header,
+// parse_body, verify_envelope}.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SignedEnvelope {
-    payload: String,
-    signature: String,
-}
-
-fn verify_envelope(envelope: &SignedEnvelope, secret: &[u8]) -> bool {
-    let provided = match hex::decode(envelope.signature.trim()) {
-        Ok(sig) => sig,
-        Err(_) => return false,
-    };
-    let mut mac = match HmacSha256::new_from_slice(secret) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(envelope.payload.as_bytes());
-    let expected = mac.finalize().into_bytes();
-    constant_time_eq::constant_time_eq(expected.as_slice(), provided.as_slice())
-}
 
 fn runtime_policy_denial(
     runtime_policy: &RuntimePolicy,
@@ -453,6 +444,13 @@ pub(crate) fn policy_decision(
     assessment: &RiskAssessment,
     policy: &PolicyConfig,
 ) -> PolicyDecision {
+    // Fail closed on non-finite risk/trust: a NaN compares false against every
+    // bound, so without this guard a NaN `fused_risk` would slip past the
+    // ceiling check below and be ALLOWed. Non-finite values never represent a
+    // safe action, so they are denied.
+    if !assessment.fused_risk.is_finite() || !assessment.trust_score.is_finite() {
+        return PolicyDecision::deny("non_finite_risk_signal", assessment);
+    }
     // Hard deny: risk above ceiling or trust below floor.
     if assessment.fused_risk > policy.upper_safety_boundary {
         return PolicyDecision::deny("risk_ceiling_exceeded", assessment);
@@ -1139,6 +1137,43 @@ fn denied_assessment(reason: &str) -> RiskAssessment {
     }
 }
 
+/// The resource-bearing strings a proposal exposes: the declared intent name and
+/// the target of the proposed action (file path / request URL / shell command).
+/// These are the surfaces a canary tripwire watches.
+fn proposal_resource_surface(proposal: &ClientProposal) -> Vec<&str> {
+    let mut surface: Vec<&str> = Vec::new();
+    if let Some(intent) = proposal.intent_name.as_deref() {
+        surface.push(intent);
+    }
+    match &proposal.proposed_action {
+        Some(ProposedAction::FileWrite { path, .. }) => surface.push(path),
+        Some(ProposedAction::NetworkRequest { url, .. }) => surface.push(url),
+        Some(ProposedAction::ShellCommand { command }) => surface.push(command),
+        None => {}
+    }
+    surface
+}
+
+/// Return the first configured canary ("decoy") resource that the proposal
+/// references, if any. A canary is a honeytoken no legitimate intent ever names,
+/// so a single containment hit anywhere in the proposal's resource surface is
+/// treated as a compromise/probe signal. Empty or whitespace-only canary entries
+/// are ignored so a misconfigured policy cannot match every proposal.
+fn proposal_trips_canary<'a>(
+    proposal: &ClientProposal,
+    canary_resources: &'a [String],
+) -> Option<&'a str> {
+    if canary_resources.is_empty() {
+        return None;
+    }
+    let surface = proposal_resource_surface(proposal);
+    canary_resources
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .find(|canary| surface.iter().any(|resource| resource.contains(*canary)))
+}
+
 // ---------------------------------------------------------------------------
 // Lineage check result
 // ---------------------------------------------------------------------------
@@ -1187,37 +1222,37 @@ async fn handle_client_connection(
             return;
         }
 
-        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let version = header[4];
-
-        if version != 1 {
-            emit_daemon_decision_explanation(
-                "DENY",
-                "DENY_BAD_VERSION",
-                "protocol_integrity",
-                &peer_source,
-                None,
-                None,
-                None,
-            );
-            deny(&mut stream, b"SIGNAL: DENY_BAD_VERSION\n").await;
-            return;
-        }
-
-        // STEP 2: Read payload bytes of declared length.
-        if length > 4 * 1024 * 1024 {
-            emit_daemon_decision_explanation(
-                "DENY",
-                "DENY_PAYLOAD_TOO_LARGE",
-                "protocol_integrity",
-                &peer_source,
-                None,
-                None,
-                None,
-            );
-            deny(&mut stream, b"SIGNAL: DENY_PAYLOAD_TOO_LARGE\n").await;
-            return;
-        }
+        // STEP 2: Validate the frame header (version + length bound) via the
+        // fuzzable ts_wire decoder, then read exactly `length` body bytes.
+        let length = match ts_wire::classify_frame_header(ts_wire::decode_frame_header(&header)) {
+            Ok(len) => len,
+            Err(FrameReject::BadVersion) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_BAD_VERSION",
+                    "protocol_integrity",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
+                deny(&mut stream, b"SIGNAL: DENY_BAD_VERSION\n").await;
+                return;
+            }
+            Err(FrameReject::PayloadTooLarge) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_PAYLOAD_TOO_LARGE",
+                    "protocol_integrity",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
+                deny(&mut stream, b"SIGNAL: DENY_PAYLOAD_TOO_LARGE\n").await;
+                return;
+            }
+        };
 
         let mut buffer = vec![0u8; length];
         if let Err(e) = stream.read_exact(&mut buffer).await {
@@ -1225,9 +1260,12 @@ async fn handle_client_connection(
             return;
         }
 
-        let raw_wire_packet = match std::str::from_utf8(&buffer) {
-            Ok(s) => s,
-            Err(_) => {
+        // STEP 3: Decode the body into a SignedEnvelope (UTF-8 + JSON) via the
+        // fuzzable ts_wire decoder. Encoding vs. structural failures map to the
+        // same distinct verdicts as before.
+        let envelope: SignedEnvelope = match ts_wire::parse_body(&buffer) {
+            Ok(e) => e,
+            Err(BodyReject::Encoding) => {
                 emit_daemon_decision_explanation(
                     "DENY",
                     "DENY_ENCODING_ERROR",
@@ -1240,12 +1278,7 @@ async fn handle_client_connection(
                 deny(&mut stream, b"SIGNAL: DENY_ENCODING_ERROR\n").await;
                 return;
             }
-        };
-
-        // STEP 3: Parse outer SignedEnvelope.
-        let envelope: SignedEnvelope = match serde_json::from_str(raw_wire_packet) {
-            Ok(e) => e,
-            Err(_) => {
+            Err(BodyReject::Malformed) => {
                 emit_daemon_decision_explanation(
                     "DENY",
                     "DENY_MALFORMED_PAYLOAD",
@@ -1262,7 +1295,7 @@ async fn handle_client_connection(
 
         // STEP 4: Verify HMAC signature against the inner payload string.
         let secret = load_secret_from_file(secret_file.as_deref());
-        if !verify_envelope(&envelope, &secret) {
+        if !ts_wire::verify_envelope(&envelope, &secret) {
             println!("[deny] pid={} HMAC verification failed", observation.pid);
             emit_daemon_decision_explanation(
                 "DENY",
@@ -1406,7 +1439,12 @@ async fn handle_client_connection(
                 None,
                 None,
             );
-            audit_denied(&audit_logger, &observation, &proposal, "DENY_ANONYMOUS_AGENT_NOT_PERMITTED");
+            audit_denied(
+                &audit_logger,
+                &observation,
+                &proposal,
+                "DENY_ANONYMOUS_AGENT_NOT_PERMITTED",
+            );
             deny(&mut stream, b"SIGNAL: DENY_ANONYMOUS_AGENT_NOT_PERMITTED\n").await;
             return;
         }
@@ -1427,10 +1465,43 @@ async fn handle_client_connection(
                     Some(id),
                     None,
                 );
-                audit_denied(&audit_logger, &observation, &proposal, "DENY_UNKNOWN_AGENT_ID");
+                audit_denied(
+                    &audit_logger,
+                    &observation,
+                    &proposal,
+                    "DENY_UNKNOWN_AGENT_ID",
+                );
                 deny(&mut stream, b"SIGNAL: DENY_UNKNOWN_AGENT_ID\n").await;
                 return;
             }
+        }
+
+        // STEP 8.5: Canary tripwire. A decoy ("canary") resource is a honeytoken
+        // that no legitimate intent references. We short-circuit DENY *before* the
+        // allowlist so that even an otherwise-permitted intent cannot reach a
+        // tripwire — touching one is treated as a compromise/probe signal.
+        if let Some(canary) = proposal_trips_canary(&proposal, &current_policy.canary_resources) {
+            println!(
+                "[deny] pid={} canary tripwire: proposal references decoy resource {:?}",
+                observation.pid, canary
+            );
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_CANARY_TRIPWIRE",
+                "runtime_governance",
+                &peer_source,
+                Some(&proposal),
+                agent_id_opt.as_deref(),
+                None,
+            );
+            audit_denied(
+                &audit_logger,
+                &observation,
+                &proposal,
+                "DENY_CANARY_TRIPWIRE",
+            );
+            deny(&mut stream, b"SIGNAL: DENY_CANARY_TRIPWIRE\n").await;
+            return;
         }
 
         // STEP 9: Intent allowlist check.
@@ -1454,7 +1525,12 @@ async fn handle_client_connection(
                         agent_id_opt.as_deref(),
                         None,
                     );
-                    audit_denied(&audit_logger, &observation, &proposal, "DENY_INTENT_NOT_ALLOWED");
+                    audit_denied(
+                        &audit_logger,
+                        &observation,
+                        &proposal,
+                        "DENY_INTENT_NOT_ALLOWED",
+                    );
                     deny(&mut stream, b"SIGNAL: DENY_INTENT_NOT_ALLOWED\n").await;
                     return;
                 }
@@ -1486,8 +1562,13 @@ async fn handle_client_connection(
                     agent_id_opt.as_deref(),
                     None,
                 );
-                audit_denied(&audit_logger, &observation, &proposal, "DENY_DELEGATION_INVALID");
-            deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
+                audit_denied(
+                    &audit_logger,
+                    &observation,
+                    &proposal,
+                    "DENY_DELEGATION_INVALID",
+                );
+                deny(&mut stream, b"SIGNAL: DENY_DELEGATION_INVALID\n").await;
                 return;
             }
 
@@ -1504,7 +1585,12 @@ async fn handle_client_connection(
                 agent_id_opt.as_deref(),
                 None,
             );
-            audit_denied(&audit_logger, &observation, &proposal, "DENY_DELEGATION_UNSUPPORTED");
+            audit_denied(
+                &audit_logger,
+                &observation,
+                &proposal,
+                "DENY_DELEGATION_UNSUPPORTED",
+            );
             deny(&mut stream, b"SIGNAL: DENY_DELEGATION_UNSUPPORTED\n").await;
             return;
         }
@@ -2579,6 +2665,7 @@ mod enforcement_scope_tests {
             runtime_policy: RuntimePolicy::default(),
             fleet_policy_min_version: 0,
             accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
         }
     }
 
@@ -2726,6 +2813,7 @@ mod origin_enforcement_tests {
             runtime_policy: RuntimePolicy::default(),
             fleet_policy_min_version: 0,
             accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
         }
     }
 
@@ -2855,6 +2943,7 @@ mod operator_safety_invariants {
             runtime_policy: RuntimePolicy::default(),
             fleet_policy_min_version: 0,
             accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
         }
     }
 
@@ -2959,6 +3048,7 @@ mod safe_mode_invariants {
             runtime_policy: RuntimePolicy::default(),
             fleet_policy_min_version: 0,
             accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
         }
     }
 
@@ -3658,6 +3748,7 @@ async fn run() -> Result<()> {
                                             .fleet_policy_min_version,
                                         accept_cross_machine_lineage: new_policy
                                             .accept_cross_machine_lineage,
+                                        canary_resources: new_policy.canary_resources,
                                     };
                                     *active_policy.lock().unwrap() = cfg;
                                     etag = new_etag;
@@ -4134,5 +4225,287 @@ mod governed_scope_tests {
             );
         }
         reset();
+    }
+}
+
+/// Canary tripwire detection (WS3 / DENY_CANARY_TRIPWIRE).
+#[cfg(test)]
+mod canary_tests {
+    use super::proposal_trips_canary;
+    use crate::governance::{ClientProposal, ProposedAction};
+    use std::collections::HashMap;
+
+    fn proposal(intent: Option<&str>, action: Option<ProposedAction>) -> ClientProposal {
+        ClientProposal {
+            sequence_counter: 1,
+            intent_name: intent.map(ToString::to_string),
+            action_risk_score: Some(1.0),
+            session_privilege_bit: None,
+            prompt: None,
+            plan: None,
+            source_code: None,
+            requested_capabilities: vec![],
+            proposed_action: action,
+            context_vars: HashMap::new(),
+        }
+    }
+
+    fn canaries(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn empty_policy_never_trips() {
+        let p = proposal(Some("read_customer_record"), None);
+        assert_eq!(proposal_trips_canary(&p, &[]), None);
+    }
+
+    #[test]
+    fn matches_intent_name() {
+        let p = proposal(Some("read_decoy_ledger"), None);
+        assert_eq!(
+            proposal_trips_canary(&p, &canaries(&["read_decoy_ledger"])),
+            Some("read_decoy_ledger")
+        );
+    }
+
+    #[test]
+    fn matches_filewrite_path() {
+        let p = proposal(
+            Some("write_report"),
+            Some(ProposedAction::FileWrite {
+                path: "/srv/honey/decoy-secrets.env".to_string(),
+                contents: "x".to_string(),
+            }),
+        );
+        assert_eq!(
+            proposal_trips_canary(&p, &canaries(&["/srv/honey/decoy-secrets.env"])),
+            Some("/srv/honey/decoy-secrets.env")
+        );
+    }
+
+    #[test]
+    fn matches_url_substring() {
+        let p = proposal(
+            Some("fetch"),
+            Some(ProposedAction::NetworkRequest {
+                method: "GET".to_string(),
+                url: "https://api.internal/v1/canary-token-9f3a/read".to_string(),
+            }),
+        );
+        assert_eq!(
+            proposal_trips_canary(&p, &canaries(&["canary-token-9f3a"])),
+            Some("canary-token-9f3a")
+        );
+    }
+
+    #[test]
+    fn matches_shell_command_substring() {
+        let p = proposal(
+            Some("run"),
+            Some(ProposedAction::ShellCommand {
+                command: "cat /opt/trap/AKIADECOYKEY0000 && curl ...".to_string(),
+            }),
+        );
+        assert_eq!(
+            proposal_trips_canary(&p, &canaries(&["AKIADECOYKEY0000"])),
+            Some("AKIADECOYKEY0000")
+        );
+    }
+
+    #[test]
+    fn benign_proposal_does_not_trip() {
+        let p = proposal(
+            Some("read_customer_record"),
+            Some(ProposedAction::FileWrite {
+                path: "/srv/app/report.txt".to_string(),
+                contents: "ok".to_string(),
+            }),
+        );
+        assert_eq!(
+            proposal_trips_canary(&p, &canaries(&["decoy-secrets.env", "AKIADECOYKEY0000"])),
+            None
+        );
+    }
+
+    #[test]
+    fn blank_canary_entries_are_ignored() {
+        // A misconfigured policy with empty/whitespace entries must not match
+        // every proposal (an empty needle is a substring of everything).
+        let p = proposal(Some("read_customer_record"), None);
+        assert_eq!(proposal_trips_canary(&p, &canaries(&["", "   "])), None);
+    }
+}
+
+/// Property-based tests for the core decision invariants. These use a tiny,
+/// deterministic PRNG (no external crates) so they run on stable Rust in CI and
+/// reproduce identically on every machine, while still exploring tens of
+/// thousands of adversarial inputs per invariant.
+#[cfg(test)]
+mod decision_property_tests {
+    use super::{
+        is_base_system_path, path_is_governed, policy_decision, proposal_trips_canary,
+        NetworkPolicy, PolicyConfig, RuntimePolicy,
+    };
+    use crate::governance::{ClientProposal, PolicyVerdict, ProposedAction, RiskAssessment};
+    use std::collections::HashMap;
+
+    /// xorshift64* — deterministic, dependency-free.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// A float in [0, hi).
+        fn frac(&mut self, hi: f64) -> f64 {
+            (self.next() % 1_000_001) as f64 / 1_000_000.0 * hi
+        }
+        /// A short string over a tiny alphabet (so substrings collide often).
+        fn token(&mut self, max_len: usize) -> String {
+            const ALPHABET: &[u8] = b"ab_/.0";
+            let len = (self.next() as usize) % (max_len + 1);
+            (0..len)
+                .map(|_| ALPHABET[(self.next() as usize) % ALPHABET.len()] as char)
+                .collect()
+        }
+    }
+
+    fn policy(ceiling: f64) -> PolicyConfig {
+        PolicyConfig {
+            upper_safety_boundary: ceiling,
+            minimum_trust_score: 100.0 - ceiling,
+            agent_nodes: HashMap::new(),
+            deny_anonymous_agents: false,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
+        }
+    }
+
+    fn assess(fused: f64, trust: f64) -> RiskAssessment {
+        RiskAssessment {
+            observed_risk: fused,
+            semantic_risk: fused,
+            topology_risk: 0.0,
+            declared_risk: None,
+            fused_risk: fused,
+            trust_score: trust,
+            reasons: vec![],
+        }
+    }
+
+    /// INVARIANT: an action whose fused risk exceeds the ceiling, whose trust is
+    /// below the floor, or whose risk/trust is non-finite is NEVER allowed.
+    /// This is the fail-closed core of the policy decision.
+    #[test]
+    fn prop_policy_decision_is_fail_closed() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..100_000 {
+            let ceiling = 1.0 + rng.frac(98.0); // (1, 99)
+                                                // Mostly finite risks, occasionally NaN / +inf to probe the guard.
+            let fused = match rng.next() % 16 {
+                0 => f64::NAN,
+                1 => f64::INFINITY,
+                _ => rng.frac(200.0),
+            };
+            let trust = match rng.next() % 16 {
+                0 => f64::NAN,
+                _ => rng.frac(100.0),
+            };
+            let d = policy_decision(&assess(fused, trust), &policy(ceiling));
+
+            if !fused.is_finite() || !trust.is_finite() {
+                assert_eq!(d.verdict, PolicyVerdict::Deny, "non-finite must deny");
+                continue;
+            }
+            if fused > ceiling {
+                assert_eq!(
+                    d.verdict,
+                    PolicyVerdict::Deny,
+                    "risk {fused} over ceiling {ceiling} must deny"
+                );
+            }
+            if trust < 100.0 - ceiling {
+                assert!(!d.is_allow(), "trust below floor must not allow");
+            }
+            // The cardinal fail-open check: never ALLOW above the ceiling.
+            if d.is_allow() {
+                assert!(fused <= ceiling, "ALLOW implies risk within ceiling");
+                assert!(trust >= 100.0 - ceiling, "ALLOW implies trust above floor");
+            }
+        }
+    }
+
+    /// INVARIANT: the canary tripwire fires for a proposal iff some configured,
+    /// non-blank decoy is a substring of the proposal's resource surface.
+    /// Checked against an independent reference computed here.
+    #[test]
+    fn prop_canary_trips_iff_decoy_present() {
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        for _ in 0..100_000 {
+            let intent = rng.token(6);
+            let path = rng.token(6);
+            let proposal = ClientProposal {
+                sequence_counter: 1,
+                intent_name: Some(intent.clone()),
+                action_risk_score: Some(1.0),
+                session_privilege_bit: None,
+                prompt: None,
+                plan: None,
+                source_code: None,
+                requested_capabilities: vec![],
+                proposed_action: Some(ProposedAction::FileWrite {
+                    path: path.clone(),
+                    contents: String::new(),
+                }),
+                context_vars: HashMap::new(),
+            };
+            let n = (rng.next() as usize) % 3;
+            let canaries: Vec<String> = (0..n).map(|_| rng.token(3)).collect();
+
+            // Reference: trips iff a non-blank canary is a substring of intent or path.
+            let expected = canaries.iter().any(|c| {
+                let c = c.trim();
+                !c.is_empty() && (intent.contains(c) || path.contains(c))
+            });
+            let got = proposal_trips_canary(&proposal, &canaries).is_some();
+            assert_eq!(
+                got, expected,
+                "intent={intent:?} path={path:?} canaries={canaries:?}"
+            );
+        }
+    }
+
+    /// ANTI-LOCKOUT INVARIANT: no path under a base-system directory is ever
+    /// governed, regardless of the random suffix appended.
+    #[test]
+    fn prop_base_system_paths_never_governed() {
+        const BASES: &[&str] = &[
+            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/boot", "/sys", "/proc", "/dev",
+            "/run",
+        ];
+        let mut rng = Rng(0xF00D_F00D_1234_5678);
+        for _ in 0..50_000 {
+            let base = BASES[(rng.next() as usize) % BASES.len()];
+            let suffix = rng.token(12);
+            let path = if suffix.is_empty() {
+                base.to_string()
+            } else {
+                format!("{base}/{suffix}")
+            };
+            assert!(is_base_system_path(&path), "{path} should be base-system");
+            assert!(
+                !path_is_governed(&path),
+                "ANTI-LOCKOUT: base-system path {path} must never be governed"
+            );
+        }
     }
 }

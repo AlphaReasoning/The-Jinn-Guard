@@ -47,7 +47,10 @@
 #define JG_PAYLOAD_PREVIEW_LEN 64
 #define JG_MAX_UNIX_PATH 108
 #define JG_MAX_POLICY_PATHS 8
-#define JG_CONTROL_AUDIT_ONLY 1
+
+// runtime_controls is a single-slot u32 bitfield (key 0) shared by all hooks.
+#define JG_CONTROL_AUDIT_ONLY 1            // bit 0: observe-only, never deny
+#define JG_CONTROL_CONNECT_DEFAULT_DENY 2  // bit 1: deny non-allowlisted egress
 
 #define JG_CORE_FIELD_PTR(ptr, type, field) \
     ((const void *)((const char *)(ptr) + bpf_core_field_offset(type, field)))
@@ -58,6 +61,25 @@
         bpf_map_lookup_elem((runtime_controls), &__jg_control_key); \
     __jg_control_value && (*__jg_control_value & JG_CONTROL_AUDIT_ONLY); \
 })
+
+// Bit 1 of runtime_controls: when set, governed-scope network egress is
+// default-deny (allow only explicitly allow-listed destinations). Opt-in, so
+// the historical denylist-only behavior is unchanged when the bit is clear.
+#define jg_connect_default_deny_enabled(runtime_controls) ({       \
+    __u32 __jg_dd_key = 0;                                         \
+    __u32 *__jg_dd_value =                                         \
+        bpf_map_lookup_elem((runtime_controls), &__jg_dd_key);    \
+    __jg_dd_value && (*__jg_dd_value & JG_CONTROL_CONNECT_DEFAULT_DENY); \
+})
+
+// True for 127.0.0.0/8. `addr` is the raw 4 bytes of sin_addr.s_addr read into a
+// host u32; the first octet is therefore the low byte on every supported arch.
+// Loopback is exempt from default-deny so local services / the agent's own
+// localhost calls are never broken by enabling egress lockdown.
+static __always_inline int jg_ipv4_is_loopback(__u32 addr)
+{
+    return (addr & 0xFF) == 127;
+}
 
 // Cgroup-scoped enforcement (the structural anti-lockout guarantee).
 //

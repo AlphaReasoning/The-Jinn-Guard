@@ -27,6 +27,7 @@ hex = "0.4.3"
 
 # Local Workspace Modules
 ts_checker = { path = "../ts_checker" }
+ts_wire = { path = "../ts_wire" }
 
 # eBPF backend (optional, only compiled with `--features kernel_telemetry`)
 aya = { version = "0.13", optional = true }
