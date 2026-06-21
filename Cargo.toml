@@ -1,7 +1,11 @@
 [workspace]
 members = [
     "ts_checker",
-    "ts_cli"
+    "ts_cli",
+    "ts_wire"
+]
+exclude = [
+    "fuzz"
 ]
 resolver = "2"
 

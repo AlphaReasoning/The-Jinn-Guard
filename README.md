@@ -6,6 +6,12 @@
 
 Operating locally over high-throughput **UNIX domain sockets**, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to enforce zero-trust process isolation and anti-replay protection for governed cgroups.
 
+## ▶️ Watch it run
+
+[![Jinn Guard live demo — kernel-aware semantic firewall blocking AI-agent attacks](https://img.youtube.com/vi/aVIEinAn-Jc/maxresdefault.jpg)](https://youtu.be/aVIEinAn-Jc)
+
+*Automated demo (Rust + eBPF): one legitimate request is allowed; real attacks are blocked live by the daemon.*
+
 > ### ▶️ See it live in 5 minutes
 > ```bash
 > bash scripts/demo.sh        # or: bash scripts/demo.sh --auto
@@ -15,6 +21,16 @@ Operating locally over high-throughput **UNIX domain sockets**, the platform bin
 > back, and the validated numbers + safety guarantees are walked through — plain
 > enough for a non-technical audience. Nothing is mocked. Presenter notes and
 > safety FAQ: [`DEMO.md`](DEMO.md).
+
+> ### 🔬 For evaluators — don't trust it, *verify* it
+> ```bash
+> python3 scripts/validate/validate.py        # attacks, determinism, audit-chain, tamper-proof
+> ```
+> A reproducible, dependency-free harness that drives the real daemon and lets you
+> **independently verify** every claim: re-run for determinism, recompute the
+> tamper-evident audit hash-chain yourself, corrupt the log and watch it get
+> caught, and bring your own attack. See [`scripts/validate/`](scripts/validate/)
+> and [`scripts/validate/CLAIMS.md`](scripts/validate/CLAIMS.md).
 
 ---
 
@@ -278,6 +294,17 @@ agent carrying an executable allowlist); per-binary execve limits remain only as
 strong as that allowlist.
 
 ---
+
+## 🎓 Teaching lab — learn the governance model
+
+[`lab/`](lab/README.md) is a self-contained, dependency-free lab that teaches the
+Jinn Guard model — semantic intent → policy → decision → audit — **without** the
+kernel/eBPF layer. Students build a mini allow/deny/canary/human-review checker
+(`python3 lab/checker_starter.py`), then find and fix a planted audit-logging
+flaw. It is explicit about which verdicts the real daemon enforces today
+(`ALLOW`/`DENY`) versus which are taught as concepts (`CANARY_TRIGGERED`,
+`HUMAN_REVIEW`); the design path to close that gap is in
+[`docs/agent_governance_extensions.md`](docs/agent_governance_extensions.md).
 
 ## 🚀 Quick Start
 
