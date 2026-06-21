@@ -85,7 +85,16 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
 
     struct jg_request *req = bpf_ringbuf_reserve(&requests, sizeof(*req), 0);
     if (!req) {
-        return audit_only ? 0 : -JG_EPERM;
+        // barrier_var stops clang -O2 from lowering `cond ? -EPERM : 0` to
+        // `-(cond & 1)` (BPF_NEG), whose result the verifier cannot bound to
+        // [-4095, 0] at exit once it has been spilled to stack in this larger
+        // program. Forcing a real branch makes each arm return a literal.
+        int deny = !audit_only;
+        barrier_var(deny);
+        if (deny) {
+            return -JG_EPERM;
+        }
+        return 0;
     }
     __builtin_memset(req, 0, sizeof(*req));
 
@@ -146,7 +155,14 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
     }
 
     bpf_ringbuf_submit(req, 0);
-    return audit_only ? 0 : (denied ? -JG_EPERM : 0);
+    // See the note above: barrier_var forces a real branch so each exit returns
+    // a literal the verifier can bound, instead of a `-(cond & 1)` negation.
+    int deny = !audit_only && denied;
+    barrier_var(deny);
+    if (deny) {
+        return -JG_EPERM;
+    }
+    return 0;
 }
 
 char LICENSE_socket_connect[] SEC("license") = "GPL";
