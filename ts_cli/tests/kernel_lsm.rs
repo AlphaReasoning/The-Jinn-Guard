@@ -874,6 +874,52 @@ fn test_kernel_governed_vm_launch_denied() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// JG #52 — denied-directory enforcement keys on the directory's filesystem
+/// identity `(s_dev, i_ino)`, not on the configured path string. We create a
+/// file inside the denied directory but *reach it through a symlink* whose path
+/// does not textually match any policy entry. Naive path-string matching would
+/// see an unconfigured path and ALLOW the write; identity matching resolves the
+/// real parent inode (the denied dir) and DENIES it. This is the mount-remap
+/// robustness from THREAT_MODEL §7 item 4 made testable without a mount syscall
+/// (which governed scope now denies anyway, #50): a symlink relocates the *name*
+/// while preserving the target inode's `(dev, ino)`.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_inode_identity_denied_via_symlink() {
+    let denied_root = fs_root("inode_identity");
+    let daemon = DaemonGuard::spawn("inode_identity", denied_root.to_str().unwrap());
+
+    // A symlink OUTSIDE the denied dir, pointing at it. Its path matches no
+    // policy entry; only the target inode identity does.
+    let link = PathBuf::from("/tmp/jg_inode_identity_link");
+    let _ = fs::remove_file(&link);
+    std::os::unix::fs::symlink(&denied_root, &link)
+        .unwrap_or_else(|e| panic!("create identity symlink {}: {e}", link.display()));
+
+    // spawn() left us in the governed cgroup. Create a regular file via the
+    // symlinked path; the real parent dir is the denied root.
+    let probe = link.join("identity_probe.txt");
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map(|_| ());
+
+    // Leave the governed cgroup BEFORE asserting so teardown runs ungoverned.
+    CgroupScope::leave();
+    let _ = fs::remove_file(&probe);
+    let _ = fs::remove_file(&link);
+
+    assert!(
+        matches!(&result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "JG #52: a write into the denied directory reached via a non-matching \
+         symlink path must be denied by (dev, ino) identity, got {result:?}"
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(denied_root);
+}
+
 #[test]
 #[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
 fn test_kernel_filesystem_create_blocking_percentiles() {

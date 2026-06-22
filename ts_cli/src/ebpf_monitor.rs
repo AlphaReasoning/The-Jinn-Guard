@@ -405,6 +405,18 @@ pub mod aya_backend {
 
     unsafe impl aya::Pod for PathKey {}
 
+    /// Collision-free directory identity used by the `denied_dir_inodes` map.
+    /// Must match `struct jg_inode_key` in `bpf/lsm/jg_common.h`: (dev, ino),
+    /// both `u64` so there is no padding hole in the hashed key.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InodeKey {
+        dev: u64,
+        ino: u64,
+    }
+
+    unsafe impl aya::Pod for InodeKey {}
+
     /// Raw request layout from the eBPF ring buffer.
     /// Must match `jg_request` in `bpf/lsm/jg_common.h`.
     #[repr(C)]
@@ -529,7 +541,7 @@ pub mod aya_backend {
         unix_denylist: Option<AyaHashMap<MapData, PathKey, u8>>,
         allowed_exec_paths: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_basenames: Option<AyaHashMap<MapData, PathKey, u8>>,
-        denied_dir_inodes: Option<AyaHashMap<MapData, u64, u8>>,
+        denied_dir_inodes: Option<AyaHashMap<MapData, InodeKey, u8>>,
     }
 
     /// The main user-space monitor for loading LSM hooks and handling requests.
@@ -1249,7 +1261,7 @@ pub mod aya_backend {
     }
 
     fn configure_denied_dir_inodes<'a, I>(
-        map: &mut AyaHashMap<MapData, u64, u8>,
+        map: &mut AyaHashMap<MapData, InodeKey, u8>,
         paths: I,
         object_path: &str,
     ) -> Result<()>
@@ -1257,14 +1269,15 @@ pub mod aya_backend {
         I: IntoIterator<Item = &'a String>,
     {
         for path in paths {
-            let Some(ino) = denied_dir_inode(path)? else {
+            let Some(key) = denied_dir_inode(path)? else {
                 continue;
             };
-            map.insert(ino, 1, 0).map_err(|e| {
+            map.insert(key, 1, 0).map_err(|e| {
                 anyhow!(
-                    "Failed to populate denied_dir_inodes entry '{}' ino={} in {}: {}",
+                    "Failed to populate denied_dir_inodes entry '{}' dev={} ino={} in {}: {}",
                     path,
-                    ino,
+                    key.dev,
+                    key.ino,
                     object_path,
                     e
                 )
@@ -1319,7 +1332,7 @@ pub mod aya_backend {
         Vec::new()
     }
 
-    fn denied_dir_inode(path: &str) -> Result<Option<u64>> {
+    fn denied_dir_inode(path: &str) -> Result<Option<InodeKey>> {
         let trimmed = path.trim();
         if trimmed.is_empty() || !trimmed.contains('/') {
             return Ok(None);
@@ -1327,10 +1340,26 @@ pub mod aya_backend {
 
         let configured = std::path::Path::new(trimmed);
         if let Ok(metadata) = std::fs::metadata(configured) {
-            return Ok(metadata.is_dir().then_some(metadata.ino()));
+            if !metadata.is_dir() {
+                return Ok(None);
+            }
+            return Ok(Some(InodeKey {
+                dev: kernel_dev_from_stat(metadata.dev()),
+                ino: metadata.ino(),
+            }));
         }
 
         Ok(None)
+    }
+
+    /// Re-encode a userspace `st_dev` (glibc bit layout) into the kernel-internal
+    /// `dev_t` the BPF hook reads from `inode->i_sb->s_dev`: `(major << 20) | minor`
+    /// (MINORBITS = 20). glibc and the kernel encode major/minor differently, so a
+    /// raw `st_dev` would not match `s_dev`; decode and rebuild in kernel format.
+    fn kernel_dev_from_stat(st_dev: u64) -> u64 {
+        let major = libc::major(st_dev) as u64;
+        let minor = libc::minor(st_dev) as u64;
+        (major << 20) | (minor & 0xf_ffff)
     }
 
     fn denied_entry_is_existing_dir(path: &str) -> bool {

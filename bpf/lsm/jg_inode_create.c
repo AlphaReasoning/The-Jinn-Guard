@@ -26,7 +26,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, __u64);
+    __type(key, struct jg_inode_key);
     __type(value, __u8);
 } denied_dir_inodes SEC(".maps");
 
@@ -55,14 +55,19 @@ static __always_inline int jg_inode_basename_denied(const char *path)
 
 static __always_inline int jg_inode_dir_denied(struct inode *dir)
 {
-    __u64 ino = 0;
+    struct jg_inode_key key = {};
 
     if (!dir) {
         return 0;
     }
 
-    bpf_probe_read_kernel(&ino, sizeof(ino), JG_CORE_FIELD_PTR(dir, struct inode, i_ino));
-    __u8 *entry = bpf_map_lookup_elem(&denied_dir_inodes, &ino);
+    // Key on (superblock device, inode number), not i_ino alone: i_ino is only
+    // unique within a superblock, so a bare-ino denylist collides across mounts.
+    // The (dev, ino) identity is what the daemon resolved via stat(2) and is
+    // immune to mount/bind/pivot_root path remapping (JG #52).
+    key.ino = BPF_CORE_READ(dir, i_ino);
+    key.dev = (__u64)BPF_CORE_READ(dir, i_sb, s_dev);
+    __u8 *entry = bpf_map_lookup_elem(&denied_dir_inodes, &key);
     return entry && *entry;
 }
 

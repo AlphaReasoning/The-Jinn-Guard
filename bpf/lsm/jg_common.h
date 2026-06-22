@@ -144,6 +144,17 @@ struct jg_path_key {
     char path[JG_MAX_RESOURCE_LEN];
 };
 
+// Collision-free identity of a directory inode: the superblock device id PLUS
+// the inode number. i_ino alone is only unique *within* a superblock, so it can
+// collide across mounts/filesystems; pairing it with i_sb->s_dev makes the
+// denied-directory match exact and immune to mount/bind/pivot_root remapping
+// (JG #52). Both fields are __u64 so the 16-byte key has no internal padding
+// (a hashed BPF map key must be fully initialized — no padding holes).
+struct jg_inode_key {
+    __u64 dev;
+    __u64 ino;
+};
+
 // Decision verdict from user-space.
 enum jg_verdict {
     VERDICT_UNKNOWN = 0,
