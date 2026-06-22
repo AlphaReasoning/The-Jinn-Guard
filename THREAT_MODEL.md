@@ -179,12 +179,19 @@ wraps armed runs in a hard 10-minute watchdog.
 3. **`bpf_core_read` field-width discipline.** A `short` kernel field read into a
    wider local caused a fail-open (JG-ADV-2026-004, fixed). All current
    `bpf_core_read`/`bpf_probe_read_kernel` scalar reads were audited and match
-   their source widths. Note: `denied_dir_inodes` keys on the low 32 bits of the
-   inode (consistent on both sides); a >32-bit-inode collision would *over-block*
-   (fail closed), never fail open.
-3. **Mount-boundary path resolution.** Inode hooks have no vfsmount; a file on a
-   sub-mount (e.g. a tmpfs `/tmp`) resolves relative to that mount's root.
-   Root-filesystem paths — the security-critical cases — resolve absolutely.
+   their source widths. Note: `denied_dir_inodes` keys on the full 64-bit
+   `(s_dev, i_ino)` pair (JG #52); both halves are read at full width on the
+   kernel side and resolved via `stat(2)` on the daemon side, so there is no
+   truncation and no cross-superblock inode-number collision.
+3. **Mount-boundary path resolution.** Inode hooks have no vfsmount, so the
+   *human-readable path* reconstructed for telemetry resolves relative to a
+   sub-mount's root. The **enforcement decision**, however, no longer depends on
+   that string: denied directories are matched by their `(s_dev, i_ino)` identity
+   (JG #52), which a bind-mount / `pivot_root` / mount-namespace remap cannot
+   forge — the inode the kernel hands the hook is the real target regardless of
+   the path it was reached by. Residual: identity matching covers the *parent
+   directory* of create/unlink; per-file denylist entries still match on
+   basename, and the telemetry path string remains sub-mount-relative.
 4. **Interpreter chains (JG-ADV-2026-001).** An agent explicitly allowed to run an
    interpreter can drive other tools through it. Mitigated by denying
    interpreters for governed agents; not eliminated.
@@ -263,9 +270,12 @@ view is authoritative**, and **no second kernel** is introduced.
    it requires exec of the emulator binary, already denied by the bprm allowlist
    (#4 attack surface), and offers only a slow interpreted guest the host hooks
    still observe, not a fast second kernel.
-4. **Key path decisions on inode/superblock identity, not path strings** (#52,
-   future), so bind-mount/`pivot_root` remapping cannot fool the denylist (deepens
-   the mount-boundary fix).
+4. **Key path decisions on inode/superblock identity, not path strings —
+   IMPLEMENTED (#52).** The `inode_create`/`inode_unlink` denied-directory match
+   now keys on the `(s_dev, i_ino)` pair the daemon resolved via `stat(2)`, not on
+   i_ino alone (collides across superblocks) or the path string (remappable). A
+   bind-mount / `pivot_root` / mount-namespace remap cannot fool it: the kernel
+   hands the hook the real target inode regardless of the path used to reach it.
 5. **Drop nesting-enabling capabilities — IMPLEMENTED (#53).** The `capable` hook
    denies escalation capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`,
    `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`, `CAP_MKNOD`) when exercised
