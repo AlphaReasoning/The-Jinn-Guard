@@ -690,6 +690,69 @@ fn test_kernel_governance_subtree_is_unsheddable() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// JG #53 — a governed task may not wield escalation capabilities inside a user
+/// namespace it creates. The child first unshares a new user namespace (allowed:
+/// the check is in the init ns), then unshares a mount namespace, which requires
+/// CAP_SYS_ADMIN evaluated against the new *nested* userns. The capable hook
+/// denies that for governed scope, so the second unshare fails with EPERM —
+/// neutering the rootless-userns nesting an agent would use to escape the host
+/// LSM scope. Run in a forked, single-threaded child because unshare(NEWUSER)
+/// is rejected from a multi-threaded process.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_governed_nested_userns_caps_denied() {
+    let root = fs_root("userns");
+    let daemon = DaemonGuard::spawn("userns", root.to_str().unwrap());
+
+    // spawn() left us in the governed cgroup; the forked child inherits it.
+    let code = fork_nested_userns_mount();
+
+    CgroupScope::leave();
+
+    assert_eq!(
+        code,
+        libc::EPERM,
+        "JG #53: governed unshare(CLONE_NEWNS) inside a fresh user namespace must \
+         be denied EPERM ({}); got exit code {code} (0=succeeded/escaped, \
+         >=200=could not create the userns at all)",
+        libc::EPERM
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Fork a single-threaded child that creates a user namespace and then tries to
+/// create a mount namespace inside it; returns the errno of the mount-namespace
+/// unshare (0 = unexpectedly succeeded; 200+e = the userns itself could not be
+/// created, an environment problem rather than a governance result).
+fn fork_nested_userns_mount() -> i32 {
+    // SAFETY: the child performs only async-signal-safe syscalls before _exit.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+    if pid == 0 {
+        let r1 = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+        if r1 != 0 {
+            let e = io::Error::last_os_error().raw_os_error().unwrap_or(31);
+            unsafe { libc::_exit(200 + (e & 0x1f)) };
+        }
+        let r2 = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        let code = if r2 == 0 {
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(255)
+        };
+        unsafe { libc::_exit(code) };
+    }
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    }
+}
+
 #[test]
 #[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
 fn test_kernel_filesystem_create_blocking_percentiles() {

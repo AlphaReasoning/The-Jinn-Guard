@@ -31,7 +31,8 @@ LSM_SRCS = lsm/jg_socket_connect.c \
            lsm/jg_socket_sendmsg.c \
            lsm/jg_bprm_check_security.c \
            lsm/jg_inode_create.c \
-           lsm/jg_inode_unlink.c
+           lsm/jg_inode_unlink.c \
+           lsm/jg_capable.c
 
 TRACEPOINT_OBJS = $(TRACEPOINT_SRCS:.bpf.c=.bpf.o)
 LSM_OBJS = $(LSM_SRCS:.c=.o)
