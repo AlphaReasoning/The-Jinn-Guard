@@ -1209,3 +1209,86 @@ fn test_kernel_unix_deputy_blocking_percentiles() {
     drop(daemon);
     let _ = fs::remove_dir_all(root);
 }
+
+/// #56 — AF_UNIX deny-by-default allowlist. With `network_policy.unix_default_deny`
+/// on, a governed connect to an *allow-listed* socket path succeeds, a connect to
+/// any other (live) unix socket is denied, and — the anti-lockout invariant — the
+/// Jinn Guard control socket itself stays reachable even though it is not in the
+/// operator's allowlist (the daemon always self-allow-lists it). Both target
+/// sockets have real listeners, so the only reason the blocked connect fails is
+/// the LSM verdict, not a missing endpoint.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_unix_default_deny_allowlist() {
+    let root = fs_root("unix_dd");
+    let allowed_sock = "/tmp/jg_kernel_lsm_unix_dd_allowed.sock";
+    let blocked_sock = "/tmp/jg_kernel_lsm_unix_dd_blocked.sock";
+    let _ = fs::remove_file(allowed_sock);
+    let _ = fs::remove_file(blocked_sock);
+
+    let policy = format!(
+        r#"
+global_safety_ceiling: 90.0
+network_policy:
+  default_deny: false
+  unix_default_deny: true
+  allowed_unix_sockets:
+    - "{allowed_sock}"
+agent_nodes:
+  - id: "kernel_agent"
+    privilege_tier: 1
+    max_sequence_quota: 0
+    allowed_intents: []
+    allowed_executables:
+      - "/bin/echo"
+    denied_write_paths:
+      - "{root}"
+    denied_unlink_paths:
+      - "{root}"
+    invariants: []
+"#,
+        allowed_sock = allowed_sock,
+        root = root.to_str().unwrap(),
+    );
+
+    let daemon = DaemonGuard::spawn_with_policy("unix_dd", root.to_str().unwrap(), &policy, &[]);
+
+    // Both targets have live listeners, so a failed connect is attributable to
+    // the LSM verdict and nothing else. (bind/accept are not governed.)
+    let allowed_listener = UnixListener::bind(allowed_sock).unwrap();
+    let (allowed_running, allowed_thread) = spawn_unix_accept_loop(allowed_listener);
+    let blocked_listener = UnixListener::bind(blocked_sock).unwrap();
+    let (blocked_running, blocked_thread) = spawn_unix_accept_loop(blocked_listener);
+
+    // spawn() left us in the governed cgroup.
+    let to_allowed = UnixStream::connect(allowed_sock).map(|_| ());
+    let to_blocked = UnixStream::connect(blocked_sock).map(|_| ());
+    // Anti-lockout: the agent must still reach its own governor's socket even
+    // though it is not in the operator allowlist.
+    let to_daemon = UnixStream::connect(&daemon.socket_path).map(|_| ());
+
+    // Leave the governed cgroup BEFORE asserting so teardown runs ungoverned.
+    CgroupScope::leave();
+    finish_accept_loop(allowed_running, allowed_thread);
+    finish_accept_loop(blocked_running, blocked_thread);
+    let _ = fs::remove_file(allowed_sock);
+    let _ = fs::remove_file(blocked_sock);
+
+    assert!(
+        to_allowed.is_ok(),
+        "JG #56: an allow-listed unix socket must be reachable, got {to_allowed:?}"
+    );
+    assert!(
+        matches!(&to_blocked, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "JG #56: a non-allowlisted unix connect must be denied under unix_default_deny, \
+         got {to_blocked:?}"
+    );
+    assert!(
+        to_daemon.is_ok(),
+        "JG #56 anti-lockout: the Jinn Guard control socket must remain reachable \
+         under unix_default_deny, got {to_daemon:?}"
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}

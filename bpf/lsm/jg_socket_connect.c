@@ -42,6 +42,16 @@ struct {
     __type(value, __u8);
 } unix_denylist SEC(".maps");
 
+// #56: explicit AF_UNIX egress allowlist, consulted only when the UNIX
+// default-deny bit is set. Holds the operator's allow-listed socket paths plus
+// the Jinn Guard control socket (always added by the daemon for anti-lockout).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct jg_path_key);
+    __type(value, __u8);
+} unix_allowlist SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -146,6 +156,14 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
         __u8 *unix_entry = bpf_map_lookup_elem(&unix_denylist, &unix_key);
         if (unix_entry && *unix_entry) {
             denied = 1;
+        } else if (jg_unix_default_deny_enabled(&runtime_controls)) {
+            // #56: under UNIX default-deny, permit only allow-listed socket
+            // paths. An abstract-namespace socket reads as "" and is never
+            // allow-listed, so it is denied here (documented).
+            __u8 *allow = bpf_map_lookup_elem(&unix_allowlist, &unix_key);
+            if (!(allow && *allow)) {
+                denied = 1;
+            }
         }
         break;
     }
