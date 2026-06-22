@@ -150,8 +150,9 @@ Linux 6.12 host across all four validation tiers.
 
 ### Known limitations
 - Not independently audited; single-distribution (Debian) validation.
-- Sub-mount filesystem paths resolve relative to their mount root; root-fs paths
-  resolve absolutely.
+- Sub-mount filesystem path *strings* (telemetry) are relative to their mount
+  root; the enforcement decision keys on the directory's `(s_dev, i_ino)` identity
+  (JG #52), so a mount/bind/`pivot_root` remap cannot fool it (THREAT_MODEL §7.1).
 - Interpreter chains mitigated, not eliminated.
 - HMAC key rotation not yet automated.
 

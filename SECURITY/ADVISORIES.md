@@ -25,8 +25,10 @@ This file is the **canonical registry** for Jinn Guard advisory identifiers.
 - **JG-ADV-2026-002 — relative-path bypass.** The inode hooks originally sent only
   the basename to user space, defeating prefix checks like `/etc/`. *Fixed* by
   kernel-side full-path resolution (`jg_read_dentry_path`, bounded `d_parent`
-  walk). Residual: sub-mount paths resolve relative to their mount root;
-  root-filesystem paths (the security-critical cases) resolve absolutely.
+  walk). Residual (telemetry only, since JG #52): sub-mount path *strings* are
+  relative to their mount root, but the enforcement decision now keys on the
+  directory's `(s_dev, i_ino)` identity rather than the string, so a mount/bind/
+  `pivot_root` remap cannot fool it (THREAT_MODEL §7.1).
 
 - **JG-ADV-2026-003 — UID spoofing.** From the historical white-box audit
   (`red-team-report.md`), which described an aspirational mTLS identity model
