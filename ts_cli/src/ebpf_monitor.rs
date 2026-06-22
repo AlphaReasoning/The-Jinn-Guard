@@ -387,6 +387,11 @@ pub mod aya_backend {
     // Capability hook (JG #53). Emits no requests; the value only labels the
     // loaded object and is never used for request routing.
     const JG_SRC_CAPABLE: u32 = 7;
+    // Mount-nesting primitive hooks (JG #50). Pure kernel-floor deny-in-scope
+    // hooks; emit no requests, the value only labels the loaded object.
+    const JG_SRC_SB_MOUNT: u32 = 8;
+    const JG_SRC_SB_PIVOTROOT: u32 = 9;
+    const JG_SRC_MOVE_MOUNT: u32 = 10;
     /// Policy path key used by BPF maps.
     /// Must match `struct jg_path_key` in `bpf/lsm/jg_common.h`.
     #[repr(C)]
@@ -591,6 +596,28 @@ pub mod aya_backend {
                     "/usr/lib/jinnguard/lsm/jg_capable.o",
                     "jg_capable",
                     "capable",
+                ),
+                // Mount-nesting primitive hooks (JG #50): deny mount / pivot_root
+                // / move_mount for governed tasks so a governed agent cannot
+                // assemble a nested container/sandbox root outside host LSM scope.
+                // Pure kernel-floor deny-in-scope; emit no requests.
+                (
+                    JG_SRC_SB_MOUNT,
+                    "/usr/lib/jinnguard/lsm/jg_sb_mount.o",
+                    "jg_sb_mount",
+                    "sb_mount",
+                ),
+                (
+                    JG_SRC_SB_PIVOTROOT,
+                    "/usr/lib/jinnguard/lsm/jg_sb_pivotroot.o",
+                    "jg_sb_pivotroot",
+                    "sb_pivotroot",
+                ),
+                (
+                    JG_SRC_MOVE_MOUNT,
+                    "/usr/lib/jinnguard/lsm/jg_move_mount.o",
+                    "jg_move_mount",
+                    "move_mount",
                 ),
             ];
 
