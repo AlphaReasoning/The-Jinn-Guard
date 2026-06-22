@@ -288,7 +288,7 @@ jobs:
   # booted with `lsm=...,bpf` and cgroup v2 mounted.
   #
   # Fans out across the validated distro/kernel runners (each registered with the
-  # shared `bpf-lsm` label plus a per-host label): AlphaOS 6.12, Ubuntu 24.04 6.17
+  # shared `bpf-lsm` label plus a per-host label): Debian 13 6.12 (jinn1), Ubuntu 24.04 6.17
   # (jinn2), AlmaLinux 9.8 5.14 (jinn3). 5.14 is the floor that exercises the
   # oldest supported verifier. fail-fast: false so one distro's failure still lets
   # the others report. The steps are package-manager agnostic (build deps are baked
@@ -307,8 +307,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - distro: AlphaOS
-            label: alphaos
+          - distro: Debian 13
+            label: jinn1
             kernel: "6.12"
           - distro: Ubuntu 24.04
             label: jinn2
