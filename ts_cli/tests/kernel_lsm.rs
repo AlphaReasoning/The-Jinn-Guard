@@ -644,6 +644,52 @@ fn test_kernel_execve_blocking_percentiles() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// JG #49 — governance must be un-sheddable. A task in a *descendant* cgroup of
+/// the governed scope is still enforced (cgroup-subtree matching), not just a
+/// task in the exact governed cgroup. Under the previous exact-id check, a
+/// governed agent could shed enforcement by creating a child cgroup and moving
+/// into it (its cgroup id no longer matched); subtree matching closes that.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_governance_subtree_is_unsheddable() {
+    let root = fs_root("subtree");
+    let daemon = DaemonGuard::spawn("subtree", root.to_str().unwrap());
+    let denied = first_existing(&["/bin/true", "/usr/bin/true"]);
+
+    // Baseline: spawn() left us directly in the governed cgroup, where a
+    // non-allowlisted exec must be denied (default-deny exec in governed scope).
+    let in_scope = command_status_success(Command::new(&denied));
+    assert!(
+        matches!(&in_scope, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "baseline: exec in the governed cgroup must be denied, got {in_scope:?}"
+    );
+
+    // Create a descendant cgroup and migrate this process into it. Its cgroup id
+    // differs from the governed scope, so exact-id matching would treat it as
+    // out-of-scope and ALLOW the exec; subtree matching must still DENY it.
+    let nested = daemon.cgroup.path.join("nested");
+    fs::create_dir(&nested)
+        .unwrap_or_else(|e| panic!("create nested cgroup {}: {e}", nested.display()));
+    fs::write(nested.join("cgroup.procs"), std::process::id().to_string())
+        .unwrap_or_else(|e| panic!("migrate into nested cgroup {}: {e}", nested.display()));
+
+    let in_descendant = command_status_success(Command::new(&denied));
+
+    // Step back to the root cgroup BEFORE asserting so teardown (and the rest of
+    // the harness) runs ungoverned even if the assertion fails.
+    CgroupScope::leave();
+    let _ = fs::remove_dir(&nested);
+
+    assert!(
+        matches!(&in_descendant, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "JG #49: a task in a descendant of the governed cgroup must remain governed \
+         (subtree match), but the exec was not denied: {in_descendant:?}"
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 #[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
 fn test_kernel_filesystem_create_blocking_percentiles() {

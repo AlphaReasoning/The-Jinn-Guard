@@ -89,25 +89,56 @@ static __always_inline int jg_ipv4_is_loopback(__u32 addr)
 //     configures a scope).
 //   * non-zero -> a specific cgroup v2 id (the kernfs id returned by
 //     bpf_get_current_cgroup_id(), == the value name_to_handle_at() reports
-//     for the cgroup directory). ONLY tasks in that cgroup are subject to
-//     allow/deny; every other task is passed straight through (return 0).
+//     for the cgroup directory). Tasks in that cgroup OR any descendant cgroup
+//     (the whole subtree) are subject to allow/deny; every other task is passed
+//     straight through (return 0).
 //
 // This lets armed enforcement be confined to a dedicated agent/test cgroup so
 // the operator's own desktop is never denied — the previous source of lockouts.
 #define JG_SCOPE_KEY 0
 #define JG_SCOPE_GLOBAL 0ULL
 
-#define jg_in_governed_scope(governed_scope) ({                    \
-    __u32 __jg_scope_key = JG_SCOPE_KEY;                           \
-    __u64 *__jg_scope_value =                                      \
-        bpf_map_lookup_elem((governed_scope), &__jg_scope_key);   \
-    int __jg_in_scope = 1;                                         \
-    if (__jg_scope_value && *__jg_scope_value != JG_SCOPE_GLOBAL) { \
-        __jg_in_scope =                                            \
-            (bpf_get_current_cgroup_id() == *__jg_scope_value);   \
-    }                                                             \
-    __jg_in_scope;                                                 \
-})
+// Maximum cgroup-v2 hierarchy depth walked when testing subtree membership.
+// bpf_get_current_ancestor_cgroup_id() returns 0 for levels deeper than the
+// task's own cgroup, so a governed cgroup at any absolute depth < this bound is
+// always matched; the cap only sets how many cheap helper calls an ungoverned
+// task costs. Generous — agent cgroups sit only a few levels under the root.
+#define JG_CGROUP_MAX_DEPTH 16
+
+// Un-sheddable cgroup-subtree membership test (JG #49).
+//
+// Returns 1 if the current task is governed. Global scope (id 0 or map missing)
+// governs everyone. Otherwise the task is governed iff the configured cgroup id
+// is its own cgroup OR appears anywhere in its ancestor chain — i.e. the task
+// is anywhere in the governed cgroup *subtree*. Matching the whole subtree (not
+// just the exact id) is what makes the scope un-sheddable: a governed agent
+// that creates or migrates into a child cgroup within its delegated subtree
+// stays governed. Escaping requires moving to a cgroup OUTSIDE the subtree,
+// which needs write access to a foreign cgroup.procs that a confined agent does
+// not have (and that #50/#53 further deny).
+//
+// Anti-lockout is preserved exactly: global scope governs all with no walk, and
+// a task outside the subtree is passed straight through as before.
+static __always_inline int jg_in_governed_scope(void *governed_scope)
+{
+    __u32 scope_key = JG_SCOPE_KEY;
+    __u64 *scope = bpf_map_lookup_elem(governed_scope, &scope_key);
+    if (!scope || *scope == JG_SCOPE_GLOBAL) {
+        return 1;
+    }
+    // Fast path: the task is directly in the governed cgroup.
+    if (bpf_get_current_cgroup_id() == *scope) {
+        return 1;
+    }
+    // Subtree path: is the governed cgroup an ancestor at any level?
+#pragma unroll
+    for (int lvl = 0; lvl < JG_CGROUP_MAX_DEPTH; lvl++) {
+        if (bpf_get_current_ancestor_cgroup_id(lvl) == *scope) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 struct jg_path_key {
     char path[JG_MAX_RESOURCE_LEN];
