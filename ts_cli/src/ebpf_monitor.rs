@@ -384,6 +384,9 @@ pub mod aya_backend {
     const JG_SRC_BPRM_CHECK_SECURITY: u32 = 3;
     const JG_SRC_SOCKET_CONNECT: u32 = 4;
     const JG_SRC_SOCKET_SENDMSG: u32 = 5;
+    // Capability hook (JG #53). Emits no requests; the value only labels the
+    // loaded object and is never used for request routing.
+    const JG_SRC_CAPABLE: u32 = 7;
     /// Policy path key used by BPF maps.
     /// Must match `struct jg_path_key` in `bpf/lsm/jg_common.h`.
     #[repr(C)]
@@ -579,6 +582,15 @@ pub mod aya_backend {
                     "/usr/lib/jinnguard/lsm/jg_inode_unlink.o",
                     "jg_inode_unlink",
                     "inode_unlink",
+                ),
+                // Capability hook (JG #53): denies escalation caps wielded inside
+                // a nested user namespace by governed tasks, restricting
+                // unprivileged-userns nesting. Emits no requests.
+                (
+                    JG_SRC_CAPABLE,
+                    "/usr/lib/jinnguard/lsm/jg_capable.o",
+                    "jg_capable",
+                    "capable",
                 ),
             ];
 
