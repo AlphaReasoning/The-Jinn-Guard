@@ -111,10 +111,12 @@ denied operation was actually denied, and every allowed operation succeeded.
 
 ## 6. Known limitations (disclosed)
 
-- **Mount boundaries (filesystem hooks).** The inode hooks resolve paths within
-  a filesystem; a file on a sub-mount (e.g. a tmpfs `/tmp`) resolves relative to
-  that mount's root. Root-filesystem paths (`/etc`, `/usr`, `/opt`) — the
-  security-critical cases — resolve to full absolute paths.
+- **Mount boundaries (filesystem hooks) — telemetry only since JG #52.** The
+  reconstructed path *string* for a file on a sub-mount (e.g. a tmpfs `/tmp`) is
+  relative to that mount's root, affecting logs but not the decision: denied
+  directories are matched by their `(s_dev, i_ino)` identity, which a mount/bind/
+  `pivot_root` remap cannot fool (THREAT_MODEL §7.1). Root-filesystem path strings
+  (`/etc`, `/usr`, `/opt`) also resolve to full absolute paths.
 - **Interpreter chains.** An agent explicitly allowed to run an interpreter can
   invoke other tools through it; Jinn Guard denies interpreters by policy for
   governed agents (JG-ADV-2026-001 mitigation), but per-binary execve limits are

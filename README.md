@@ -279,12 +279,15 @@ path** of a file operation in the kernel (a bounded `d_parent` walk), closing th
 earlier basename-only bypass. Validated live (audit-only) via
 `scripts/validate_m2_path_resolution.sh`.
 
-Residual limitation: the inode hooks receive a dentry without a vfsmount, so a
-file on a **sub-mount** (e.g. a tmpfs `/tmp`) resolves relative to that mount's
-root (`/tmp/x` → `/x`). Root-filesystem paths (`/etc`, `/usr`, `/opt`, `/home`
-on a single-root install) — the security-critical cases — resolve to full
-absolute paths. Crossing mount boundaries requires path-family LSM hooks or
-`bpf_d_path` and is tracked for a future release.
+Residual limitation (telemetry only, since JG #52): the inode hooks receive a
+dentry without a vfsmount, so the **reconstructed path string** for a file on a
+**sub-mount** (e.g. a tmpfs `/tmp`) is relative to that mount's root (`/tmp/x` →
+`/x`). This affects the logged/audited path, **not** the enforcement decision —
+denied directories are matched by their `(s_dev, i_ino)` identity, which a
+mount/bind/`pivot_root` remap cannot fool (see THREAT_MODEL §7.1). Root-filesystem
+paths (`/etc`, `/usr`, `/opt`, `/home` on a single-root install) also resolve to
+full absolute strings. Full cross-mount path *strings* require path-family LSM
+hooks or `bpf_d_path` and are tracked for a future release.
 
 ### Interpreter chains (JG-ADV-2026-001, mitigated)
 

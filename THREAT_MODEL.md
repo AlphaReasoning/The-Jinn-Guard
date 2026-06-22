@@ -125,7 +125,7 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 
 | CVE | Severity | Status | Resolution |
 |---|---|---|---|
-| **JG-ADV-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual: sub-mount paths resolve relative to their mount root — root-fs paths (`/etc`,`/usr`,`/opt`) resolve absolutely (§7). |
+| **JG-ADV-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual (telemetry only since #52): sub-mount path *strings* are mount-relative, but the decision keys on `(s_dev, i_ino)` identity, not the string (§7.1). |
 | **JG-ADV-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
 | **JG-ADV-2026-003** — agent impersonation via UID spoofing | Critical | **Mitigated** | Identity is authenticated as the OS user via `SO_PEERCRED` (unforgeable) **and** the application `agent_id` via HMAC-SHA256 — not a spoofable UID, closing the placeholder identity model from [`red-team-report.md`](red-team-report.md). Residual: a single shared HMAC key is not bound per-agent/UID, so any principal able to read the key can sign as any `agent_id`; per-agent secrets / `agent_id`↔UID binding tracked in §7.8 and §10. |
 | **JG-ADV-2026-004** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (re-validated on AlmaLinux 9 / 5.14, Run 04)** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
@@ -216,6 +216,40 @@ wraps armed runs in a hard 10-minute watchdog.
    or an `agent_id`↔UID binding (tracked in §10). The UDS also carries no
    restrictive mode unless `--socket-mode 0660` is set; connecting is gated by
    HMAC + peer-UID regardless, but operators on shared hosts should set it.
+
+### 7.1 Mount-boundary and TOCTOU properties (precise)
+
+Filesystem enforcement (`inode_create` / `inode_unlink`) makes a **synchronous,
+in-kernel** decision on the exact `dir` inode and `dentry` the kernel is about to
+operate on. Two consequences worth stating precisely, because earlier drafts of
+this document (and the README/advisory notes) described a weaker, path-string
+model that JG #52 superseded:
+
+- **The enforcement decision does not depend on a path string.** A denied
+  directory is matched by its `(s_dev, i_ino)` identity (JG #52), and a denied
+  per-file entry by its leaf basename. Neither is a reconstructed absolute path,
+  so a bind-mount, `pivot_root`, mount-namespace remap, or symlinked access path
+  **cannot relocate the target out from under the check** — the kernel hands the
+  hook the real inode regardless of the name used to reach it
+  (`test_kernel_inode_identity_denied_via_symlink`).
+- **No check-vs-use (classic TOCTOU) window at the floor.** The decision and the
+  guarded operation act on the same kernel object in the same syscall; there is
+  no re-resolution between check and use, so a path swapped after the check cannot
+  be substituted before the use.
+
+What remains, stated with its failure direction and the precondition an adversary
+would need:
+
+| Residual | Failure direction | Precondition / scope |
+| --- | --- | --- |
+| **Telemetry path string is sub-mount-relative.** `jg_read_dentry_path` walks `d_parent` with no `vfsmount`, so a file on a sub-mount (tmpfs `/tmp` → `/x`) logs a mount-relative path. | **Observability only** — does not affect the synchronous deny decision; the async user-space request is advisory (adaptive scoring/audit), and an inode op already completed cannot be retroactively denied. | None; affects audit/forensics precision, not enforcement. |
+| **Per-file denylist matches on leaf basename.** A denied file path contributes its basename; any governed file with that name (in any directory) is denied. | **Fail-closed (over-block).** Never permits a denied op; can over-deny a same-named file elsewhere. | None; an availability/precision cost, not a bypass. Narrowing it to `(parent dev, ino, basename)` is the natural #52 follow-up. |
+| **Policy-load-time inode pinning.** Denied-directory `(s_dev, i_ino)` is resolved via `stat(2)` at `configure_policy` (startup). If a denied directory's inode is *replaced* (unlinked + recreated, or its backing mount swapped) after load, the denylist holds the stale identity and the replacement is unmatched. | **Fail-open in this narrow case.** | Requires replacing a configured system directory at runtime — itself a privileged act, and creating the replacement under a governed parent is itself denied. Mitigation: re-resolve on policy reload; prefer stable system directories as denied roots. |
+| **Cross-mount absolute paths in telemetry need path-family hooks.** Full global paths across mounts require `bpf_d_path` / path-family LSM hooks. | Observability only (same as row 1). | None. |
+
+The previously-tracked "path remap fools the string denylist" concern is
+**closed** by #52; the residual surface above is strictly narrower and, except for
+the documented load-time pinning case, fails closed.
 
 ### Nested execution and sandbox escape
 
