@@ -920,6 +920,89 @@ fn test_kernel_inode_identity_denied_via_symlink() {
     let _ = fs::remove_dir_all(denied_root);
 }
 
+/// JG #60 — a denied *file* path is matched precisely by its parent directory's
+/// `(s_dev, i_ino)` identity plus basename, not by basename anywhere in scope.
+/// Policy denies exactly `<guarded>/secret.conf`. We assert three things in
+/// governed scope: the exact file is denied; a different name in the same dir is
+/// allowed (not a directory-wide deny); and — the narrowing that matters — the
+/// same basename in a *different* directory is allowed. Basename-only matching
+/// (the pre-#60 behavior) would have denied that last case.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_per_file_denial_precise() {
+    // Two real directories that exist before the daemon resolves policy, so the
+    // denied file's parent `(dev, ino)` is pinned at load.
+    let guarded = PathBuf::from("/tmp/jg_perfile_guarded");
+    let other = PathBuf::from("/tmp/jg_perfile_other");
+    for d in [&guarded, &other] {
+        let _ = fs::remove_dir_all(d);
+        fs::create_dir_all(d).unwrap_or_else(|e| panic!("create {}: {e}", d.display()));
+    }
+    let denied_file = guarded.join("secret.conf");
+
+    let policy = format!(
+        r#"
+global_safety_ceiling: 90.0
+network_policy:
+  default_deny: false
+  denied_ips:
+    - "127.0.0.1"
+agent_nodes:
+  - id: "kernel_agent"
+    privilege_tier: 1
+    max_sequence_quota: 0
+    allowed_intents: []
+    allowed_executables:
+      - "/bin/echo"
+    denied_write_paths:
+      - "{denied}"
+    denied_unlink_paths:
+      - "{denied}"
+    invariants: []
+"#,
+        denied = denied_file.display()
+    );
+
+    let dummy_root = fs_root("perfile");
+    let daemon =
+        DaemonGuard::spawn_with_policy("perfile", dummy_root.to_str().unwrap(), &policy, &[]);
+
+    // spawn() left us in the governed cgroup.
+    let create = |p: PathBuf| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+            .map(|_| ())
+    };
+    let denied_exact = create(guarded.join("secret.conf"));
+    let same_dir_other_name = create(guarded.join("allowed.conf"));
+    let other_dir_same_name = create(other.join("secret.conf"));
+
+    // Leave the governed cgroup BEFORE asserting so teardown runs ungoverned.
+    CgroupScope::leave();
+    let _ = fs::remove_dir_all(&guarded);
+    let _ = fs::remove_dir_all(&other);
+
+    assert!(
+        matches!(&denied_exact, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "JG #60: the exact denied file <guarded>/secret.conf must be denied, got {denied_exact:?}"
+    );
+    assert!(
+        same_dir_other_name.is_ok(),
+        "JG #60: a different filename in the guarded dir must be allowed \
+         (per-file, not directory-wide), got {same_dir_other_name:?}"
+    );
+    assert!(
+        other_dir_same_name.is_ok(),
+        "JG #60: the same basename in a DIFFERENT directory must be allowed \
+         (precise (dev,ino,name), not basename-anywhere), got {other_dir_same_name:?}"
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(dummy_root);
+}
+
 #[test]
 #[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
 fn test_kernel_filesystem_create_blocking_percentiles() {
