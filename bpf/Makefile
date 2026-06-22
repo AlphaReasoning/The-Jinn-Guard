@@ -35,7 +35,8 @@ LSM_SRCS = lsm/jg_socket_connect.c \
            lsm/jg_capable.c \
            lsm/jg_sb_mount.c \
            lsm/jg_sb_pivotroot.c \
-           lsm/jg_move_mount.c
+           lsm/jg_move_mount.c \
+           lsm/jg_file_open.c
 
 TRACEPOINT_OBJS = $(TRACEPOINT_SRCS:.bpf.c=.bpf.o)
 LSM_OBJS = $(LSM_SRCS:.c=.o)

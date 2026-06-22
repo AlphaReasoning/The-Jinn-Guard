@@ -230,34 +230,65 @@ view is authoritative**, and **no second kernel** is introduced.
 
 **Hardening direction (tracked in the hardening backlog and §10):**
 
-1. **Un-sheddable governance tag.** Tag the *task* (BPF task-local storage)
-   inherited on `clone`/`fork`/`exec`, rather than relying on cgroup membership
-   alone; deny `cgroup.procs` writes that move a governed task out of scope. The
-   tag follows the process tree and cannot be dropped.
-2. **Deny the nesting primitives by default for governed agents.** Add LSM
-   mediation for `mount`/`move_mount`, `pivot_root`, `chroot`, `setns`, and
-   namespace-creating `clone`/`unshare` flags. A governed agent with no legitimate
-   need is denied these, collapsing most of the surface.
-3. **Treat VM launch as a hard boundary.** Host BPF-LSM cannot see inside a guest
-   kernel. Deny `/dev/kvm` and `/dev/vhost-*` and VMM binaries for governed
-   agents. A VM-capable governed agent is **outside the single-host enforcement
-   model unless a nested Jinn Guard instance governs the guest** (recursive
-   governance). This is stated as an explicit scope limit, not a claim.
-4. **Key path decisions on inode/superblock identity, not path strings**, so
-   bind-mount/`pivot_root` remapping cannot fool the denylist (deepens the
-   mount-boundary fix).
-5. **Drop nesting-enabling capabilities** (`CAP_SYS_ADMIN`, `CAP_SYS_CHROOT`) and
-   restrict unprivileged user-namespace creation for governed workloads.
-6. **Default-deny dangerous operations at the kernel floor for governed scope**, so
-   a nested process that never speaks the protocol still cannot exec/mount/connect
-   outside policy — i.e., non-cooperation is safe.
-7. **Detect even where permitted:** namespace/cgroup/mount/VM-device creation by a
-   governed agent is a high-signal event and is logged/alerted (canary-style).
+1. **Un-sheddable governance tag — IMPLEMENTED (#49).** Governance follows the
+   whole cgroup **subtree**: `jg_in_governed_scope()` matches the governed cgroup
+   id *or any ancestor* (`bpf_get_current_ancestor_cgroup_id`, bounded depth), so
+   a governed task that creates and migrates into a descendant cgroup stays
+   governed. (Implemented via subtree matching rather than BPF task-local storage:
+   the pinned aya 0.13 loader cannot load `TASK_STORAGE` maps; subtree matching is
+   the equivalent guarantee with the available map types.) **Residual:** migration
+   to a sibling/parent cgroup *outside* the governed subtree is still escape — the
+   complementary `cgroup.procs`-write denial remains future work.
+2. **Deny the nesting primitives by default for governed agents — IMPLEMENTED
+   (#50).** LSM mediation now denies `mount` (`sb_mount`), `pivot_root`
+   (`sb_pivotroot`), and `move_mount` for governed scope (pure kernel-floor
+   deny-in-scope; audit-only downgrades to observe). **Residual:** `chroot`,
+   `setns`, and namespace-creating `clone`/`unshare` flags are not yet directly
+   mediated — but unprivileged userns nesting is separately neutered by #53 (item
+   5), which is the capability such an `unshare(CLONE_NEWNS)` requires.
+3. **Treat VM launch as a hard boundary — IMPLEMENTED (#51).** Host BPF-LSM cannot
+   see inside a guest kernel, so a nested VM is the strongest escape. The
+   `file_open` hook denies a governed task from opening **`/dev/kvm`**, matched by
+   its fixed device identity (`MISC_MAJOR` 10, `KVM_MINOR` 232) so no path walk is
+   needed; the rdev check runs before the scope check so non-KVM opens pay almost
+   nothing. This collapses **all KVM-accelerated VMMs** — QEMU/KVM, Firecracker,
+   Cloud Hypervisor, crosvm, Kata. A VM-capable governed agent remains **outside
+   the single-host enforcement model unless a nested Jinn Guard instance governs
+   the guest** (recursive governance); this is an explicit scope limit, not a
+   claim. **Residual (disclosed):** (a) `/dev/vhost-*` paravirt I/O devices are not
+   yet denied — they register with *dynamic* misc minors, so a fixed-rdev match is
+   unreliable; they are useless without `/dev/kvm` for acceleration but enable
+   vhost-backed paths in software VMs. (b) Pure software emulation (TCG/qemu, or
+   gVisor's ptrace/KVM platforms in their non-KVM mode) needs no device node — but
+   it requires exec of the emulator binary, already denied by the bprm allowlist
+   (#4 attack surface), and offers only a slow interpreted guest the host hooks
+   still observe, not a fast second kernel.
+4. **Key path decisions on inode/superblock identity, not path strings** (#52,
+   future), so bind-mount/`pivot_root` remapping cannot fool the denylist (deepens
+   the mount-boundary fix).
+5. **Drop nesting-enabling capabilities — IMPLEMENTED (#53).** The `capable` hook
+   denies escalation capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`,
+   `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`, `CAP_MKNOD`) when exercised
+   inside a **non-init user namespace** (`ns->level > 0`) by a governed task, with
+   an init-ns fast path. This restricts the unprivileged-userns nesting an agent
+   would use to manufacture in-namespace "root" and then create mount/pid/cgroup
+   namespaces.
+6. **Default-deny dangerous operations at the kernel floor for governed scope —
+   IMPLEMENTED (#54/#55).** A nested process that never speaks the protocol still
+   cannot exec off-allowlist, mount, open `/dev/kvm`, or connect outside policy
+   (default-deny IPv4 egress + AF_UNIX orchestrator-socket denylist) — i.e.,
+   non-cooperation is safe.
+7. **Detect even where permitted (partial):** namespace/cgroup/mount/VM-device
+   creation by a governed agent is a high-signal event. Denials are chain-logged
+   today (#37); broader canary-style alerting on *permitted-but-suspicious*
+   creation remains future work.
 
-Until items 1–3 land, operators should run governed agents **without
-`CAP_SYS_ADMIN`** and with unprivileged user namespaces disabled
-(`kernel.unprivileged_userns_clone=0` where the workload permits), which blocks
-the high-severity namespace and mount vectors at the OS level today.
+The high-severity namespace, mount, and VM vectors (items 1–3, 5, 6) are now
+mediated at the kernel floor for governed scope. Defense-in-depth still benefits
+from running governed agents **without `CAP_SYS_ADMIN`** and with unprivileged
+user namespaces disabled (`kernel.unprivileged_userns_clone=0` where the workload
+permits); Jinn Guard's hooks no longer *depend* on that OS hardening, but it
+removes the residuals noted above (e.g. sibling-cgroup migration, `setns`).
 
 ### Confused deputy via privileged orchestrators
 
