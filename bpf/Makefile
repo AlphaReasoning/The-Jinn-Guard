@@ -32,7 +32,10 @@ LSM_SRCS = lsm/jg_socket_connect.c \
            lsm/jg_bprm_check_security.c \
            lsm/jg_inode_create.c \
            lsm/jg_inode_unlink.c \
-           lsm/jg_capable.c
+           lsm/jg_capable.c \
+           lsm/jg_sb_mount.c \
+           lsm/jg_sb_pivotroot.c \
+           lsm/jg_move_mount.c
 
 TRACEPOINT_OBJS = $(TRACEPOINT_SRCS:.bpf.c=.bpf.o)
 LSM_OBJS = $(LSM_SRCS:.c=.o)
@@ -61,7 +64,7 @@ check-tools:
 %.bpf.o: %.bpf.c jg_events.h $(OUT)/vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-lsm/%.o: lsm/%.c lsm/jg_common.h common/maps.h $(OUT)/vmlinux.h
+lsm/%.o: lsm/%.c lsm/jg_common.h common/maps.h common/governed_floor.h $(OUT)/vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 legacy-telemetry: check-tools $(OUT)/vmlinux.h $(LEGACY_TELEMETRY_OBJS)

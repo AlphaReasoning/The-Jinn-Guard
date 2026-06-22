@@ -753,6 +753,62 @@ fn fork_nested_userns_mount() -> i32 {
     }
 }
 
+/// JG #50 — a governed task may not create new mounts. mount(2) is denied at the
+/// `sb_mount` LSM hook for tasks in the governed cgroup subtree, blocking the
+/// filesystem half of nesting a container/sandbox root outside the host LSM
+/// scope (the in-kernel complement to #53's capability denial). The target lives
+/// OUTSIDE the policy fs_root and a tmpfs needs no block device or allowlisted
+/// source, so the EPERM is attributable to the mount hook, not the path
+/// allowlist.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_governed_mount_denied() {
+    let root = fs_root("mount");
+    let daemon = DaemonGuard::spawn("mount", root.to_str().unwrap());
+
+    let target = PathBuf::from("/tmp/jg_mnt_target_mount");
+    let _ = fs::remove_dir_all(&target);
+    fs::create_dir_all(&target).unwrap();
+    let c_target = std::ffi::CString::new(target.to_str().unwrap()).unwrap();
+
+    // spawn() left us in the governed cgroup.
+    let rc = unsafe {
+        libc::mount(
+            c"none".as_ptr(),
+            c_target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
+    // Undo an unexpected success before asserting so we never leave a stray
+    // tmpfs mounted in /tmp.
+    if rc == 0 {
+        unsafe { libc::umount(c_target.as_ptr()) };
+    }
+
+    // Leave the governed cgroup BEFORE asserting so teardown runs ungoverned
+    // even if an assertion fails.
+    CgroupScope::leave();
+    let _ = fs::remove_dir_all(&target);
+
+    assert_eq!(
+        rc, -1,
+        "JG #50: governed mount(2) must be denied, but it succeeded (rc=0)"
+    );
+    assert_eq!(
+        errno,
+        libc::EPERM,
+        "JG #50: governed mount(2) must be denied EPERM ({}); got errno {errno}",
+        libc::EPERM
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 #[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
 fn test_kernel_filesystem_create_blocking_percentiles() {
