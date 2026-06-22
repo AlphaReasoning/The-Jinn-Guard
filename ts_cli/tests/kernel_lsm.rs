@@ -809,6 +809,63 @@ fn test_kernel_governed_mount_denied() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// JG #51 — a governed task may not open /dev/kvm, neutering KVM-accelerated
+/// VM/microVM launch (the strongest host-LSM escape: a guest kernel runs outside
+/// our hooks). The `file_open` hook matches the device by its fixed identity
+/// (MISC_MAJOR 10, KVM_MINOR 232), so we test it WITHOUT depending on real KVM
+/// being present on the runner: mknod a char node with rdev (10,232) in /tmp and
+/// open it. The LSM file_open hook fires before the device driver's open, so the
+/// EPERM is attributable to the hook whether or not /dev/kvm is registered. The
+/// node lives OUTSIDE the policy fs_root so no path-allowlist rule is involved.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_governed_vm_launch_denied() {
+    let root = fs_root("vmlaunch");
+    let daemon = DaemonGuard::spawn("vmlaunch", root.to_str().unwrap());
+
+    // A char device node with the fixed /dev/kvm identity (major 10, minor 232).
+    let node = "/tmp/jg_kvm_node_vmlaunch";
+    let _ = fs::remove_file(node);
+    let c_node = std::ffi::CString::new(node).unwrap();
+    let kvm_dev = libc::makedev(10, 232);
+    // mknod runs in the governed cgroup (init userns), where CAP_MKNOD is allowed
+    // and the node is outside fs_root, so creating it is not itself denied.
+    let mk = unsafe { libc::mknod(c_node.as_ptr(), libc::S_IFCHR | 0o600, kvm_dev) };
+    assert_eq!(
+        mk,
+        0,
+        "could not mknod the kvm test node: {}",
+        io::Error::last_os_error()
+    );
+
+    let fd = unsafe { libc::open(c_node.as_ptr(), libc::O_RDWR) };
+    let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
+    // Close an unexpected success before asserting (would only happen if the hook
+    // failed to deny AND a real KVM device answered the open).
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+
+    // Leave the governed cgroup BEFORE asserting so teardown runs ungoverned.
+    CgroupScope::leave();
+    let _ = fs::remove_file(node);
+
+    assert_eq!(
+        fd, -1,
+        "JG #51: governed open(/dev/kvm-identity) must be denied, but it succeeded"
+    );
+    assert_eq!(
+        errno,
+        libc::EPERM,
+        "JG #51: governed /dev/kvm open must be denied EPERM ({}); got errno {errno}",
+        libc::EPERM
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 #[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
 fn test_kernel_filesystem_create_blocking_percentiles() {

@@ -392,6 +392,9 @@ pub mod aya_backend {
     const JG_SRC_SB_MOUNT: u32 = 8;
     const JG_SRC_SB_PIVOTROOT: u32 = 9;
     const JG_SRC_MOVE_MOUNT: u32 = 10;
+    // VM-launch device hook (JG #51): denies /dev/kvm open in governed scope.
+    // Pure kernel-floor deny; emits no requests, value only labels the object.
+    const JG_SRC_FILE_OPEN: u32 = 11;
     /// Policy path key used by BPF maps.
     /// Must match `struct jg_path_key` in `bpf/lsm/jg_common.h`.
     #[repr(C)]
@@ -618,6 +621,16 @@ pub mod aya_backend {
                     "/usr/lib/jinnguard/lsm/jg_move_mount.o",
                     "jg_move_mount",
                     "move_mount",
+                ),
+                // VM-launch device hook (JG #51): deny /dev/kvm open for governed
+                // tasks so an agent cannot launch a KVM-accelerated VM/microVM and
+                // escape the host LSM scope inside a guest kernel. Pure kernel-floor
+                // deny-in-scope; matches the device by fixed (major 10, minor 232).
+                (
+                    JG_SRC_FILE_OPEN,
+                    "/usr/lib/jinnguard/lsm/jg_file_open.o",
+                    "jg_file_open",
+                    "file_open",
                 ),
             ];
 
