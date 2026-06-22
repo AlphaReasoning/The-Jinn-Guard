@@ -281,6 +281,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Job 7: Real-kernel LSM enforcement matrix (self-hosted, privileged)
+  #
+  # Setup, per-distro requirements, and gotchas: docs/ci-self-hosted-runners.md
   # GitHub-hosted runners cannot enable the BPF LSM (boot param) or attach LSM
   # programs as root, so the #[ignore]d kernel_lsm tests — the actual allow/deny
   # enforcement proofs, including #54 default-deny IPv4 egress and #55 the AF_UNIX
