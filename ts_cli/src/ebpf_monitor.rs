@@ -417,6 +417,20 @@ pub mod aya_backend {
 
     unsafe impl aya::Pod for InodeKey {}
 
+    /// Precise per-file denial key for the `denied_files_in_dir` map.
+    /// Must match `struct jg_dir_file_key` in `bpf/lsm/jg_common.h`:
+    /// (parent dev, parent ino, NUL-padded basename) = (u64, u64, [u8; 128]),
+    /// 144 bytes with no padding hole.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DirFileKey {
+        dev: u64,
+        ino: u64,
+        name: [u8; JG_MAX_RESOURCE_LEN],
+    }
+
+    unsafe impl aya::Pod for DirFileKey {}
+
     /// Raw request layout from the eBPF ring buffer.
     /// Must match `jg_request` in `bpf/lsm/jg_common.h`.
     #[repr(C)]
@@ -542,6 +556,7 @@ pub mod aya_backend {
         allowed_exec_paths: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_basenames: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_dir_inodes: Option<AyaHashMap<MapData, InodeKey, u8>>,
+        denied_files_in_dir: Option<AyaHashMap<MapData, DirFileKey, u8>>,
     }
 
     /// The main user-space monitor for loading LSM hooks and handling requests.
@@ -747,6 +762,13 @@ pub mod aya_backend {
                 if !denied_paths.is_empty() {
                     if let Some(map) = object.denied_dir_inodes.as_mut() {
                         configure_denied_dir_inodes(
+                            map,
+                            denied_paths.iter().copied(),
+                            object.object_path,
+                        )?;
+                    }
+                    if let Some(map) = object.denied_files_in_dir.as_mut() {
+                        configure_denied_files_in_dir(
                             map,
                             denied_paths.iter().copied(),
                             object.object_path,
@@ -988,6 +1010,7 @@ pub mod aya_backend {
         let allowed_exec_paths = optional_hash_map(&mut bpf, "allowed_exec_paths", object_path)?;
         let denied_basenames = optional_hash_map(&mut bpf, "denied_basenames", object_path)?;
         let denied_dir_inodes = optional_hash_map(&mut bpf, "denied_dir_inodes", object_path)?;
+        let denied_files_in_dir = optional_hash_map(&mut bpf, "denied_files_in_dir", object_path)?;
 
         Ok((
             LoadedLsmObject {
@@ -1005,6 +1028,7 @@ pub mod aya_backend {
                 allowed_exec_paths,
                 denied_basenames,
                 denied_dir_inodes,
+                denied_files_in_dir,
             },
             requests,
         ))
@@ -1298,6 +1322,13 @@ pub mod aya_backend {
             if denied_entry_is_existing_dir(path) {
                 continue;
             }
+            // Entries whose parent directory resolves at load time are matched
+            // precisely by `denied_files_in_dir` (dev, ino, basename); only fall
+            // back to the basename-anywhere map when that precise key is
+            // unavailable, so this map never over-blocks an entry we can pin.
+            if denied_file_parent_key(path)?.is_some() {
+                continue;
+            }
             let key = path_key(filesystem_policy_leaf(path));
             if key.path[0] == 0 {
                 continue;
@@ -1312,6 +1343,72 @@ pub mod aya_backend {
             })?;
         }
         Ok(())
+    }
+
+    fn configure_denied_files_in_dir<'a, I>(
+        map: &mut AyaHashMap<MapData, DirFileKey, u8>,
+        paths: I,
+        object_path: &str,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        for path in paths {
+            let Some(key) = denied_file_parent_key(path)? else {
+                continue;
+            };
+            map.insert(key, 1, 0).map_err(|e| {
+                anyhow!(
+                    "Failed to populate denied_files_in_dir entry '{}' dev={} ino={} in {}: {}",
+                    path,
+                    key.dev,
+                    key.ino,
+                    object_path,
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Precise per-file key for a denied *file* path whose parent directory
+    /// exists and resolves at load time: `(parent dev, parent ino, basename)`.
+    /// Returns `None` for existing directories (handled by `denied_dir_inodes`),
+    /// relative paths, empty leaves, or paths whose parent does not resolve to a
+    /// directory — those fall back to the basename-only `denied_basenames` map so
+    /// coverage never regresses (JG #60).
+    fn denied_file_parent_key(path: &str) -> Result<Option<DirFileKey>> {
+        let trimmed = path.trim().trim_end_matches('/');
+        // Only an absolute path has an unambiguous resolvable parent directory.
+        if !trimmed.starts_with('/') || denied_entry_is_existing_dir(trimmed) {
+            return Ok(None);
+        }
+        let leaf = filesystem_policy_leaf(trimmed);
+        if leaf.is_empty() {
+            return Ok(None);
+        }
+        let Some(parent) = std::path::Path::new(trimmed).parent() else {
+            return Ok(None);
+        };
+        let Ok(metadata) = std::fs::metadata(parent) else {
+            return Ok(None);
+        };
+        if !metadata.is_dir() {
+            return Ok(None);
+        }
+        Ok(Some(DirFileKey {
+            dev: kernel_dev_from_stat(metadata.dev()),
+            ino: metadata.ino(),
+            name: name_to_key_bytes(leaf),
+        }))
+    }
+
+    fn name_to_key_bytes(name: &str) -> [u8; JG_MAX_RESOURCE_LEN] {
+        let mut out = [0u8; JG_MAX_RESOURCE_LEN];
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(JG_MAX_RESOURCE_LEN.saturating_sub(1));
+        out[..len].copy_from_slice(&bytes[..len]);
+        out
     }
 
     fn denied_paths_for_object<'a>(policy: &'a PolicyConfig, object_path: &str) -> Vec<&'a String> {

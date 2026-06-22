@@ -31,6 +31,13 @@ struct {
 } denied_dir_inodes SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct jg_dir_file_key);
+    __type(value, __u8);
+} denied_files_in_dir SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
@@ -71,6 +78,31 @@ static __always_inline int jg_inode_dir_denied(struct inode *dir)
     return entry && *entry;
 }
 
+static __always_inline int jg_inode_file_in_dir_denied(struct inode *dir, const char *name)
+{
+    struct jg_dir_file_key key = {};
+
+    if (!dir) {
+        return 0;
+    }
+
+    // Precise per-file match: the file's basename within its parent dir's
+    // (dev, ino) identity (JG #60), so a denied file name is denied only in the
+    // configured directory, not everywhere in governed scope (the basename-only
+    // map remains as a fallback for entries whose parent did not resolve at load).
+    key.ino = BPF_CORE_READ(dir, i_ino);
+    key.dev = (__u64)BPF_CORE_READ(dir, i_sb, s_dev);
+#pragma unroll
+    for (int i = 0; i < JG_MAX_RESOURCE_LEN; i++) {
+        key.name[i] = name[i];
+        if (name[i] == '\0') {
+            break;
+        }
+    }
+    __u8 *entry = bpf_map_lookup_elem(&denied_files_in_dir, &key);
+    return entry && *entry;
+}
+
 
 SEC("lsm.s/inode_unlink")
 int BPF_PROG(jg_inode_unlink, struct inode *dir, struct dentry *dentry) {
@@ -89,7 +121,9 @@ int BPF_PROG(jg_inode_unlink, struct inode *dir, struct dentry *dentry) {
     // existing synchronous enforcement), then resolve the full path for the
     // user-space request below (JG-ADV-2026-002).
     jg_read_dentry_basename(dentry, resource_path, sizeof(resource_path));
-    int decision = (jg_inode_dir_denied(dir) || jg_inode_basename_denied(resource_path))
+    int decision = (jg_inode_dir_denied(dir)
+                    || jg_inode_file_in_dir_denied(dir, resource_path)
+                    || jg_inode_basename_denied(resource_path))
         ? -JG_EPERM
         : 0;
     jg_read_dentry_path(dentry, resource_path, sizeof(resource_path));

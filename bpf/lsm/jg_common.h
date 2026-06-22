@@ -155,6 +155,17 @@ struct jg_inode_key {
     __u64 ino;
 };
 
+// Precise per-file denial identity: the parent directory's (dev, ino) PLUS the
+// file's basename. Lets a denied *file* path (e.g. /etc/passwd) match only that
+// name in that exact directory, instead of the basename anywhere in scope (which
+// over-blocks). Layout is (u64, u64, char[128]) = 144 bytes with no padding hole,
+// so the hashed key is fully defined. Must match `DirFileKey` in ebpf_monitor.rs.
+struct jg_dir_file_key {
+    __u64 dev;
+    __u64 ino;
+    char name[JG_MAX_RESOURCE_LEN];
+};
+
 // Decision verdict from user-space.
 enum jg_verdict {
     VERDICT_UNKNOWN = 0,
