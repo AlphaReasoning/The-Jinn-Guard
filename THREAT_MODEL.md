@@ -548,6 +548,16 @@ limitation (Art. 5(1)(e))**, which Jinn Guard resolves by keeping personal data
 - **Right of access (Art. 15):** `read_subject_pii` returns the data still held
   for a subject. **Data minimisation (Art. 5(1)(c)):** an opt-in mode never
   persists command-line argument *values*, only their count.
+- **Salt rotation (#11, Art. 4(5) / 5(1)(c)):** the pseudonym salt can be rotated
+  (`rotate_pseudonym_salt`, or automatically at startup when a salt exceeds
+  `JINNGUARD_AUDIT_SALT_MAX_AGE_SECS`). Each rotation starts a new *epoch*, so a
+  subject's future pseudonym no longer links to its past one — limiting long-horizon
+  correlation/profiling across the log. Every prior epoch's salt is retained, so a
+  uid still resolves to all of its historical pseudonyms (`pseudonyms_for_uid_all_epochs`)
+  and a rotation-aware erasure (`erase_uid`) reaches records written under **any**
+  salt. Rotation never touches the hash chain — `verify_chain` is unaffected. Default
+  off, preserving the prior single-salt behaviour; legacy installs adopt their existing
+  salt as epoch 1 so already-written pseudonyms keep resolving.
 
 **Lawful basis / residuals.** Security and abuse-prevention logging is intended to
 rest on **legitimate interest (Art. 6(1)(f))**; a deployment must still set a
