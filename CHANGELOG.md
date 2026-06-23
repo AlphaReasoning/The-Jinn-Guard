@@ -9,6 +9,16 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Audit-log observability metrics (JG #11 monitoring).** The opt-in, loopback-only
+  Prometheus endpoint now surfaces the audit log's tamper-evidence and
+  data-protection posture: `jinnguard_audit_chain_entries` (gauge),
+  `jinnguard_audit_chain_intact` (0/1 gauge — result of the last `verify_chain`),
+  `jinnguard_audit_salt_epoch` (gauge — active rotation epoch, #11),
+  `jinnguard_audit_erasures_total` and `jinnguard_audit_erased_rows_total`
+  (counters — honoured Art. 17 erasures, for Art. 5(2) accountability). The
+  `AuditLogger` pushes its state on log/rotate/erase; `refresh_chain_health_metric()`
+  runs a verification and publishes the intact gauge (for a periodic daemon tick,
+  off the hot logging path). No new dependencies; scraper never touches the audit DB.
 - **Automated audit pseudonym-salt rotation (JG #11).** The audit log's per-install
   pseudonym salt can now be **rotated** (`AuditLogger::rotate_pseudonym_salt`, or
   automatically at startup once a salt exceeds `JINNGUARD_AUDIT_SALT_MAX_AGE_SECS`).

@@ -133,10 +133,18 @@ Key series:
 | `jinnguard_decisions_total{verdict}` | Userspace allow/deny |
 | `jinnguard_denials_total{reason}` | Denials by reason (e.g. `DENY_REPLAY_ATTACK`) |
 | `jinnguard_kernel_decisions_total{verdict}` | Kernel-LSM allow/deny |
+| `jinnguard_orchestrator_socket_attempts_total{orchestrator,verdict}` | Governed connects to orchestrator/init sockets (confused-deputy signal) |
+| `jinnguard_audit_chain_entries` | Entries in the tamper-evident audit chain |
+| `jinnguard_audit_chain_intact` | Last `verify_chain` result (1 = tamper-evidence holds) |
+| `jinnguard_audit_salt_epoch` | Active pseudonym-salt epoch (increments on rotation) |
+| `jinnguard_audit_erasures_total` / `jinnguard_audit_erased_rows_total` | Honoured Art. 17 erasures (accountability) |
 | `jinnguard_build_info{version}` | Build version |
 
 Suggested alerts: daemon down (`up == 0` / no `uptime` scrape), a sudden spike in
-`jinnguard_denials_total`, or any rise in a `DENY_REPLAY_ATTACK` series.
+`jinnguard_denials_total`, any rise in a `DENY_REPLAY_ATTACK` series, any
+`jinnguard_orchestrator_socket_attempts_total{verdict="allow"}` (a confused-deputy
+path is open), and **`jinnguard_audit_chain_intact == 0`** (audit tamper-evidence
+broken — page immediately).
 
 ### Health checks
 
