@@ -9,6 +9,18 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Optional mTLS for the MCP gateway (JG #11).** The MCP enforcement proxy can now
+  require **mutual TLS**: pass `--mcp-tls-cert`, `--mcp-tls-key` and `--mcp-tls-ca`
+  together and the gateway presents its certificate and **requires + verifies a
+  client certificate** chaining to the given CA before any request reaches the
+  governance pipeline. A client with no certificate, or one not signed by the CA,
+  fails the handshake and is dropped (**fail-closed**) — closing the prior gap where
+  the gateway authenticated callers only by a synthetic per-IP id over plaintext TCP.
+  Off by default (plain TCP, unchanged); a *partial* flag combination is a fatal
+  config error (`code=78 kind=MCP_TLS_CONFIG`) rather than a silent plaintext
+  fallback. Built on `openssl` (already in the tree) + `tokio-openssl`; the
+  per-connection handler is now transport-generic. 3 new unit tests
+  (valid material builds, missing files rejected, key/cert mismatch rejected).
 - **Audit-log observability metrics (JG #11 monitoring).** The opt-in, loopback-only
   Prometheus endpoint now surfaces the audit log's tamper-evidence and
   data-protection posture: `jinnguard_audit_chain_entries` (gauge),

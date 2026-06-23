@@ -13,9 +13,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::{
@@ -198,7 +199,7 @@ struct HttpRequest {
 /// Read a minimal HTTP/1.1 request from a tokio TcpStream.
 /// Supports chunked detection but does not decode chunks — the body is read
 /// by Content-Length only, which is the norm for JSON-RPC clients.
-async fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<HttpRequest> {
+async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<HttpRequest> {
     let mut raw = Vec::with_capacity(4096);
 
     // Read until we see \r\n\r\n (end of headers).
@@ -252,8 +253,8 @@ async fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<HttpRequest
 }
 
 /// Write a minimal HTTP/1.1 response.
-async fn write_http_response(
-    stream: &mut TcpStream,
+async fn write_http_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     status_text: &str,
     content_type: &str,
@@ -281,8 +282,8 @@ async fn write_http_response(
 // peer, policy, registry, audit, telemetry, secret, upstream); bundling these
 // into a struct would not improve clarity.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_mcp_connection(
-    mut stream: TcpStream,
+pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     peer_addr: SocketAddr,
     current_policy: PolicyConfig,
     registry_store: Arc<Mutex<LineageRegistry>>,
@@ -799,6 +800,56 @@ async fn forward_to_upstream(
 // Public entry point — called from main.rs to start the gateway listener.
 // ---------------------------------------------------------------------------
 
+/// Operator-supplied mTLS material for the MCP gateway (#11). All three are
+/// required together: a server identity (`cert` + `key`) the gateway presents, and
+/// the `ca` used to verify connecting clients.
+#[derive(Debug, Clone)]
+pub(crate) struct McpTlsConfig {
+    pub cert: String,
+    pub key: String,
+    pub ca: String,
+}
+
+/// Build an mTLS `SslAcceptor` that presents `cert`/`key` and **requires** a client
+/// certificate chaining to `ca`. A client presenting no certificate — or one not
+/// signed by `ca` — fails the handshake, so an unauthenticated MCP client never
+/// reaches the governance pipeline (fail-closed). Errors if any file is missing or
+/// the private key does not match the certificate.
+pub(crate) fn build_mcp_tls_acceptor(cfg: &McpTlsConfig) -> anyhow::Result<SslAcceptor> {
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+        .map_err(|e| anyhow::anyhow!("mcp mTLS: cannot init acceptor: {e}"))?;
+    builder
+        .set_certificate_chain_file(&cfg.cert)
+        .map_err(|e| anyhow::anyhow!("mcp mTLS: bad server cert {}: {e}", cfg.cert))?;
+    builder
+        .set_private_key_file(&cfg.key, SslFiletype::PEM)
+        .map_err(|e| anyhow::anyhow!("mcp mTLS: bad server key {}: {e}", cfg.key))?;
+    builder
+        .check_private_key()
+        .map_err(|e| anyhow::anyhow!("mcp mTLS: private key does not match certificate: {e}"))?;
+    builder
+        .set_ca_file(&cfg.ca)
+        .map_err(|e| anyhow::anyhow!("mcp mTLS: bad client CA {}: {e}", cfg.ca))?;
+    // The "mutual" in mTLS: require AND verify the client certificate.
+    builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    Ok(builder.build())
+}
+
+/// Complete the server-side TLS handshake (verifying the client certificate) and
+/// return the encrypted stream.
+async fn accept_tls(
+    acceptor: &SslAcceptor,
+    stream: TcpStream,
+) -> anyhow::Result<tokio_openssl::SslStream<TcpStream>> {
+    let ssl = openssl::ssl::Ssl::new(acceptor.context())?;
+    let mut tls = tokio_openssl::SslStream::new(ssl, stream)?;
+    std::pin::Pin::new(&mut tls).accept().await?;
+    Ok(tls)
+}
+
+// The gateway runner threads the full request context plus the optional TLS
+// acceptor; bundling these into a struct would not improve clarity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_mcp_gateway(
     port: u16,
     upstream: String,
@@ -807,11 +858,13 @@ pub(crate) async fn run_mcp_gateway(
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
     secret: Arc<Vec<u8>>,
+    tls: Option<Arc<SslAcceptor>>,
 ) {
     let addr = format!("0.0.0.0:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
-            println!("[MCP] gateway listening on {addr}");
+            let mode = if tls.is_some() { "mTLS" } else { "plaintext" };
+            println!("[MCP] gateway listening on {addr} ({mode})");
             l
         }
         Err(e) => {
@@ -829,20 +882,46 @@ pub(crate) async fn run_mcp_gateway(
                 let telemetry_clone = Arc::clone(&telemetry_store);
                 let upstream_clone = upstream.clone();
                 let secret_clone = Arc::clone(&secret);
+                let tls_clone = tls.clone();
 
                 tokio::spawn(async move {
                     let worker = tokio::spawn(async move {
-                        handle_mcp_connection(
-                            stream,
-                            peer_addr,
-                            policy_snapshot,
-                            registry_clone,
-                            logger_clone,
-                            telemetry_clone,
-                            secret_clone,
-                            upstream_clone,
-                        )
-                        .await;
+                        // With mTLS configured, complete (and verify) the handshake
+                        // before the connection reaches the governance pipeline; a
+                        // failed handshake drops the connection fail-closed.
+                        match tls_clone {
+                            Some(acceptor) => match accept_tls(&acceptor, stream).await {
+                                Ok(tls_stream) => {
+                                    handle_mcp_connection(
+                                        tls_stream,
+                                        peer_addr,
+                                        policy_snapshot,
+                                        registry_clone,
+                                        logger_clone,
+                                        telemetry_clone,
+                                        secret_clone,
+                                        upstream_clone,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    eprintln!("[MCP] mTLS handshake rejected from {peer_addr}: {e}")
+                                }
+                            },
+                            None => {
+                                handle_mcp_connection(
+                                    stream,
+                                    peer_addr,
+                                    policy_snapshot,
+                                    registry_clone,
+                                    logger_clone,
+                                    telemetry_clone,
+                                    secret_clone,
+                                    upstream_clone,
+                                )
+                                .await;
+                            }
+                        }
                     });
 
                     if let Err(err) = worker.await {
@@ -853,6 +932,97 @@ pub(crate) async fn run_mcp_gateway(
                 });
             }
             Err(e) => eprintln!("[MCP] accept error: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_mtls_tests {
+    use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::{PKey, Private};
+    use openssl::rsa::Rsa;
+    use openssl::x509::{X509NameBuilder, X509};
+    use std::io::Write;
+
+    /// Generate a throwaway self-signed cert + key for the acceptor tests.
+    fn self_signed(cn: &str) -> (PKey<Private>, X509) {
+        let pkey = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", cn).unwrap();
+        let name = name.build();
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.set_pubkey(&pkey).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        b.sign(&pkey, MessageDigest::sha256()).unwrap();
+        (pkey, b.build())
+    }
+
+    fn write_temp(name: &str, bytes: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("jg_mtls_test_{name}"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn acceptor_builds_from_valid_material() {
+        let (key, cert) = self_signed("jinnguard-mcp");
+        let cert_path = write_temp("ok.crt", &cert.to_pem().unwrap());
+        let key_path = write_temp("ok.key", &key.private_key_to_pem_pkcs8().unwrap());
+        // The same self-signed cert doubles as the client-trust CA here.
+        let cfg = McpTlsConfig {
+            cert: cert_path.clone(),
+            key: key_path.clone(),
+            ca: cert_path.clone(),
+        };
+        assert!(
+            build_mcp_tls_acceptor(&cfg).is_ok(),
+            "valid cert/key/ca must build an acceptor"
+        );
+        for p in [cert_path, key_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn acceptor_rejects_missing_files() {
+        let cfg = McpTlsConfig {
+            cert: "/nonexistent/jg/server.crt".to_string(),
+            key: "/nonexistent/jg/server.key".to_string(),
+            ca: "/nonexistent/jg/ca.crt".to_string(),
+        };
+        assert!(
+            build_mcp_tls_acceptor(&cfg).is_err(),
+            "missing material must fail closed, not build a usable acceptor"
+        );
+    }
+
+    #[test]
+    fn acceptor_rejects_mismatched_key_and_cert() {
+        // A cert from one keypair with the private key of another must be refused.
+        let (_k1, cert1) = self_signed("server-a");
+        let (k2, _c2) = self_signed("server-b");
+        let cert_path = write_temp("mismatch.crt", &cert1.to_pem().unwrap());
+        let key_path = write_temp("mismatch.key", &k2.private_key_to_pem_pkcs8().unwrap());
+        let cfg = McpTlsConfig {
+            cert: cert_path.clone(),
+            key: key_path.clone(),
+            ca: cert_path.clone(),
+        };
+        assert!(
+            build_mcp_tls_acceptor(&cfg).is_err(),
+            "a private key that does not match the cert must be rejected"
+        );
+        for p in [cert_path, key_path] {
+            let _ = std::fs::remove_file(p);
         }
     }
 }

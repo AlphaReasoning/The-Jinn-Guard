@@ -1826,6 +1826,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-openssl"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59df6849caa43bb7567f9a36f863c447d95a11d5903c9cc334ba32576a27eadd"
+dependencies = [
+ "openssl",
+ "openssl-sys",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1893,6 +1904,7 @@ dependencies = [
  "log",
  "nom",
  "num_cpus",
+ "openssl",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1901,6 +1913,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tokio",
+ "tokio-openssl",
  "ts_checker",
  "ts_wire",
  "z3",

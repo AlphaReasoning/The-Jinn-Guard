@@ -26,6 +26,11 @@ signal-hook = "0.4.4"
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
+# #11 optional mTLS for the MCP gateway. openssl is already in the dependency
+# graph (via reqwest/native-tls); tokio-openssl adds async TLS streams. Engaged
+# only when the operator supplies --mcp-tls-{cert,key,ca}; plain TCP otherwise.
+openssl = "0.10"
+tokio-openssl = "0.6"
 
 # Local Workspace Modules
 ts_checker = { path = "../ts_checker" }
