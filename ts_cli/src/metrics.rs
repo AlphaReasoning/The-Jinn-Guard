@@ -25,6 +25,14 @@ struct Metrics {
     /// keyed by `"<orchestrator>|<verdict>"` (e.g. `"docker|deny"`). A non-zero
     /// allow count is itself a signal — it means a confused-deputy path is open.
     deputy_attempts: Mutex<BTreeMap<String, u64>>,
+    /// #11/#61 audit observability. Entry count + active salt epoch are gauges;
+    /// erasures are counters (Art. 5(2) accountability); `audit_chain_intact` is a
+    /// 0/1 gauge reflecting the last `verify_chain` (1 = tamper-evidence holds).
+    audit_chain_entries: AtomicU64,
+    audit_salt_epoch: AtomicU64,
+    audit_erasures_total: AtomicU64,
+    audit_erased_rows_total: AtomicU64,
+    audit_chain_intact: AtomicU64,
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -38,6 +46,9 @@ fn m() -> &'static Metrics {
 pub fn init() {
     let _ = m();
     let _ = START.get_or_init(Instant::now);
+    // Optimistic until the first chain verification reports otherwise, so the
+    // gauge never reads "broken" merely because no check has run yet.
+    m().audit_chain_intact.store(1, Ordering::Relaxed);
 }
 
 fn uptime_seconds() -> u64 {
@@ -94,6 +105,37 @@ pub fn record_orchestrator_socket_attempt(orchestrator: &str, denied: bool) {
     if let Ok(mut map) = m().deputy_attempts.lock() {
         *map.entry(key).or_insert(0) += 1;
     }
+}
+
+// #11/#61 Audit observability setters. The audit logger pushes its state here so
+// the (loopback-only) `/metrics` endpoint can surface tamper-evidence and
+// data-protection posture without the scraper touching the audit DB.
+
+/// Total entries currently in the tamper-evident chain.
+pub fn set_audit_chain_entries(n: u64) {
+    m().audit_chain_entries.store(n, Ordering::Relaxed);
+}
+
+/// The active pseudonym-salt epoch (increments on each rotation, #11).
+pub fn set_audit_salt_epoch(epoch: u64) {
+    m().audit_salt_epoch.store(epoch, Ordering::Relaxed);
+}
+
+/// One honoured erasure request (Art. 17) that removed `rows` PII rows. No-op
+/// erasures (already erased) are not counted.
+pub fn record_audit_erasure(rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    m().audit_erasures_total.fetch_add(1, Ordering::Relaxed);
+    m().audit_erased_rows_total
+        .fetch_add(rows, Ordering::Relaxed);
+}
+
+/// Result of the most recent chain verification (`true` = tamper-evidence holds).
+pub fn set_audit_chain_intact(intact: bool) {
+    m().audit_chain_intact
+        .store(u64::from(intact), Ordering::Relaxed);
 }
 
 /// One synchronous kernel-LSM allow/deny decision.
@@ -183,6 +225,50 @@ pub fn render() -> String {
         }
     }
 
+    // #11/#61 audit observability: tamper-evidence + data-protection posture.
+    out.push_str(
+        "# HELP jinnguard_audit_chain_entries Entries in the tamper-evident audit chain.\n",
+    );
+    out.push_str("# TYPE jinnguard_audit_chain_entries gauge\n");
+    out.push_str(&format!(
+        "jinnguard_audit_chain_entries {}\n",
+        g.audit_chain_entries.load(Ordering::Relaxed)
+    ));
+
+    out.push_str(
+        "# HELP jinnguard_audit_chain_intact Whether the last chain verification passed (1=intact).\n",
+    );
+    out.push_str("# TYPE jinnguard_audit_chain_intact gauge\n");
+    out.push_str(&format!(
+        "jinnguard_audit_chain_intact {}\n",
+        g.audit_chain_intact.load(Ordering::Relaxed)
+    ));
+
+    out.push_str(
+        "# HELP jinnguard_audit_salt_epoch Active pseudonym-salt epoch (increments on rotation).\n",
+    );
+    out.push_str("# TYPE jinnguard_audit_salt_epoch gauge\n");
+    out.push_str(&format!(
+        "jinnguard_audit_salt_epoch {}\n",
+        g.audit_salt_epoch.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP jinnguard_audit_erasures_total Honoured erasure requests (Art. 17).\n");
+    out.push_str("# TYPE jinnguard_audit_erasures_total counter\n");
+    out.push_str(&format!(
+        "jinnguard_audit_erasures_total {}\n",
+        g.audit_erasures_total.load(Ordering::Relaxed)
+    ));
+
+    out.push_str(
+        "# HELP jinnguard_audit_erased_rows_total PII rows removed by erasure requests.\n",
+    );
+    out.push_str("# TYPE jinnguard_audit_erased_rows_total counter\n");
+    out.push_str(&format!(
+        "jinnguard_audit_erased_rows_total {}\n",
+        g.audit_erased_rows_total.load(Ordering::Relaxed)
+    ));
+
     out
 }
 
@@ -265,5 +351,25 @@ mod tests {
         assert!(text.contains("jinnguard_decisions_total{verdict=\"deny\"}"));
         assert!(text.contains("jinnguard_denials_total{reason=\"DENY_VIOLATION\"}"));
         assert!(text.contains("jinnguard_kernel_decisions_total{verdict=\"deny\"}"));
+    }
+
+    #[test]
+    fn render_emits_audit_observability_series() {
+        // The audit series are always present (race-free): assert the names/HELP,
+        // not values other tests may concurrently mutate.
+        let text = render();
+        for series in [
+            "jinnguard_audit_chain_entries",
+            "jinnguard_audit_chain_intact",
+            "jinnguard_audit_salt_epoch",
+            "jinnguard_audit_erasures_total",
+            "jinnguard_audit_erased_rows_total",
+        ] {
+            assert!(text.contains(series), "missing audit series {series}");
+        }
+        assert!(text.contains("# TYPE jinnguard_audit_salt_epoch gauge"));
+        assert!(text.contains("# TYPE jinnguard_audit_erasures_total counter"));
+        // Every audit series renders a value line (numeric), not just metadata.
+        assert!(text.contains("jinnguard_audit_chain_intact "));
     }
 }

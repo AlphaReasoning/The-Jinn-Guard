@@ -1257,6 +1257,13 @@ impl AuditLogger {
             }
         }
 
+        // Surface startup audit state on the (opt-in) metrics endpoint (#11).
+        let chain_entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))
+            .unwrap_or(0);
+        crate::metrics::set_audit_chain_entries(chain_entries as u64);
+        crate::metrics::set_audit_salt_epoch(active.epoch as u64);
+
         Self {
             file_path: file_path.to_string(),
             db: Arc::new(Mutex::new(conn)),
@@ -1349,11 +1356,14 @@ impl AuditLogger {
             Self::insert_salt_epoch(&conn, now)?
         };
         let epoch = rotated.epoch;
-        let mut st = self
-            .salt_state
-            .lock()
-            .map_err(|_| anyhow!("AuditLogger: salt mutex poisoned"))?;
-        *st = rotated;
+        {
+            let mut st = self
+                .salt_state
+                .lock()
+                .map_err(|_| anyhow!("AuditLogger: salt mutex poisoned"))?;
+            *st = rotated;
+        }
+        crate::metrics::set_audit_salt_epoch(epoch as u64);
         Ok(epoch)
     }
 
@@ -1415,14 +1425,18 @@ impl AuditLogger {
     /// Returns the number of rows erased. The hash chain is untouched and still
     /// verifies — [`verify_chain`] passes identically before and after.
     pub fn erase_subject(&self, subject_pseudonym: &str) -> Result<usize> {
-        let conn = self
-            .db
-            .lock()
-            .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
-        let n = conn.execute(
-            "DELETE FROM audit_pii WHERE subject = ?1",
-            params![subject_pseudonym],
-        )?;
+        let n = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+            conn.execute(
+                "DELETE FROM audit_pii WHERE subject = ?1",
+                params![subject_pseudonym],
+            )?
+        };
+        // Art. 5(2) accountability: surface honoured erasures on the metrics endpoint.
+        crate::metrics::record_audit_erasure(n as u64);
         Ok(n)
     }
 
@@ -1617,7 +1631,22 @@ impl AuditLogger {
             );
         }
 
+        // #11 monitoring: this entry's index is 0-based, so the chain now holds
+        // `next_index + 1` entries.
+        crate::metrics::set_audit_chain_entries(next_index + 1);
+
         Ok(())
+    }
+
+    /// #11 Run a full chain verification and publish the result to the metrics
+    /// endpoint (`jinnguard_audit_chain_intact` / `jinnguard_audit_chain_entries`).
+    /// Intended for a periodic daemon health tick; kept off the hot `log()` path
+    /// because it re-reads the whole JSONL chain. Returns whether the chain is intact.
+    pub fn refresh_chain_health_metric(&self) -> Result<bool> {
+        let v = self.verify_chain()?;
+        crate::metrics::set_audit_chain_intact(v.intact);
+        crate::metrics::set_audit_chain_entries(v.entries as u64);
+        Ok(v.intact)
     }
 
     /// Return the last N audit entries deserialized from `full_json` in the DB.
