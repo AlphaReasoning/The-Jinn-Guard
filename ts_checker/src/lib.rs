@@ -118,6 +118,18 @@ impl<'a> PolicyEngine<'a> {
                 .ok_or_else(|| anyhow!("Cannot parse invariant expression: '{}'", invariant))?;
 
             // Resolve LHS variable; skip if unknown (vacuous).
+            //
+            // SECURITY NOTE (JG-RT-004, defense-in-depth): a missing variable makes
+            // its invariant vacuously pass (fail-open). The daemon force-populates
+            // every risk/telemetry variable it owns (observed_risk, fused_risk,
+            // trust_score, privilege_tier, is_root, declared_risk, action_risk_score,
+            // …) so those cannot be suppressed by a caller; but an invariant written
+            // over a *caller-supplied* custom variable can be bypassed by omitting it.
+            // This layer is defense-in-depth (the intent allowlist + kernel exec
+            // enforcement are the primary gates). Likewise, very large caller-supplied
+            // values saturate in the `as i32` scaling below. Recommendation: author
+            // security-relevant invariants only over the daemon-guaranteed variables
+            // above, whose presence and bounded range are not attacker-controlled.
             let lhs_val = match context_vars.get(lhs) {
                 Some(&v) => v,
                 None => {

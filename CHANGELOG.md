@@ -9,6 +9,16 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Internal red-team batch 2 — kernel floor / proof / fleet review (JG #59).** Audited
+  the fleet bundle verifier, the Z3 policy-proof path, the BPF `socket_connect` hook,
+  and the capability-hardening sequence — all found **sound** (content-bound signed
+  bundles with rollback-before-signature; SMT timeout→`Unknown`→DENY fail-closed;
+  null-checked/bounded BPF map access behind the kernel verifier + matrix; cap drop
+  ordered after BPF attach, bounding-set only). One **LOW** defense-in-depth finding
+  (**JG-RT-004**): a policy invariant over a *caller-supplied* variable fails open if
+  the variable is omitted — documented in-code with author guidance; semantics
+  deliberately not flipped (it is a test-pinned design choice and a DiD layer). See
+  [`RED_TEAM_FINDINGS.md`](RED_TEAM_FINDINGS.md).
 - **Internal red-team batch 1 — fixed 3 reachable issues (JG #59).** See
   [`RED_TEAM_FINDINGS.md`](RED_TEAM_FINDINGS.md). **JG-RT-001 (HIGH):** the MCP
   gateway allocated a request body directly from the attacker-controlled

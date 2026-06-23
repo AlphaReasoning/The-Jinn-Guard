@@ -61,13 +61,49 @@ the upstream connection.
 - **MCP gateway mTLS (JG #11).** Client cert required + verified; handshake failure
   drops the connection fail-closed. No finding.
 
+## Batch 2 — kernel floor, policy proof, fleet, capability hardening
+
+### JG-RT-004 — Invariant over a missing variable fails open (LOW, documented)
+`ts_checker::verify_policy_invariants` skips (treats as vacuously satisfied) any
+invariant whose variable is absent from `context_vars`. The daemon force-populates
+every risk/telemetry variable it owns, so those cannot be suppressed; but an
+invariant authored over a *caller-supplied custom* variable can be bypassed by
+omitting it. Related: very large caller-supplied values saturate in the `as i32`
+scaling. This is a **defense-in-depth** layer (the intent allowlist + kernel exec
+enforcement are the primary gates; cf. THREAT_MODEL §8), and the skip is a
+deliberate, test-pinned design choice (missing telemetry must not cause spurious
+denials).
+- **Action:** documented in-code at the skip site with the guidance to author
+  security-relevant invariants only over the daemon-guaranteed variables (whose
+  presence and bounded range are not attacker-controlled). Semantics intentionally
+  **not** flipped to fail-closed — that would deny legitimate optional-telemetry
+  policies and is the project owner's call, not a unilateral red-team change.
+
+### Surfaces reviewed and found sound (batch 2)
+
+- **Fleet bundle verification (`fleet_policy.rs`).** The signed canonical binds the
+  policy via `sha256(policy_yaml)`, so any tamper changes the recomputed hash and
+  fails verification; rollback (`version < min_version`) is checked *before*
+  signature and the floor ratchets on apply; HMAC compared constant-time. No finding.
+- **Z3 / policy proof (`ts_checker`).** A per-`check()` 250 ms solver timeout returns
+  `SatResult::Unknown`, which every call site maps to **DENY** — the SMT layer fails
+  *closed* on a pathological/timed-out proof. No finding (beyond JG-RT-004 above).
+- **BPF LSM `socket_connect` hook (`bpf/lsm/`).** Every `bpf_map_lookup_elem` is
+  null-checked before deref; address reads are length-bounded (`bpf_probe_read_*`
+  with `sizeof`); IPv6 under default-deny fails closed (no un-allowlisted bypass).
+  eBPF memory safety is additionally enforced by the **kernel verifier at load**
+  (gated by the `build-ebpf` CI job + exercised by the real-kernel matrix), so OOB /
+  null-deref / unbounded-loop bugs cannot load. No finding.
+- **Capability hardening (`main.rs`).** `apply()` runs **after** BPF `load()` +
+  `attach_all()` (dropping caps earlier would break enforcement); it drops only from
+  the *bounding* set (effective caps stay intact, so map writes keep working) and
+  sets `no_new_privs`; a test guards the drop list against required caps. No finding.
+
 ## Remaining surfaces (subsequent batches)
 
-- BPF LSM hooks (`bpf/lsm/*.c`) — map bounds, helper return checks, verifier-floor
-  behaviour on 5.14.
-- Policy/Z3 path — pathological policy inputs, the SMT timeout/`Unknown`→DENY path.
-- Fleet client (`fleet_policy.rs`) — bundle signature/rollback handling.
-- Capability hardening (`main.rs`) — the bounding-set drop and `no_new_privs` ordering.
+- Full effective-set deprivilege (open #11 item; wants real-host validation).
 - Per-request secret re-read inside the connection loop (a missing-file mid-connection
   triggers `fatal`/exit — fail-closed, but a privileged local actor can crash the
-  daemon; noted, low severity, fix deferred to a batch that reworks secret caching).
+  daemon; low severity, fix deferred to a batch that reworks secret caching).
+- Integration-level flows (multi-step lineage, quota accounting) and the explainability
+  emitter's handling of attacker-controlled fields in log output.
