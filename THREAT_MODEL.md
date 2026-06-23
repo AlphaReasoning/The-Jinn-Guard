@@ -391,9 +391,14 @@ helpers, and **privileged MCP tool servers** reachable by non-denylisted paths.
 3. **Govern the deputy / propagate identity** (the complete but hard fix): the
    deputy acts under the caller's capability rather than its ambient root
    (designation = authority). Attribution across a shared daemon is genuinely hard.
-4. **Detect unconditionally:** a governed agent connecting to a container/VM/init
-   control socket is a high-signal event — log/alert even where it cannot yet be
-   blocked.
+4. **Detect unconditionally — IMPLEMENTED (#58).** A governed agent connecting to
+   a container/VM/init control socket is a high-signal event, so it is now surfaced
+   independently of the verdict: each attempt emits a `[JINNGUARD DEPUTY ALERT]`
+   log line and increments
+   `jinnguard_orchestrator_socket_attempts_total{orchestrator,verdict}`. This is
+   detection, not enforcement (the deny is #55's); an `allow`-verdict alert is the
+   strongest signal, flagging any deputy path the denylist does not yet cover —
+   e.g. a socket reached by an abstract-namespace or non-denylisted path.
 
 **Architectural limit:** confused deputy via ambient-authority daemons is a
 fundamental limit of any per-process/per-cgroup model. Jinn Guard cannot govern an

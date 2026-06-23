@@ -21,6 +21,10 @@ struct Metrics {
     kernel_deny_total: AtomicU64,
     /// Userspace denials keyed by their `SIGNAL: <reason>` token.
     deny_reasons: Mutex<BTreeMap<String, u64>>,
+    /// #58: governed-agent connect attempts to orchestrator/init control sockets,
+    /// keyed by `"<orchestrator>|<verdict>"` (e.g. `"docker|deny"`). A non-zero
+    /// allow count is itself a signal — it means a confused-deputy path is open.
+    deputy_attempts: Mutex<BTreeMap<String, u64>>,
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -78,6 +82,18 @@ fn reason_token(body: &[u8]) -> String {
             }
         })
         .collect()
+}
+
+/// #58: a governed agent attempted to connect to an orchestrator/init control
+/// socket (docker/containerd/podman/crio/libvirt/dbus/systemd). Recorded whether
+/// or not the connect was denied — an `allow` here flags a confused-deputy path
+/// that should have been closed.
+pub fn record_orchestrator_socket_attempt(orchestrator: &str, denied: bool) {
+    let verdict = if denied { "deny" } else { "allow" };
+    let key = format!("{orchestrator}|{verdict}");
+    if let Ok(mut map) = m().deputy_attempts.lock() {
+        *map.entry(key).or_insert(0) += 1;
+    }
 }
 
 /// One synchronous kernel-LSM allow/deny decision.
@@ -153,6 +169,19 @@ pub fn render() -> String {
         "jinnguard_kernel_decisions_total{{verdict=\"deny\"}} {}\n",
         g.kernel_deny_total.load(Ordering::Relaxed)
     ));
+
+    out.push_str(
+        "# HELP jinnguard_orchestrator_socket_attempts_total Governed-agent connect attempts to orchestrator/init control sockets (confused-deputy signal).\n",
+    );
+    out.push_str("# TYPE jinnguard_orchestrator_socket_attempts_total counter\n");
+    if let Ok(map) = g.deputy_attempts.lock() {
+        for (key, count) in map.iter() {
+            let (orchestrator, verdict) = key.split_once('|').unwrap_or((key.as_str(), "deny"));
+            out.push_str(&format!(
+                "jinnguard_orchestrator_socket_attempts_total{{orchestrator=\"{orchestrator}\",verdict=\"{verdict}\"}} {count}\n"
+            ));
+        }
+    }
 
     out
 }
