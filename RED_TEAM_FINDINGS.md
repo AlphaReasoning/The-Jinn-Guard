@@ -99,11 +99,28 @@ denials).
   the *bounding* set (effective caps stay intact, so map writes keep working) and
   sets `no_new_privs`; a test guards the drop list against required caps. No finding.
 
-## Remaining surfaces (subsequent batches)
+## Batch 3 — explainability emitter, capability deprivilege
 
-- Full effective-set deprivilege (open #11 item; wants real-host validation).
+### JG-RT-005 — Log injection into the human console explanation (LOW, fixed)
+`DecisionExplanation::to_console_output` interpolated attacker-controlled fields
+(`agent_id`, resource path, action, reasons) raw via `{}`, so an embedded newline
+could forge a fake `[JINN-GUARD] ALLOW …` line in the human console log. The
+structured `to_structured_log` channel was already injection-safe (serde-escaped).
+- **Fix:** `sanitize_log_field` replaces control characters with `U+FFFD` in those
+  fields before the human output. Test: `console_output_is_not_log_injectable`.
+
+### Full effective-set deprivilege (hardening, implemented + matrix-validated)
+The capability hardening (#25) previously dropped only the *bounding* set (prevents
+re-acquisition, not use). `JINNGUARD_HARDEN_CAPS=1` now also reduces the live
+(effective + permitted) set to `RETAINED_CAPS` via `capset(2)` after BPF attach, so a
+post-compromise daemon cannot wield a dangerous capability. The real-kernel matrix
+runs its armed enforcement tests with hardening enabled (5.14/6.12/6.17), so a drop
+that broke BPF map ops / `/proc` enrichment / enforcement fails CI. Unit test
+`effective_retained_mask_keeps_required_drops_dangerous` pins the mask invariants.
+
+## Remaining surfaces (future batches)
+
 - Per-request secret re-read inside the connection loop (a missing-file mid-connection
   triggers `fatal`/exit — fail-closed, but a privileged local actor can crash the
   daemon; low severity, fix deferred to a batch that reworks secret caching).
-- Integration-level flows (multi-step lineage, quota accounting) and the explainability
-  emitter's handling of attacker-controlled fields in log output.
+- Integration-level flows (multi-step lineage, quota accounting).

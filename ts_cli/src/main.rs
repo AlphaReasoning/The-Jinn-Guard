@@ -2823,6 +2823,27 @@ mod exit_code_tests {
     }
 
     #[test]
+    fn effective_retained_mask_keeps_required_drops_dangerous() {
+        use super::capability_hardening::{retained_mask, DROP_FROM_BOUNDING_SET, RETAINED_CAPS};
+        let mask = retained_mask();
+        // Every retained capability's bit is set in the effective-set mask…
+        for (name, cap) in RETAINED_CAPS {
+            assert!(
+                mask & (1u64 << cap) != 0,
+                "retained mask must keep {name} (cap {cap}) the daemon needs at runtime"
+            );
+        }
+        // …and every bounding-set drop is also cleared from the effective mask,
+        // so a deprivileged daemon can neither hold nor re-acquire it.
+        for (name, cap) in DROP_FROM_BOUNDING_SET {
+            assert!(
+                mask & (1u64 << cap) == 0,
+                "retained mask must not keep dropped capability {name} (cap {cap})"
+            );
+        }
+    }
+
+    #[test]
     fn startup_failure_codes_are_distinct() {
         let codes = [
             exit_codes::EX_UNAVAILABLE,
@@ -3899,6 +3920,79 @@ pub mod capability_hardening {
             "[hardening] dropped {dropped}/{} dangerous capabilities from the bounding set",
             DROP_FROM_BOUNDING_SET.len()
         );
+
+        // Effective-set deprivilege: reduce the live (effective + permitted)
+        // capability set to exactly RETAINED_CAPS, so the daemon cannot *use* a
+        // dangerous capability post-compromise — not merely cannot re-acquire it
+        // (which is all the bounding-set drop above achieves). Best-effort.
+        match drop_effective_to_retained() {
+            Ok(()) => eprintln!(
+                "[hardening] reduced effective/permitted caps to the {} required by the daemon",
+                RETAINED_CAPS.len()
+            ),
+            Err(e) => eprintln!(
+                "[hardening] warning: effective-set deprivilege failed ({e}); \
+                 bounding-set drop still applied"
+            ),
+        }
+    }
+
+    /// 64-bit mask of the capabilities the daemon retains at runtime.
+    pub fn retained_mask() -> u64 {
+        RETAINED_CAPS
+            .iter()
+            .fold(0u64, |m, (_, cap)| m | (1u64 << cap))
+    }
+
+    /// Set the calling process's effective + permitted (and inheritable)
+    /// capability sets to exactly [`RETAINED_CAPS`] via `capset(2)`. Reducing one's
+    /// own capabilities never requires extra privilege, so this only ever *removes*
+    /// caps. Returns `Err(errno)` if the syscall fails.
+    ///
+    /// The pinned `libc` crate does not expose the capset structs, so the kernel
+    /// ABI (`linux/capability.h`, `_LINUX_CAPABILITY_VERSION_3`) is declared here
+    /// and invoked through the raw `SYS_capset` syscall.
+    pub fn drop_effective_to_retained() -> Result<(), i32> {
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+
+        let mask = retained_mask();
+        let header = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0, // the calling process
+        };
+        // v3 uses two 32-bit data slots: caps 0-31 and 32-63.
+        let data = [
+            CapData {
+                effective: (mask & 0xffff_ffff) as u32,
+                permitted: (mask & 0xffff_ffff) as u32,
+                inheritable: 0,
+            },
+            CapData {
+                effective: (mask >> 32) as u32,
+                permitted: (mask >> 32) as u32,
+                inheritable: 0,
+            },
+        ];
+        let r =
+            unsafe { libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        }
     }
 }
 
