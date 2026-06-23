@@ -9,6 +9,17 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Confused-deputy detection: governed connects to orchestrator/init control
+  sockets are now surfaced (JG #58).** The kernel already *denies* a governed
+  agent's connect to docker/containerd/podman/crio/libvirt/D-Bus/systemd control
+  sockets (#55); this adds the operator-facing *detection* signal. Every such
+  attempt emits a single greppable `[JINNGUARD DEPUTY ALERT]` line (pid,
+  orchestrator, socket, verdict, process) and increments a new Prometheus counter
+  `jinnguard_orchestrator_socket_attempts_total{orchestrator,verdict}`. An `allow`
+  here is the louder alarm — it means a deputy path is open. Detection only: it
+  never changes the verdict. The classifier is a pure, exhaustively unit-tested
+  function (exact-match, `/run` vs `/var/run`, non-orchestrator/abstract/IP
+  destinations rejected) that mirrors the in-kernel denylist.
 - **Anti-lockout invariants regression-tested on real kernels (JG #43).** Two new
   armed `kernel_lsm` tests assert the guarantees that keep governance from bricking
   the host: (1) `test_kernel_ungoverned_host_is_never_locked_out` — the dual of the

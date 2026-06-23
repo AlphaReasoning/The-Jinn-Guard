@@ -45,10 +45,10 @@ use ts_checker::PolicyEngine;
 use ts_wire::{BodyReject, FrameReject, SignedEnvelope};
 use z3::{Config as Z3Config, Context as Z3Context};
 
-use ebpf_monitor::{LsmRequest, Verdict};
+use ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
 
 #[cfg(feature = "kernel_telemetry")]
-use ebpf_monitor::{LsmPathResolutionCache, LsmRequestType};
+use ebpf_monitor::LsmPathResolutionCache;
 
 // TelemetryStore maps kernel PID → list of kernel telemetry events
 // Feature-gated: in non-kernel-telemetry builds this is a stub.
@@ -2219,6 +2219,12 @@ fn run_lsm_verdict_loop(
             let denied = matches!(verdict, Verdict::Deny);
             metrics::record_kernel_decision(denied);
             emit_lsm_decision_explanation(&request, verdict);
+            // #58: surface confused-deputy attempts (governed connect to an
+            // orchestrator/init control socket) for operator visibility. Detection
+            // only; the enforcement decision already happened above and in-kernel.
+            if let Some(alert) = classify_deputy_connect(&request, verdict) {
+                alert.report();
+            }
 
             {
                 let mut store = telemetry_store.lock().unwrap();
@@ -2340,6 +2346,249 @@ fn lsm_intent_response_verdict(
     }
 
     None
+}
+
+/// #58 — orchestrator/init control sockets whose connect, from a *governed*
+/// agent, is a confused-deputy signal: the agent is reaching for a daemon that
+/// holds ungoverned root authority (container runtimes, libvirt, the system
+/// D-Bus, the systemd private socket). This is the user-space *detection* mirror
+/// of the in-kernel denylist (#55, `ORCHESTRATOR_CONTROL_SOCKETS` in
+/// `ebpf_monitor.rs`); the two lists must stay in sync — the
+/// `deputy_socket_paths_match_kernel_denylist` test pins that.
+const ORCHESTRATOR_CONTROL_SOCKETS: &[(&str, &str)] = &[
+    ("/run/docker.sock", "docker"),
+    ("/var/run/docker.sock", "docker"),
+    ("/run/containerd/containerd.sock", "containerd"),
+    ("/var/run/containerd/containerd.sock", "containerd"),
+    ("/run/podman/podman.sock", "podman"),
+    ("/var/run/podman/podman.sock", "podman"),
+    ("/run/crio/crio.sock", "crio"),
+    ("/var/run/crio/crio.sock", "crio"),
+    ("/run/libvirt/libvirt-sock", "libvirt"),
+    ("/var/run/libvirt/libvirt-sock", "libvirt"),
+    ("/run/libvirt/libvirt-sock-ro", "libvirt"),
+    ("/var/run/libvirt/libvirt-sock-ro", "libvirt"),
+    ("/run/dbus/system_bus_socket", "dbus"),
+    ("/var/run/dbus/system_bus_socket", "dbus"),
+    ("/run/systemd/private", "systemd"),
+    ("/var/run/systemd/private", "systemd"),
+];
+
+/// Return the orchestrator label if `path` is a known orchestrator/init control
+/// socket, else `None`. Exact pathname match (mirrors the in-kernel denylist);
+/// an abstract-namespace socket reads as "" and never matches.
+#[allow(dead_code)] // used by the kernel_telemetry verdict path + tests
+fn orchestrator_control_socket(path: &str) -> Option<&'static str> {
+    ORCHESTRATOR_CONTROL_SOCKETS
+        .iter()
+        .find(|(socket, _)| *socket == path)
+        .map(|(_, label)| *label)
+}
+
+/// A governed agent's attempt to reach an orchestrator/init control socket.
+/// Surfaced for operator visibility regardless of the verdict — an `allow` is
+/// the louder signal, since it means a confused-deputy path is still open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct DeputyConnectAlert {
+    orchestrator: &'static str,
+    socket: String,
+    denied: bool,
+    pid: u32,
+    process: Option<String>,
+}
+
+#[allow(dead_code)]
+impl DeputyConnectAlert {
+    /// Emit the operator-facing detection signal: a single greppable log line
+    /// plus a Prometheus counter increment. Detection only — the enforcement
+    /// decision is the kernel denylist's (#55); this never changes the verdict.
+    fn report(&self) {
+        println!(
+            "[JINNGUARD DEPUTY ALERT] pid={} orchestrator={} socket={} verdict={} process={}",
+            self.pid,
+            self.orchestrator,
+            self.socket,
+            if self.denied { "DENY" } else { "ALLOW" },
+            self.process.as_deref().unwrap_or("?"),
+        );
+        metrics::record_orchestrator_socket_attempt(self.orchestrator, self.denied);
+    }
+}
+
+/// Classify a resolved LSM request as a deputy-socket connect attempt, if it is
+/// one. Only AF_UNIX `Connect` requests to a known orchestrator socket qualify;
+/// everything else (IP connects, execs, inode ops, ordinary unix sockets)
+/// returns `None`.
+#[allow(dead_code)] // used by the kernel_telemetry verdict path + tests
+fn classify_deputy_connect(request: &LsmRequest, verdict: Verdict) -> Option<DeputyConnectAlert> {
+    if request.req_type != LsmRequestType::Connect {
+        return None;
+    }
+    if request.family as i32 != libc::AF_UNIX {
+        return None;
+    }
+    let socket = request.effective_path();
+    let orchestrator = orchestrator_control_socket(socket)?;
+    Some(DeputyConnectAlert {
+        orchestrator,
+        socket: socket.to_string(),
+        denied: matches!(verdict, Verdict::Deny),
+        pid: request.pid,
+        process: request.process_path.clone(),
+    })
+}
+
+#[cfg(test)]
+mod deputy_detection_tests {
+    use super::*;
+
+    fn unix_connect(resource: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 7,
+            pid: 4242,
+            req_type: LsmRequestType::Connect,
+            source_program: 0,
+            family: libc::AF_UNIX as u16,
+            tty: None,
+            is_interactive: false,
+            process_path: Some("/usr/bin/agent".to_string()),
+            resource: resource.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    #[test]
+    fn orchestrator_sockets_classify_to_their_label() {
+        assert_eq!(
+            orchestrator_control_socket("/run/docker.sock"),
+            Some("docker")
+        );
+        // /var/run is a symlink to /run on most distros, but an agent may use
+        // either literal path, so both are listed.
+        assert_eq!(
+            orchestrator_control_socket("/var/run/docker.sock"),
+            Some("docker")
+        );
+        assert_eq!(
+            orchestrator_control_socket("/run/containerd/containerd.sock"),
+            Some("containerd")
+        );
+        assert_eq!(
+            orchestrator_control_socket("/run/libvirt/libvirt-sock-ro"),
+            Some("libvirt")
+        );
+        assert_eq!(
+            orchestrator_control_socket("/run/dbus/system_bus_socket"),
+            Some("dbus")
+        );
+        assert_eq!(
+            orchestrator_control_socket("/run/systemd/private"),
+            Some("systemd")
+        );
+    }
+
+    #[test]
+    fn non_orchestrator_paths_do_not_classify() {
+        // Ordinary application sockets, the empty abstract-namespace read, and an
+        // IP-style connect resource must all be ignored.
+        assert_eq!(orchestrator_control_socket("/tmp/app.sock"), None);
+        assert_eq!(orchestrator_control_socket("/run/myapp/app.sock"), None);
+        assert_eq!(orchestrator_control_socket(""), None);
+        assert_eq!(orchestrator_control_socket("10.0.0.1:80"), None);
+        // A path that merely contains a known socket name but is not an exact
+        // match must not classify (exact-match semantics, mirroring the kernel).
+        assert_eq!(orchestrator_control_socket("/run/docker.sock.evil"), None);
+        assert_eq!(orchestrator_control_socket("/home/x/run/docker.sock"), None);
+    }
+
+    #[test]
+    fn classify_flags_denied_and_allowed_attempts() {
+        let denied = classify_deputy_connect(&unix_connect("/run/docker.sock"), Verdict::Deny)
+            .expect("docker connect must classify");
+        assert_eq!(denied.orchestrator, "docker");
+        assert_eq!(denied.socket, "/run/docker.sock");
+        assert!(denied.denied);
+        assert_eq!(denied.pid, 4242);
+        assert_eq!(denied.process.as_deref(), Some("/usr/bin/agent"));
+
+        // An ALLOW outcome is still reported — it is the louder signal (the
+        // confused-deputy path was open).
+        let allowed =
+            classify_deputy_connect(&unix_connect("/run/podman/podman.sock"), Verdict::Allow)
+                .expect("podman connect must classify");
+        assert_eq!(allowed.orchestrator, "podman");
+        assert!(!allowed.denied);
+    }
+
+    #[test]
+    fn ordinary_unix_connect_is_not_a_deputy_alert() {
+        assert!(classify_deputy_connect(&unix_connect("/tmp/app.sock"), Verdict::Allow).is_none());
+    }
+
+    #[test]
+    fn non_unix_connect_is_not_a_deputy_alert() {
+        // Same destination string but AF_INET — not a unix-socket connect.
+        let mut req = unix_connect("/run/docker.sock");
+        req.family = libc::AF_INET as u16;
+        assert!(classify_deputy_connect(&req, Verdict::Deny).is_none());
+    }
+
+    #[test]
+    fn non_connect_request_is_not_a_deputy_alert() {
+        // An execve whose resource happens to look like a socket path must not be
+        // misread as a connect attempt.
+        let mut req = unix_connect("/run/docker.sock");
+        req.req_type = LsmRequestType::Execve;
+        assert!(classify_deputy_connect(&req, Verdict::Deny).is_none());
+    }
+
+    #[test]
+    fn every_listed_socket_classifies_to_a_known_label() {
+        // Pins the detection list to the kernel denylist's shape (#55,
+        // ORCHESTRATOR_CONTROL_SOCKETS in ebpf_monitor.rs): exactly these labels,
+        // every entry resolvable. If the kernel list changes, update both.
+        let mut labels: Vec<&str> = ORCHESTRATOR_CONTROL_SOCKETS
+            .iter()
+            .map(|(path, label)| {
+                assert_eq!(
+                    orchestrator_control_socket(path),
+                    Some(*label),
+                    "listed socket {path} must classify to {label}"
+                );
+                *label
+            })
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels,
+            [
+                "containerd",
+                "crio",
+                "dbus",
+                "docker",
+                "libvirt",
+                "podman",
+                "systemd"
+            ]
+        );
+    }
+
+    #[test]
+    fn report_increments_metric_with_labels() {
+        let alert = classify_deputy_connect(&unix_connect("/run/crio/crio.sock"), Verdict::Deny)
+            .expect("crio connect must classify");
+        alert.report();
+        let rendered = metrics::render();
+        assert!(
+            rendered.contains(
+                "jinnguard_orchestrator_socket_attempts_total{orchestrator=\"crio\",verdict=\"deny\"}"
+            ),
+            "metric line missing from render:\n{rendered}"
+        );
+    }
 }
 
 #[cfg(feature = "kernel_telemetry")]
