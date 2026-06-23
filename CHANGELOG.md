@@ -60,6 +60,14 @@ Operability and review-driven hardening (moving toward pilot-ready).
   model-based scoring and interpreter child-process attribution to the open items.
 
 ### Added
+- **`SECURITY_ARCHITECTURE.md` — security architecture & trust-boundary doc (JG #39).**
+  The structural companion to `THREAT_MODEL.md`: the two-plane enforcement model
+  (cooperative user-space gate chain + non-cooperative kernel eBPF-LSM floor), the
+  crate/module map, all 10 LSM hooks, an 8-row trust-boundary table, the
+  cooperative/non-cooperative data flows, the audit/data-protection plane, the
+  open-core boundary, key management, and the fail-closed posture — each tied to
+  real code and cross-linked to the threat model. Linked from `README.md` and
+  `THREAT_MODEL.md` §1.
 - **Signed fleet-policy client hook (`--fleet-policy-url`), gated behind the
   `fleet` Cargo feature** (part of `--features enterprise`; **off by default**).
   When built with the feature, the daemon can pull a signed, versioned
