@@ -164,6 +164,11 @@ pub struct NetworkPolicy {
     pub denied_ips: Vec<String>,
     #[serde(default)]
     pub allowed_unix_sockets: Vec<String>,
+    /// #56: when true, governed-scope AF_UNIX connects are deny-by-default —
+    /// only `allowed_unix_sockets` (plus the Jinn Guard control socket, always
+    /// permitted for anti-lockout) may be reached. Independent of `default_deny`.
+    #[serde(default)]
+    pub unix_default_deny: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2122,6 +2127,7 @@ fn jinnguard_safe_mode_enabled() -> bool {
 fn start_lsm_verdict_loop(
     active_policy: Arc<Mutex<PolicyConfig>>,
     telemetry_store: TelemetryStore,
+    socket_path: &str,
 ) -> Result<()> {
     let enterprise_required = enterprise_kernel_telemetry_required();
     let safe_mode = jinnguard_safe_mode_enabled();
@@ -2142,7 +2148,7 @@ fn start_lsm_verdict_loop(
 
     let policy_snapshot = active_policy.lock().unwrap().clone();
     monitor
-        .configure_policy(&policy_snapshot, safe_mode)
+        .configure_policy(&policy_snapshot, safe_mode, socket_path)
         .map_err(|err| {
             anyhow::anyhow!("fail-closed: failed to configure in-kernel LSM policy maps: {err}")
         })?;
@@ -2173,6 +2179,7 @@ fn start_lsm_verdict_loop(
 fn start_lsm_verdict_loop(
     _active_policy: Arc<Mutex<PolicyConfig>>,
     _telemetry_store: TelemetryStore,
+    _socket_path: &str,
 ) -> Result<()> {
     if enterprise_kernel_telemetry_required() {
         return Err(anyhow::anyhow!(
@@ -3657,9 +3664,11 @@ async fn run() -> Result<()> {
     }
 
     eprintln!("[startup] initializing LSM verdict loop");
-    if let Err(err) =
-        start_lsm_verdict_loop(Arc::clone(&active_policy), Arc::clone(&telemetry_store))
-    {
+    if let Err(err) = start_lsm_verdict_loop(
+        Arc::clone(&active_policy),
+        Arc::clone(&telemetry_store),
+        &args.socket_path,
+    ) {
         // Fail-closed kernel-telemetry startup gets its own code so a supervisor
         // can distinguish "kernel LSM unavailable" from a generic crash.
         exit_codes::fatal(

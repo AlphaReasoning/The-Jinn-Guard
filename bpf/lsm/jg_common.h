@@ -51,6 +51,7 @@
 // runtime_controls is a single-slot u32 bitfield (key 0) shared by all hooks.
 #define JG_CONTROL_AUDIT_ONLY 1            // bit 0: observe-only, never deny
 #define JG_CONTROL_CONNECT_DEFAULT_DENY 2  // bit 1: deny non-allowlisted egress
+#define JG_CONTROL_UNIX_DEFAULT_DENY 4     // bit 2: deny non-allowlisted AF_UNIX
 
 #define JG_CORE_FIELD_PTR(ptr, type, field) \
     ((const void *)((const char *)(ptr) + bpf_core_field_offset(type, field)))
@@ -70,6 +71,19 @@
     __u32 *__jg_dd_value =                                         \
         bpf_map_lookup_elem((runtime_controls), &__jg_dd_key);    \
     __jg_dd_value && (*__jg_dd_value & JG_CONTROL_CONNECT_DEFAULT_DENY); \
+})
+
+// Bit 2 of runtime_controls: when set, governed-scope AF_UNIX connects are
+// default-deny — only explicitly allow-listed socket paths (plus the Jinn Guard
+// control socket, which the daemon always allow-lists for anti-lockout) are
+// permitted; everything else, including abstract-namespace sockets, is denied.
+// Opt-in and independent of the IPv4 default-deny bit, so enabling network
+// default-deny does not silently sever the agent's local IPC (JG #56).
+#define jg_unix_default_deny_enabled(runtime_controls) ({          \
+    __u32 __jg_ud_key = 0;                                         \
+    __u32 *__jg_ud_value =                                         \
+        bpf_map_lookup_elem((runtime_controls), &__jg_ud_key);    \
+    __jg_ud_value && (*__jg_ud_value & JG_CONTROL_UNIX_DEFAULT_DENY); \
 })
 
 // True for 127.0.0.0/8. `addr` is the raw 4 bytes of sin_addr.s_addr read into a

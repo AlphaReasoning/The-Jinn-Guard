@@ -377,10 +377,17 @@ helpers, and **privileged MCP tool servers** reachable by non-denylisted paths.
    default-deny under `network_policy.default_deny`, allow-listed destinations
    plus loopback only, with IPv6 failing closed — so a non-cooperating nested
    process cannot reach the network off an allowlist either.)
-2. **Deny-by-default IPC egress allowlist** for governed agents (#56, future):
-   only explicitly permitted AF_UNIX endpoints; all others denied by default
-   (today AF_UNIX is denylist-based so the agent can still reach the Jinn Guard
-   socket and other non-denylisted endpoints).
+2. **Deny-by-default IPC egress allowlist — IMPLEMENTED (#56).** With
+   `network_policy.unix_default_deny` set, governed-scope AF_UNIX connects are
+   default-deny: only `allowed_unix_sockets` (plus the Jinn Guard control socket,
+   which the daemon always self-allow-lists for anti-lockout) may be reached;
+   every other path, including abstract-namespace sockets, is denied. The flag is
+   independent of the IPv4 `default_deny` bit, so enabling network default-deny
+   never silently severs the agent's local IPC. The #55 orchestrator denylist
+   still applies on top (a denylisted path is denied regardless of the allowlist).
+   **Residual:** abstract-namespace sockets cannot be allow-listed by path, so
+   under this mode they are unconditionally denied (acceptable for the opt-in
+   deny-by-default posture; documented).
 3. **Govern the deputy / propagate identity** (the complete but hard fix): the
    deputy acts under the caller's capability rather than its ambient root
    (designation = authority). Attribution across a shared daemon is genuinely hard.

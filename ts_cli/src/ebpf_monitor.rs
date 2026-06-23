@@ -374,6 +374,8 @@ pub mod aya_backend {
     const JG_CONTROL_AUDIT_ONLY: u32 = 1;
     // Bit 1: deny non-allowlisted governed-scope network egress (#54).
     const JG_CONTROL_CONNECT_DEFAULT_DENY: u32 = 2;
+    // Bit 2: deny non-allowlisted governed-scope AF_UNIX egress (#56).
+    const JG_CONTROL_UNIX_DEFAULT_DENY: u32 = 4;
     // Key 0 of the per-object `governed_scope` array. Value 0 = govern every
     // task (historical/deployed default); a non-zero cgroup-v2 id confines
     // enforcement to that one cgroup so the operator's desktop is never denied.
@@ -553,6 +555,8 @@ pub mod aya_backend {
         ipv4_allowlist: Option<AyaHashMap<MapData, u32, u8>>,
         // #55: AF_UNIX orchestrator/control-socket denylist for socket_connect.
         unix_denylist: Option<AyaHashMap<MapData, PathKey, u8>>,
+        // #56: AF_UNIX egress allowlist, consulted under UNIX default-deny.
+        unix_allowlist: Option<AyaHashMap<MapData, PathKey, u8>>,
         allowed_exec_paths: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_basenames: Option<AyaHashMap<MapData, PathKey, u8>>,
         denied_dir_inodes: Option<AyaHashMap<MapData, InodeKey, u8>>,
@@ -742,8 +746,13 @@ pub mod aya_backend {
             &mut self,
             policy: &PolicyConfig,
             safe_mode: bool,
+            daemon_socket_path: &str,
         ) -> Result<()> {
-            self.configure_runtime_controls(safe_mode, policy.network_policy.default_deny)?;
+            self.configure_runtime_controls(
+                safe_mode,
+                policy.network_policy.default_deny,
+                policy.network_policy.unix_default_deny,
+            )?;
 
             for object in &mut self.objects {
                 if let Some(map) = object.ipv4_denylist.as_mut() {
@@ -754,6 +763,9 @@ pub mod aya_backend {
                 }
                 if let Some(map) = object.unix_denylist.as_mut() {
                     configure_unix_denylist(map, policy, object.object_path)?;
+                }
+                if let Some(map) = object.unix_allowlist.as_mut() {
+                    configure_unix_allowlist(map, policy, daemon_socket_path, object.object_path)?;
                 }
                 if let Some(map) = object.allowed_exec_paths.as_mut() {
                     configure_allowed_exec_paths(map, policy, object.object_path)?;
@@ -790,6 +802,7 @@ pub mod aya_backend {
             &mut self,
             safe_mode: bool,
             default_deny: bool,
+            unix_default_deny: bool,
         ) -> Result<()> {
             let mut control_value = 0u32;
             if safe_mode {
@@ -797,6 +810,9 @@ pub mod aya_backend {
             }
             if default_deny {
                 control_value |= JG_CONTROL_CONNECT_DEFAULT_DENY;
+            }
+            if unix_default_deny {
+                control_value |= JG_CONTROL_UNIX_DEFAULT_DENY;
             }
             for object in &mut self.objects {
                 let Some(map) = object.runtime_controls.as_mut() else {
@@ -1007,6 +1023,7 @@ pub mod aya_backend {
         let ipv4_denylist = optional_hash_map(&mut bpf, "ipv4_denylist", object_path)?;
         let ipv4_allowlist = optional_hash_map(&mut bpf, "ipv4_allowlist", object_path)?;
         let unix_denylist = optional_hash_map(&mut bpf, "unix_denylist", object_path)?;
+        let unix_allowlist = optional_hash_map(&mut bpf, "unix_allowlist", object_path)?;
         let allowed_exec_paths = optional_hash_map(&mut bpf, "allowed_exec_paths", object_path)?;
         let denied_basenames = optional_hash_map(&mut bpf, "denied_basenames", object_path)?;
         let denied_dir_inodes = optional_hash_map(&mut bpf, "denied_dir_inodes", object_path)?;
@@ -1025,6 +1042,7 @@ pub mod aya_backend {
                 ipv4_denylist,
                 ipv4_allowlist,
                 unix_denylist,
+                unix_allowlist,
                 allowed_exec_paths,
                 denied_basenames,
                 denied_dir_inodes,
@@ -1236,6 +1254,40 @@ pub mod aya_backend {
             map.insert(key, 1, 0).map_err(|e| {
                 anyhow!(
                     "Failed to populate unix_denylist entry '{}' in {}: {}",
+                    path,
+                    object_path,
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// #56: populate the AF_UNIX egress allowlist from
+    /// `network_policy.allowed_unix_sockets`, plus the Jinn Guard control socket
+    /// itself — which is added unconditionally so a governed agent can always
+    /// reach its own governor even under UNIX default-deny (anti-lockout).
+    fn configure_unix_allowlist(
+        map: &mut AyaHashMap<MapData, PathKey, u8>,
+        policy: &PolicyConfig,
+        daemon_socket_path: &str,
+        object_path: &str,
+    ) -> Result<()> {
+        let entries = std::iter::once(daemon_socket_path).chain(
+            policy
+                .network_policy
+                .allowed_unix_sockets
+                .iter()
+                .map(String::as_str),
+        );
+        for path in entries {
+            let key = path_key(path);
+            if key.path[0] == 0 {
+                continue;
+            }
+            map.insert(key, 1, 0).map_err(|e| {
+                anyhow!(
+                    "Failed to populate unix_allowlist entry '{}' in {}: {}",
                     path,
                     object_path,
                     e
