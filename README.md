@@ -237,8 +237,12 @@ repo — happy to talk.
 | **Behavioral drift** | Statistical drift detector on `fused_risk` delta against lineage baseline (`DENY_BEHAVIORAL_DRIFT`). |
 | **Z3 totality proof** | Every request passes through `execute_totality_audit()` — mathematical proof that `fused_risk ≤ upper_safety_boundary`. |
 | **Z3 invariants** | Per-agent declarative constraints (`spending_ceiling_usd`, `privilege_escalation_depth`, etc.) verified against daemon-computed runtime state. Callers cannot spoof daemon-observed values. |
-| **Audit log** | Hash-chained JSONL log. Each entry includes the SHA-256 of the previous entry — tamper evident. |
+| **Audit log** | Hash-chained JSONL log (each entry includes the SHA-256 of the previous — tamper evident), and **erasure-safe**: personal data is kept out of the chain and crypto-shredded on a GDPR Art. 17 request, with the chain still verifying. See [`THREAT_MODEL.md` §12](THREAT_MODEL.md). |
 | **eBPF telemetry** | Kernel-level visibility into execve, file open, network connect, and capability checks — correlated with governance decisions. |
+
+> **Architecture & trust boundaries:** [`SECURITY_ARCHITECTURE.md`](SECURITY_ARCHITECTURE.md)
+> (components, data flow, the two enforcement planes, the open-core boundary).
+> **Adversary model & threat→mitigation evidence:** [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 ---
 
@@ -569,7 +573,7 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 
 | Item | Status |
 |---|---|
-| eBPF compilation gated in CI (compiles all 5 LSM objects, fails the build on a BPF regression) | ✅ Done |
+| eBPF compilation gated in CI (compiles all 10 LSM objects, fails the build on a BPF regression) | ✅ Done |
 | Structured, machine-parseable CLI exit codes for startup failures (`code=`/`kind=`) | ✅ Done |
 | Opt-in capability hardening after BPF load — `no_new_privs` + bounding-set drop (`JINNGUARD_HARDEN_CAPS=1`) | ✅ Done |
 | Prometheus `/metrics` + `/healthz` endpoint (opt-in `JINNGUARD_METRICS_PORT`, loopback) | ✅ Done |

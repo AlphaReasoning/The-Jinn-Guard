@@ -20,6 +20,11 @@ the code and, where possible, to an automated test or a live validation result.
 
 ## 1. System overview and trust boundaries
 
+> For the structural view — components, module/crate layout, data-flow diagrams,
+> the open-core boundary, and the full trust-boundary table — see the companion
+> [`SECURITY_ARCHITECTURE.md`](SECURITY_ARCHITECTURE.md). This section summarizes
+> the boundaries that the threat analysis below depends on.
+
 Jinn Guard mediates the actions of an autonomous AI agent at the operating-system
 boundary, treating the agent as **untrusted**. There are two enforcement planes:
 
