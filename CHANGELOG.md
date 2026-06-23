@@ -9,6 +9,22 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **GDPR/erasure-safe audit logging — crypto-shredding + data minimisation (JG #61).**
+  The tamper-evident SHA-256 hash chain previously embedded personal data
+  (uid/gid, executable path, full command-line argv) directly in each entry,
+  putting immutability in conflict with the **right to erasure (Art. 17)** and
+  **storage limitation (Art. 5(1)(e))**. Now the chain commits only to a
+  *PII-free* projection: a per-install **subject pseudonym** (Art. 4(5)), an
+  opaque `pii_ref`, and an **`HMAC(per-record salt, PII)` commitment**. The actual
+  personal data lives in a separate, erasable `audit_pii` store. `erase_subject()`
+  deletes a subject's rows (and their commitment salts) — **crypto-shredding**:
+  the data becomes unrecoverable while *every hash in the chain still verifies*.
+  `verify_chain()` returns the same intact result before and after erasure (pinned
+  by a unit test). Adds `read_subject_pii()` for **right of access (Art. 15)** and
+  an opt-in **argv data-minimisation** mode (`JINNGUARD_AUDIT_MINIMIZE_ARGV=1` or
+  `AuditLogger::with_argv_minimization`) that never persists argument *values*.
+  No new dependencies (HMAC-SHA256 + `/dev/urandom`); `log()`'s signature and all
+  call sites are unchanged — redaction happens inside the logger.
 - **Confused-deputy detection: governed connects to orchestrator/init control
   sockets are now surfaced (JG #58).** The kernel already *denies* a governed
   agent's connect to docker/containerd/podman/crio/libvirt/D-Bus/systemd control

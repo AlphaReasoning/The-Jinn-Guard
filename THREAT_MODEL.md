@@ -513,3 +513,35 @@ sudo bash scripts/run_professor_validation.sh --arm
 
 Each tier's PASS maps directly back to the evidence keys in §5. See
 [`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md) for the per-tier breakdown.
+
+## 12. Data protection in the audit log (GDPR / Datenschutz)
+
+The audit log is an append-only **SHA-256 hash chain**: each entry commits to the
+previous entry's hash, so any modification or deletion of past records is
+detectable (integrity / accountability — Art. 5(1)(f), 5(2), 32). That
+immutability collides with the **right to erasure (Art. 17)** and **storage
+limitation (Art. 5(1)(e))**, which Jinn Guard resolves by keeping personal data
+**out of the chain** (#61):
+
+- **What the chain stores** is a PII-free projection: a per-install
+  **subject pseudonym** (`HMAC(install-salt, uid)`, Art. 4(5) pseudonymisation),
+  an opaque `pii_ref`, and a commitment `HMAC(per-record salt, PII)`. None of the
+  identifying or content fields (uid/gid, executable path, command-line argv)
+  appear in the chain.
+- **Personal data** lives in a separate, erasable `audit_pii` store. **Erasure**
+  (`erase_subject`) deletes a subject's rows together with their per-record salts.
+  Because the chain only ever held an HMAC under a now-destroyed salt, the
+  commitment can no longer be linked to or brute-forced against any candidate
+  plaintext — **crypto-shredding**. Every chain hash still verifies
+  (`verify_chain` returns the same intact result before and after erasure).
+- **Right of access (Art. 15):** `read_subject_pii` returns the data still held
+  for a subject. **Data minimisation (Art. 5(1)(c)):** an opt-in mode never
+  persists command-line argument *values*, only their count.
+
+**Lawful basis / residuals.** Security and abuse-prevention logging is intended to
+rest on **legitimate interest (Art. 6(1)(f))**; a deployment must still set a
+retention period for `audit_pii` and complete a DPIA. The subject **pseudonym is
+reversible by the operator** holding the install salt (by design — it is
+pseudonymisation, not anonymisation); destroying that salt anonymises all
+remaining pseudonyms. `pid` is retained in the chain as low-sensitivity
+operational metadata.
