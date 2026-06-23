@@ -16,6 +16,7 @@
 // lineage, and audit log files and cleans them up after each test.
 
 use hmac::{Hmac, KeyInit, Mac};
+use rusqlite::{params, Connection};
 use sha2::Sha256;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -122,6 +123,35 @@ fn build_packet(
     packet
 }
 
+fn build_packet_with_path(
+    seq: u64,
+    intent: &str,
+    agent_id: Option<&str>,
+    risk: f64,
+    path: &str,
+) -> Vec<u8> {
+    let agent_field = match agent_id {
+        Some(id) => format!(r#","agent_id":"{id}""#),
+        None => String::new(),
+    };
+    let payload = format!(
+        r#"{{"sequence_counter":{seq},"intent_name":"{intent}","action_risk_score":{risk}{agent_field},"path":{path:?}}}"#
+    );
+    let sig = sign_payload(&payload);
+    let envelope = serde_json::json!({
+        "payload": payload,
+        "signature": sig,
+    })
+    .to_string();
+
+    let body = envelope.as_bytes();
+    let mut packet = Vec::with_capacity(5 + body.len());
+    packet.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    packet.push(1u8);
+    packet.extend_from_slice(body);
+    packet
+}
+
 /// Read a framed response, return body as String.
 fn read_response(stream: &mut UnixStream) -> String {
     let mut header = [0u8; 5];
@@ -142,6 +172,33 @@ struct DaemonGuard {
     policy_path: String,
 }
 
+fn lineage_db_path(file_path: &str) -> String {
+    match file_path.strip_suffix(".json") {
+        Some(stem) => format!("{stem}.db"),
+        None => format!("{file_path}.db"),
+    }
+}
+
+fn cleanup_daemon_files(
+    socket_path: &str,
+    secret_path: &str,
+    lineage_path: &str,
+    audit_path: &str,
+    policy_path: &str,
+) {
+    for p in [
+        socket_path.to_string(),
+        secret_path.to_string(),
+        lineage_path.to_string(),
+        lineage_db_path(lineage_path),
+        audit_path.to_string(),
+        format!("{audit_path}.db"),
+        policy_path.to_string(),
+    ] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 impl DaemonGuard {
     fn spawn_with_policy(tag: &str, quota: u64, allowed_intents: &[&str]) -> Self {
         let socket_path = format!("/tmp/jg_test_{tag}.sock");
@@ -150,7 +207,13 @@ impl DaemonGuard {
         let audit_path = format!("/tmp/jg_test_{tag}.audit.log");
         let policy_path = format!("/tmp/jg_test_{tag}.policy.yaml");
 
-        let _ = std::fs::remove_file(&socket_path);
+        cleanup_daemon_files(
+            &socket_path,
+            &secret_path,
+            &lineage_path,
+            &audit_path,
+            &policy_path,
+        );
 
         write_policy(&policy_path, quota, allowed_intents);
         std::fs::write(&secret_path, TEST_SECRET).unwrap();
@@ -214,21 +277,29 @@ impl DaemonGuard {
         stream.flush().expect("flush");
         read_response(&mut stream)
     }
+
+    fn lineage_state(&self, agent_id: &str) -> (u64, u64) {
+        let conn = Connection::open(lineage_db_path(&self.lineage_path)).expect("open lineage db");
+        conn.query_row(
+            "SELECT last_sequence, decisions_seen FROM lineages WHERE key = ?1",
+            params![agent_id],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
+        .expect("lineage row")
+    }
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        for p in [
+        cleanup_daemon_files(
             &self.socket_path,
             &self.secret_path,
             &self.lineage_path,
             &self.audit_path,
             &self.policy_path,
-        ] {
-            let _ = std::fs::remove_file(p);
-        }
+        );
     }
 }
 
@@ -242,6 +313,70 @@ fn test_allow_low_risk_registered_agent() {
     let packet = build_packet(next_seq(), "read_file", Some("test_agent"), 5.0, None, None);
     let resp = daemon.send_recv(&packet);
     assert!(resp.contains("ALLOW"), "Expected ALLOW, got: {resp}");
+}
+
+#[test]
+fn test_cached_secret_survives_mid_connection_secret_file_removal() {
+    let daemon = DaemonGuard::spawn_with_policy("secret_cached", 0, &["read_file"]);
+    let mut stream = daemon.connect();
+
+    let p1 = build_packet(next_seq(), "read_file", Some("test_agent"), 5.0, None, None);
+    stream.write_all(&p1).expect("write first packet");
+    stream.flush().expect("flush first packet");
+    let r1 = read_response(&mut stream);
+    assert!(r1.contains("ALLOW"), "Expected first ALLOW, got: {r1}");
+
+    std::fs::remove_file(&daemon.secret_path).expect("remove backing secret file");
+
+    let p2 = build_packet(next_seq(), "read_file", Some("test_agent"), 5.0, None, None);
+    stream.write_all(&p2).expect("write second packet");
+    stream.flush().expect("flush second packet");
+    let r2 = read_response(&mut stream);
+    assert!(
+        r2.contains("ALLOW"),
+        "Expected cached startup secret to verify second request, got: {r2}"
+    );
+}
+
+#[test]
+fn test_out_of_order_sequence_is_denied_by_lineage() {
+    let daemon = DaemonGuard::spawn_with_policy("lineage_order", 0, &["read_file"]);
+    let high_seq = next_seq() + 10;
+    let low_seq = high_seq - 1;
+
+    let p1 = build_packet(high_seq, "read_file", Some("test_agent"), 5.0, None, None);
+    let r1 = daemon.send_recv(&p1);
+    assert!(r1.contains("ALLOW"), "Expected first ALLOW, got: {r1}");
+
+    let p2 = build_packet(low_seq, "read_file", Some("test_agent"), 5.0, None, None);
+    let r2 = daemon.send_recv(&p2);
+    assert!(
+        r2.contains("DENY_REPLAY_ATTACK"),
+        "Expected out-of-order sequence to be denied, got: {r2}"
+    );
+}
+
+#[test]
+fn test_outside_scope_fast_path_persists_lineage_state() {
+    let daemon = DaemonGuard::spawn_with_policy("outside_scope_lineage", 2, &["read_file"]);
+    let seq = next_seq();
+    let packet = build_packet_with_path(
+        seq,
+        "read_file",
+        Some("test_agent"),
+        5.0,
+        "/opt/non-test-zone/report.txt",
+    );
+
+    let resp = daemon.send_recv(&packet);
+    assert!(
+        resp.contains("ALLOW"),
+        "Expected outside-scope request to allow, got: {resp}"
+    );
+
+    let (last_sequence, decisions_seen) = daemon.lineage_state("test_agent");
+    assert_eq!(last_sequence, seq);
+    assert_eq!(decisions_seen, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +596,13 @@ fn spawn_daemon_with_mcp(tag: &str, mcp_port: u16) -> DaemonGuard {
     let audit_path = format!("/tmp/jg_test_{tag}.audit.log");
     let policy_path = format!("/tmp/jg_test_{tag}.policy.yaml");
 
-    let _ = std::fs::remove_file(&socket_path);
+    cleanup_daemon_files(
+        &socket_path,
+        &secret_path,
+        &lineage_path,
+        &audit_path,
+        &policy_path,
+    );
     write_policy(&policy_path, 0, &["model_inference"]);
     std::fs::write(&secret_path, TEST_SECRET).unwrap();
 
@@ -572,7 +713,13 @@ fn spawn_daemon_deny_anon(tag: &str) -> DaemonGuard {
     let audit_path = format!("/tmp/jg_test_{tag}.audit.log");
     let policy_path = format!("/tmp/jg_test_{tag}.policy.yaml");
 
-    let _ = std::fs::remove_file(&socket_path);
+    cleanup_daemon_files(
+        &socket_path,
+        &secret_path,
+        &lineage_path,
+        &audit_path,
+        &policy_path,
+    );
 
     // Write policy with deny_anonymous_agents = true.
     let yaml = r#"
