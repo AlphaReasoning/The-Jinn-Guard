@@ -1130,14 +1130,41 @@ pub struct AuditLogger {
     /// Without this, two concurrent governed decisions can both read the same
     /// last index and produce duplicate audit indices / a broken hash chain.
     write_guard: Mutex<()>,
-    /// Per-install secret salt that maps a uid to its stable `subject_pseudonym`
-    /// (Art. 4(5) pseudonymisation). Persisted once in `audit_meta`; held by the
-    /// operator so a data-subject request can be resolved to a pseudonym.
-    pseudonym_salt: Vec<u8>,
+    /// The currently-active pseudonym salt + its epoch (Art. 4(5) pseudonymisation).
+    /// Held behind a mutex so the salt can be *rotated* at runtime: each rotation
+    /// starts a new epoch, so a subject's future `subject_pseudonym` no longer links
+    /// to its past one. Every historical epoch's salt is retained in
+    /// `audit_salt_epoch` so erasure/access still cover records written under any
+    /// salt (see [`pseudonyms_for_uid_all_epochs`]). Held by the operator so a
+    /// data-subject request can be resolved to a pseudonym.
+    salt_state: Mutex<SaltState>,
+    /// #11 automated rotation: when set (`JINNGUARD_AUDIT_SALT_MAX_AGE_SECS`), a salt
+    /// older than this many seconds is rotated automatically at startup (and on any
+    /// explicit [`enforce_salt_rotation_policy`] call). `None`/0 disables auto-rotation,
+    /// preserving the prior single-salt behaviour.
+    salt_max_age_secs: Option<u64>,
     /// #61 data minimisation (Art. 5(1)(c)): when set (`JINNGUARD_AUDIT_MINIMIZE_ARGV=1`),
     /// command-line arguments are never persisted — only their count is kept — so
     /// the most sensitive free-text field is not collected in the first place.
     minimize_argv: bool,
+}
+
+/// The active pseudonym salt and the epoch it belongs to. A rotation installs a
+/// fresh `salt` under the next `epoch`; `created_secs` drives age-based rotation.
+#[derive(Debug, Clone)]
+struct SaltState {
+    salt: Vec<u8>,
+    epoch: i64,
+    created_secs: u64,
+}
+
+/// Pure rotation policy: is a salt created at `created_secs` due for rotation at
+/// `now`, given `max_age`? `None`/0 means rotation is disabled.
+fn salt_due_for_rotation(created_secs: u64, now: u64, max_age: Option<u64>) -> bool {
+    match max_age {
+        Some(m) if m > 0 => now.saturating_sub(created_secs) >= m,
+        _ => false,
+    }
 }
 
 impl AuditLogger {
@@ -1178,39 +1205,101 @@ impl AuditLogger {
                 created_secs    INTEGER
             );
             CREATE INDEX IF NOT EXISTS audit_pii_subject ON audit_pii(subject);
-            CREATE TABLE IF NOT EXISTS audit_meta (k TEXT PRIMARY KEY, v TEXT);",
+            CREATE TABLE IF NOT EXISTS audit_meta (k TEXT PRIMARY KEY, v TEXT);
+            -- #11 salt rotation: every pseudonym salt this install has ever used,
+            -- newest epoch active. Historical epochs are retained so a uid's PII
+            -- written under an old salt can still be located for erasure/access.
+            CREATE TABLE IF NOT EXISTS audit_salt_epoch (
+                epoch        INTEGER PRIMARY KEY AUTOINCREMENT,
+                salt         TEXT NOT NULL,
+                created_secs INTEGER NOT NULL
+            );",
         )
         .expect("AuditLogger: failed to create audit tables");
 
-        // Load (or generate once) the per-install pseudonym salt.
-        let pseudonym_salt = {
-            let existing: rusqlite::Result<String> = conn.query_row(
-                "SELECT v FROM audit_meta WHERE k = 'pseudonym_salt'",
-                [],
-                |row| row.get(0),
+        let now = now_unix_secs();
+
+        // Initialise the salt-epoch table on first use. If a legacy per-install
+        // salt exists (pre-rotation installs stored it in `audit_meta`), adopt it
+        // as epoch 1 so every pseudonym already written still resolves identically.
+        let epoch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_salt_epoch", [], |r| r.get(0))
+            .unwrap_or(0);
+        if epoch_count == 0 {
+            let legacy: Option<String> = conn
+                .query_row(
+                    "SELECT v FROM audit_meta WHERE k = 'pseudonym_salt'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            let salt_hex = match legacy {
+                Some(h) if hex::decode(&h).ok().filter(|s| !s.is_empty()).is_some() => h,
+                _ => hex::encode(os_random_bytes(32)),
+            };
+            let _ = conn.execute(
+                "INSERT INTO audit_salt_epoch (salt, created_secs) VALUES (?1, ?2)",
+                params![salt_hex, now as i64],
             );
-            match existing.ok().and_then(|h| hex::decode(h).ok()) {
-                Some(salt) if !salt.is_empty() => salt,
-                _ => {
-                    let salt = os_random_bytes(32);
-                    let _ = conn.execute(
-                        "INSERT OR REPLACE INTO audit_meta (k, v) VALUES ('pseudonym_salt', ?1)",
-                        params![hex::encode(&salt)],
-                    );
-                    salt
-                }
+        }
+
+        let salt_max_age_secs = std::env::var("JINNGUARD_AUDIT_SALT_MAX_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0);
+
+        // Load the active (highest) epoch, then auto-rotate it at startup if the
+        // configured max age has elapsed.
+        let mut active = Self::load_active_salt(&conn).expect("AuditLogger: no active salt epoch");
+        if salt_due_for_rotation(active.created_secs, now, salt_max_age_secs) {
+            if let Ok(rotated) = Self::insert_salt_epoch(&conn, now) {
+                active = rotated;
             }
-        };
+        }
 
         Self {
             file_path: file_path.to_string(),
             db: Arc::new(Mutex::new(conn)),
             write_guard: Mutex::new(()),
-            pseudonym_salt,
+            salt_state: Mutex::new(active),
+            salt_max_age_secs,
             minimize_argv: std::env::var("JINNGUARD_AUDIT_MINIMIZE_ARGV")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
         }
+    }
+
+    /// Read the active (highest-epoch) salt from the salt-epoch table.
+    fn load_active_salt(conn: &rusqlite::Connection) -> Result<SaltState> {
+        let (epoch, salt_hex, created): (i64, String, i64) = conn.query_row(
+            "SELECT epoch, salt, created_secs FROM audit_salt_epoch ORDER BY epoch DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(SaltState {
+            salt: hex::decode(&salt_hex).unwrap_or_default(),
+            epoch,
+            created_secs: created as u64,
+        })
+    }
+
+    /// Insert a fresh random salt as a new epoch and return it as the active salt.
+    fn insert_salt_epoch(conn: &rusqlite::Connection, now: u64) -> Result<SaltState> {
+        let salt = os_random_bytes(32);
+        conn.execute(
+            "INSERT INTO audit_salt_epoch (salt, created_secs) VALUES (?1, ?2)",
+            params![hex::encode(&salt), now as i64],
+        )?;
+        let epoch: i64 = conn.query_row(
+            "SELECT epoch FROM audit_salt_epoch ORDER BY epoch DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(SaltState {
+            salt,
+            epoch,
+            created_secs: now,
+        })
     }
 
     /// Builder override for argv data-minimisation (Art. 5(1)(c)). Defaults from
@@ -1221,11 +1310,104 @@ impl AuditLogger {
         self
     }
 
-    /// Stable pseudonym for a uid under this install's salt. Lets an operator map
-    /// a data-subject request (resolved to a uid) to the `subject_pseudonym`
-    /// recorded in the chain, then erase it via [`erase_subject`].
+    /// Stable pseudonym for a uid under this install's *active* salt. Stable until
+    /// the salt is rotated; after a rotation the same uid maps to a new pseudonym
+    /// (prior records keep their prior pseudonym). Lets an operator map a
+    /// data-subject request (resolved to a uid) to the `subject_pseudonym` recorded
+    /// in the chain, then erase it via [`erase_subject`] (or [`erase_uid`], which
+    /// covers every epoch).
     pub fn pseudonym_for_uid(&self, uid: u32) -> String {
-        hmac_hex(&self.pseudonym_salt, &uid.to_be_bytes())
+        let st = self
+            .salt_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hmac_hex(&st.salt, &uid.to_be_bytes())
+    }
+
+    /// The active salt epoch (monotonic; increments on every rotation). Epoch 1 is
+    /// the install's first salt.
+    pub fn active_salt_epoch(&self) -> i64 {
+        self.salt_state
+            .lock()
+            .map(|s| s.epoch)
+            .unwrap_or_else(|p| p.into_inner().epoch)
+    }
+
+    /// #11 Rotate the pseudonym salt: install a fresh epoch so a subject's *future*
+    /// pseudonym no longer links to its past one (strengthens Art. 4(5)
+    /// pseudonymisation / Art. 5(1)(c) minimisation against long-horizon
+    /// correlation). Historical epochs are retained, so erasure (Art. 17) and access
+    /// (Art. 15) still reach records written under any prior salt. Returns the new
+    /// epoch number. The hash chain is untouched and still verifies.
+    pub fn rotate_pseudonym_salt(&self) -> Result<i64> {
+        let now = now_unix_secs();
+        let rotated = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+            Self::insert_salt_epoch(&conn, now)?
+        };
+        let epoch = rotated.epoch;
+        let mut st = self
+            .salt_state
+            .lock()
+            .map_err(|_| anyhow!("AuditLogger: salt mutex poisoned"))?;
+        *st = rotated;
+        Ok(epoch)
+    }
+
+    /// Rotate the active salt if it is older than the configured max age
+    /// (`JINNGUARD_AUDIT_SALT_MAX_AGE_SECS`). Called at startup; can also be invoked
+    /// by a long-running daemon on a timer. Returns whether a rotation happened.
+    pub fn enforce_salt_rotation_policy(&self) -> Result<bool> {
+        let now = now_unix_secs();
+        let created = {
+            let st = self
+                .salt_state
+                .lock()
+                .map_err(|_| anyhow!("AuditLogger: salt mutex poisoned"))?;
+            st.created_secs
+        };
+        if salt_due_for_rotation(created, now, self.salt_max_age_secs) {
+            self.rotate_pseudonym_salt()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Every pseudonym a uid maps to across *all* salt epochs. Needed so an erasure
+    /// (Art. 17) or access (Art. 15) request covers records written under any salt
+    /// this install has used, not just the active one.
+    pub fn pseudonyms_for_uid_all_epochs(&self, uid: u32) -> Result<Vec<String>> {
+        let conn = self
+            .db
+            .lock()
+            .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+        let mut stmt = conn.prepare("SELECT salt FROM audit_salt_epoch ORDER BY epoch ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(salt) = hex::decode(r?) {
+                let p = hmac_hex(&salt, &uid.to_be_bytes());
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// GDPR Art. 17 erasure for a *uid*, across every salt epoch — the
+    /// rotation-aware counterpart to [`erase_subject`]. Resolves the uid to each
+    /// historical pseudonym and erases all of them. Returns total rows removed.
+    pub fn erase_uid(&self, uid: u32) -> Result<usize> {
+        let mut total = 0;
+        for pseudonym in self.pseudonyms_for_uid_all_epochs(uid)? {
+            total += self.erase_subject(&pseudonym)?;
+        }
+        Ok(total)
     }
 
     /// GDPR Art. 17 erasure: delete every personal-data row for a subject
@@ -1913,6 +2095,128 @@ mod tests {
             vec!["<argv redacted: 2 args>".to_string()]
         );
         assert!(!pii[0].command_line.iter().any(|a| a.contains("hunter2")));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    // ── #11: automated pseudonym-salt rotation ────────────────────────────────
+
+    #[test]
+    fn salt_due_for_rotation_policy_is_correct() {
+        // Disabled when max age is None or 0.
+        assert!(!salt_due_for_rotation(0, 1_000_000, None));
+        assert!(!salt_due_for_rotation(0, 1_000_000, Some(0)));
+        // Due once `now - created >= max_age`; not before.
+        assert!(!salt_due_for_rotation(100, 150, Some(100)));
+        assert!(salt_due_for_rotation(100, 200, Some(100)));
+        assert!(salt_due_for_rotation(100, 999, Some(100)));
+        // Clock skew (created in the future) never trips rotation.
+        assert!(!salt_due_for_rotation(500, 100, Some(10)));
+    }
+
+    #[test]
+    fn audit_salt_rotation_changes_pseudonym_and_increments_epoch() {
+        let path = "/tmp/test_audit_salt_rotate.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        assert_eq!(logger.active_salt_epoch(), 1, "first salt is epoch 1");
+        let before = logger.pseudonym_for_uid(1000);
+
+        let new_epoch = logger.rotate_pseudonym_salt().unwrap();
+        assert_eq!(new_epoch, 2);
+        assert_eq!(logger.active_salt_epoch(), 2);
+
+        let after = logger.pseudonym_for_uid(1000);
+        // Same uid now maps to a different pseudonym (future records unlinked from
+        // past ones), and it is still a pseudonym, not the raw uid.
+        assert_ne!(before, after, "rotation must change the pseudonym");
+        assert_ne!(after, "1000");
+        // Stable again until the next rotation.
+        assert_eq!(after, logger.pseudonym_for_uid(1000));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_erase_uid_covers_all_salt_epochs() {
+        let path = "/tmp/test_audit_erase_uid_epochs.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        let obs = pii_observation(4242);
+        let (intent, assessment, decision) = audit_inputs(&obs);
+
+        // One record under epoch 1, then rotate and write another under epoch 2.
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+        let epoch1_subject = logger.pseudonym_for_uid(4242);
+        logger.rotate_pseudonym_salt().unwrap();
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+        let epoch2_subject = logger.pseudonym_for_uid(4242);
+
+        assert_ne!(
+            epoch1_subject, epoch2_subject,
+            "epochs yield distinct pseudonyms"
+        );
+        // The same uid resolves to both historical pseudonyms.
+        let all = logger.pseudonyms_for_uid_all_epochs(4242).unwrap();
+        assert!(all.contains(&epoch1_subject) && all.contains(&epoch2_subject));
+        assert_eq!(logger.read_subject_pii(&epoch1_subject).unwrap().len(), 1);
+        assert_eq!(logger.read_subject_pii(&epoch2_subject).unwrap().len(), 1);
+
+        // A per-uid erasure must reach BOTH epochs (the rotation-aware Art. 17 path).
+        assert_eq!(logger.erase_uid(4242).unwrap(), 2);
+        assert!(logger.read_subject_pii(&epoch1_subject).unwrap().is_empty());
+        assert!(logger.read_subject_pii(&epoch2_subject).unwrap().is_empty());
+
+        // The chain still verifies across both epochs after erasure.
+        let after = logger.verify_chain().unwrap();
+        assert!(
+            after.intact && after.entries == 2,
+            "chain intact post-erase: {after:?}"
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_salt_legacy_install_is_adopted_as_epoch_one() {
+        // An install that predates rotation stored its salt in `audit_meta`. On
+        // upgrade it must become epoch 1 so already-written pseudonyms still resolve.
+        let path = "/tmp/test_audit_salt_legacy.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let legacy_salt = os_random_bytes(32);
+        let expected = hmac_hex(&legacy_salt, &1000u32.to_be_bytes());
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS audit_meta (k TEXT PRIMARY KEY, v TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO audit_meta (k, v) VALUES ('pseudonym_salt', ?1)",
+                params![hex::encode(&legacy_salt)],
+            )
+            .unwrap();
+        }
+
+        let logger = AuditLogger::new(path);
+        assert_eq!(logger.active_salt_epoch(), 1);
+        assert_eq!(
+            logger.pseudonym_for_uid(1000),
+            expected,
+            "legacy salt must be adopted so existing pseudonyms still resolve"
+        );
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(&db_path);

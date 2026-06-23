@@ -9,6 +9,19 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Automated audit pseudonym-salt rotation (JG #11).** The audit log's per-install
+  pseudonym salt can now be **rotated** (`AuditLogger::rotate_pseudonym_salt`, or
+  automatically at startup once a salt exceeds `JINNGUARD_AUDIT_SALT_MAX_AGE_SECS`).
+  Each rotation opens a new salt *epoch*, so a subject's future `subject_pseudonym`
+  no longer links to its past one — limiting long-horizon correlation/profiling
+  across the chain (strengthens Art. 4(5) pseudonymisation / Art. 5(1)(c)
+  minimisation). Historical epochs are retained: a uid resolves to all of its
+  pseudonyms (`pseudonyms_for_uid_all_epochs`) and a rotation-aware erasure
+  (`erase_uid`) reaches PII written under **any** salt. Rotation never touches the
+  hash chain — `verify_chain` is unchanged before/after. Default off (preserves the
+  prior single-salt behaviour); pre-rotation installs adopt their existing salt as
+  epoch 1 so already-written pseudonyms keep resolving. Backed by 4 new unit tests
+  (policy, rotation, cross-epoch erasure, legacy adoption).
 - **Release integrity pipeline — SLSA provenance + cosign signatures (JG #46 Phase 2).**
   Adds [`release.yml`](.github/workflows/release.yml), a tag-triggered (`v*`) release
   workflow that builds the binary + CycloneDX SBOM, generates **SLSA v3 build
