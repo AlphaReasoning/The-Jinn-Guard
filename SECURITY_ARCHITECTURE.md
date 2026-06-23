@@ -260,10 +260,13 @@ Consistent with the threat model's honesty bar:
   detecting the agent's control-channel access (#55/#56/#58), not by governing the
   deputy itself — the complete fix (caller-identity propagation) is open research
   (#57, [`THREAT_MODEL.md` "Confused deputy"](THREAT_MODEL.md)).
-- **Supply-chain verifiability** is *partly* in place (#46): a committed
-  `deny.toml` is gated on every push/PR by `cargo deny check` (advisories,
-  licenses, bans, sources), and CI publishes a CycloneDX SBOM artifact per build.
-  **Signed/reproducible builds and SLSA provenance remain open** (JG #46).
+- **Supply-chain verifiability** is largely in place (#46): a committed `deny.toml`
+  is gated on every push/PR by `cargo deny check` (advisories, licenses, bans,
+  sources); CI publishes a CycloneDX SBOM per build; and a tag-triggered
+  [`release.yml`](.github/workflows/release.yml) produces **SLSA v3 provenance** and
+  **cosign keyless signatures** per release artifact (see
+  [`RELEASE_INTEGRITY.md`](RELEASE_INTEGRITY.md)). **The one open sub-item is
+  independently-verified reproducible builds** (JG #46).
 
 ---
 
