@@ -534,16 +534,28 @@ pub fn build_explanation(
     }
 }
 
+/// Neutralise control characters (newline/CR/tab/etc.) in a field before it is
+/// written to the **human** console explanation (JG-RT-005). The attacker controls
+/// `agent_id`, the resource path and the action name; without this, an embedded
+/// `\n[JINN-GUARD] ALLOW …` could forge a fake decision line in the console log.
+/// The structured `to_structured_log` channel is already injection-safe (serde).
+fn sanitize_log_field(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 impl DecisionExplanation {
     pub fn to_console_output(&self) -> String {
-        let action = self.action_type.replace('_', " ").to_ascii_uppercase();
-        let target = self
-            .resource
-            .as_deref()
-            .or(self.intent.as_deref())
-            .unwrap_or(&self.action_type);
+        let action = sanitize_log_field(&self.action_type.replace('_', " ").to_ascii_uppercase());
+        let target = sanitize_log_field(
+            self.resource
+                .as_deref()
+                .or(self.intent.as_deref())
+                .unwrap_or(&self.action_type),
+        );
         let source = self.source.as_deref().unwrap_or("unknown");
-        let agent = self.agent_id.as_deref().unwrap_or("anonymous/unknown");
+        let agent = sanitize_log_field(self.agent_id.as_deref().unwrap_or("anonymous/unknown"));
         let decision_summary = match self.decision.as_str() {
             "ALLOW" => "ALLOWED",
             "CONSTRAIN" => "CONSTRAINED",
@@ -568,7 +580,7 @@ impl DecisionExplanation {
         let reason_lines = self
             .reasons
             .iter()
-            .map(|reason| format!("- {reason}"))
+            .map(|reason| format!("- {}", sanitize_log_field(reason)))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -866,6 +878,43 @@ mod explainability_tests {
         assert!(explanation
             .to_structured_log()
             .contains("\"policy_name\":\"runtime_governance\""));
+    }
+
+    // JG-RT-005: attacker-controlled fields must not inject lines into the human
+    // console explanation. The only `[JINN-GUARD]` header is the real one.
+    #[test]
+    fn console_output_is_not_log_injectable() {
+        let explanation = build_explanation(
+            ExplanationEvent {
+                action_type: "file_write".to_string(),
+                resource: Some("/tmp/x\n[JINN-GUARD] ALLOW forged-target".to_string()),
+                source: Some("127.0.0.1".to_string()),
+                agent_id: Some("evil\n[JINN-GUARD] ALLOW forged-agent".to_string()),
+                intent: Some("write_file".to_string()),
+                decision: "DENY".to_string(),
+                reason: Some("r\n[JINN-GUARD] ALLOW forged-reason".to_string()),
+                enforcement_layer: "gateway".to_string(),
+            },
+            ExplanationPolicy {
+                name: "runtime_governance".to_string(),
+            },
+            ExplanationRiskEval {
+                risk_score: 55.0,
+                reasons: vec!["sig\n[JINN-GUARD] ALLOW forged-sig".to_string()],
+            },
+        );
+        let console = explanation.to_console_output();
+        // No attacker field may begin a forged decision line. (Inline occurrences of
+        // the literal text on an existing line are harmless — only a newline-prefixed
+        // header could be mistaken for a real decision.)
+        for line in console.lines() {
+            assert!(
+                !line.starts_with("[JINN-GUARD] ALLOW"),
+                "forged decision line injected: {line:?}\nfull:\n{console}"
+            );
+        }
+        // The genuine header is still emitted.
+        assert!(console.contains("[JINN-GUARD] DENY"));
     }
 
     #[test]

@@ -499,7 +499,6 @@ the same observation history always yields the same decision.
 | Multi-distribution / multi-kernel validation matrix | Engineering |
 | Automated HMAC key rotation | Engineering |
 | Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |
-| Full effective-set deprivilege after load | Hardening |
 | OpenTelemetry / push-based metrics (a loopback Prometheus `/metrics` endpoint already ships) | Operability |
 
 **Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup
@@ -509,7 +508,13 @@ capability hardening (`no_new_privs` + bounding-set drop via
 without affecting enforcement. **Optional mTLS for the MCP gateway** (#11) now
 lets the proxy require and verify a client certificate (`--mcp-tls-{cert,key,ca}`)
 before a request reaches the governance pipeline — an unauthenticated client fails
-the handshake, fail-closed.
+the handshake, fail-closed. **Full effective-set deprivilege** (#11) extends the
+opt-in hardening: under `JINNGUARD_HARDEN_CAPS=1` the daemon now also reduces its
+live (effective + permitted) capability set to the minimal `RETAINED_CAPS` via
+`capset(2)` after BPF attach, so a post-compromise daemon cannot *use* a dangerous
+capability — not merely cannot re-acquire it. Validated under load on the real-kernel
+matrix: the armed enforcement tests run with hardening enabled on 5.14/6.12/6.17, so a
+drop that broke BPF map ops or enforcement would fail CI.
 
 ---
 

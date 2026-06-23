@@ -65,7 +65,7 @@ clang + bpftool) and install to `/usr/lib/jinnguard/lsm/`.
 | `JINNGUARD_SAFE_MODE=1` | **Audit-only**: hooks load but every decision returns allow. Nothing is blocked. | off |
 | `JINNGUARD_ENTERPRISE=1` | Fail-closed: startup *requires* kernel telemetry; refuse to run degraded. | set by unit |
 | `JINNGUARD_GOVERN_CGROUP=<dir>` | Confine kernel enforcement to one cgroup-v2; all other tasks pass through. | unset = global |
-| `JINNGUARD_HARDEN_CAPS=1` | After BPF load, set `no_new_privs` + drop dangerous caps from the bounding set. | off |
+| `JINNGUARD_HARDEN_CAPS=1` | After BPF load: set `no_new_privs`, drop dangerous caps from the bounding set, **and** reduce the live (effective+permitted) set to the minimal `RETAINED_CAPS` via `capset(2)` (#11). | off |
 | `JINNGUARD_METRICS_PORT=<port>` | Serve Prometheus metrics on `127.0.0.1:<port>/metrics`. | off |
 | `JINNGUARD_AUDIT_SALT_MAX_AGE_SECS=<n>` | Auto-rotate the audit pseudonym salt at startup once it is older than `n` seconds (limits long-horizon pseudonym correlation). Erasure/access still cover prior epochs. | off (no rotation) |
 | `JINNGUARD_SECRET_FILE=<path>` | HMAC secret file location. | `/etc/jinnguard/secret` |

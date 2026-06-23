@@ -398,5 +398,12 @@ jobs:
           export PATH="$PATH:/usr/sbin"
           # Runs the whole #[ignore]d kernel_lsm suite — the 6 baseline surfaces plus
           # the new #54 default-deny egress and #55 deputy-denylist enforcement tests.
-          sudo -E env "PATH=$PATH" JINNGUARD_TEST_BINARY="$BIN" \
+          #
+          # JINNGUARD_HARDEN_CAPS=1 is set so the spawned daemons run FULLY hardened
+          # (no_new_privs + bounding-set drop + #11 effective-set deprivilege). The
+          # daemons inherit this env, so if reducing the live capability set to
+          # RETAINED_CAPS broke BPF map ops / /proc enrichment / enforcement, these
+          # armed allow/deny tests would fail here — real-kernel validation of the
+          # effective-set drop on every distro/kernel in the matrix (5.14/6.12/6.17).
+          sudo -E env "PATH=$PATH" JINNGUARD_TEST_BINARY="$BIN" JINNGUARD_HARDEN_CAPS=1 \
             "$TESTBIN" --ignored --test-threads=1 --nocapture

@@ -9,6 +9,19 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Full effective-set capability deprivilege (JG #11 / #59 batch 3).** Under
+  `JINNGUARD_HARDEN_CAPS=1`, after BPF attach the daemon now reduces its **live**
+  (effective + permitted) capabilities to the minimal `RETAINED_CAPS` via `capset(2)`
+  — previously only the *bounding* set was dropped (which prevents re-acquisition but
+  not use). A post-compromise daemon can no longer wield `CAP_SYS_MODULE`,
+  `CAP_NET_ADMIN`, etc. The real-kernel matrix now runs its armed allow/deny tests
+  **with hardening enabled** on 5.14/6.12/6.17, so a drop that broke BPF map ops or
+  enforcement fails CI. Closes the "full effective-set deprivilege" THREAT_MODEL item.
+- **Internal red-team batch 3 — log-injection fix (JG-RT-005, LOW).** The human
+  console explanation interpolated attacker-controlled fields (agent_id, resource
+  path, action, reasons) raw, so an embedded newline could forge a fake
+  `[JINN-GUARD] ALLOW …` line. Control characters in those fields are now neutralised
+  before the human log (the structured JSON log was already serde-safe). Test added.
 - **Internal red-team batch 2 — kernel floor / proof / fleet review (JG #59).** Audited
   the fleet bundle verifier, the Z3 policy-proof path, the BPF `socket_connect` hook,
   and the capability-hardening sequence — all found **sound** (content-bound signed
