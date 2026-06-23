@@ -101,6 +101,17 @@ struct CliArgs {
     /// MCP upstream server address
     #[arg(long, default_value = "127.0.0.1:3000")]
     mcp_upstream: String,
+    /// MCP gateway mTLS: PEM server certificate chain. Set together with
+    /// --mcp-tls-key and --mcp-tls-ca to require client certificates (mTLS);
+    /// when unset the gateway listens in plaintext.
+    #[arg(long)]
+    mcp_tls_cert: Option<String>,
+    /// MCP gateway mTLS: PEM server private key (pairs with --mcp-tls-cert).
+    #[arg(long)]
+    mcp_tls_key: Option<String>,
+    /// MCP gateway mTLS: PEM CA bundle used to verify connecting clients.
+    #[arg(long)]
+    mcp_tls_ca: Option<String>,
     /// Remote policy server URL (HTTPS)
     #[arg(long)]
     policy_server: Option<String>,
@@ -4169,6 +4180,39 @@ async fn run() -> Result<()> {
         let audit_clone = Arc::clone(&audit_logger);
         let telemetry_clone = Arc::clone(&telemetry_store);
         let secret_clone = Arc::clone(&secret);
+
+        // #11 optional mTLS: all three of --mcp-tls-{cert,key,ca} must be set
+        // together. A partial combination is a configuration error (fail-closed:
+        // we refuse to start rather than silently fall back to plaintext).
+        let mcp_tls = match (
+            args.mcp_tls_cert.clone(),
+            args.mcp_tls_key.clone(),
+            args.mcp_tls_ca.clone(),
+        ) {
+            (None, None, None) => None,
+            (Some(cert), Some(key), Some(ca)) => {
+                let cfg = mcp_gateway::McpTlsConfig { cert, key, ca };
+                match mcp_gateway::build_mcp_tls_acceptor(&cfg) {
+                    Ok(acceptor) => {
+                        eprintln!(
+                            "[startup] MCP gateway mTLS enabled (client certificates required)"
+                        );
+                        Some(Arc::new(acceptor))
+                    }
+                    Err(e) => exit_codes::fatal(
+                        exit_codes::EX_CONFIG,
+                        "MCP_TLS_CONFIG",
+                        &format!("{e:#}"),
+                    ),
+                }
+            }
+            _ => exit_codes::fatal(
+                exit_codes::EX_CONFIG,
+                "MCP_TLS_CONFIG",
+                "MCP mTLS requires --mcp-tls-cert, --mcp-tls-key and --mcp-tls-ca together",
+            ),
+        };
+
         tokio::spawn(async move {
             mcp_gateway::run_mcp_gateway(
                 mcp_port,
@@ -4178,6 +4222,7 @@ async fn run() -> Result<()> {
                 audit_clone,
                 telemetry_clone,
                 secret_clone,
+                mcp_tls,
             )
             .await;
         });

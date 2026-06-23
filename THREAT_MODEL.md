@@ -499,7 +499,6 @@ the same observation history always yields the same decision.
 | Multi-distribution / multi-kernel validation matrix | Engineering |
 | Automated HMAC key rotation | Engineering |
 | Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |
-| mTLS/auth for the optional MCP/remote semantic service | Engineering |
 | Full effective-set deprivilege after load | Hardening |
 | OpenTelemetry / push-based metrics (a loopback Prometheus `/metrics` endpoint already ships) | Operability |
 
@@ -507,7 +506,10 @@ the same observation history always yields the same decision.
 failures use structured machine-parseable exit codes; opt-in post-load
 capability hardening (`no_new_privs` + bounding-set drop via
 `JINNGUARD_HARDEN_CAPS=1`) reduces the daemon's post-compromise capability
-without affecting enforcement.
+without affecting enforcement. **Optional mTLS for the MCP gateway** (#11) now
+lets the proxy require and verify a client certificate (`--mcp-tls-{cert,key,ca}`)
+before a request reaches the governance pipeline — an unauthenticated client fails
+the handshake, fail-closed.
 
 ---
 
