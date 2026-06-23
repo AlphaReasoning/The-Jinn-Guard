@@ -9,6 +9,16 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Release integrity pipeline — SLSA provenance + cosign signatures (JG #46 Phase 2).**
+  Adds [`release.yml`](.github/workflows/release.yml), a tag-triggered (`v*`) release
+  workflow that builds the binary + CycloneDX SBOM, generates **SLSA v3 build
+  provenance** (slsa-github-generator), **signs** the binary and SBOM with **cosign
+  keyless** (Sigstore/OIDC — no long-lived key), and publishes everything to a GitHub
+  Release with checksums. [`RELEASE_INTEGRITY.md`](RELEASE_INTEGRITY.md) documents the
+  `cosign verify-blob` / `slsa-verifier` steps and the expected OIDC build identity.
+  The workflow is inert until a maintainer pushes a version tag. Builds pin
+  `SOURCE_DATE_EPOCH` + `--locked`; **independently-verified reproducible builds
+  remain the one open sub-item of #46** (documented honestly, not claimed).
 - **Deputy-governance design note — caller-identity propagation (JG #57).** Adds
   [`DEPUTY_GOVERNANCE.md`](DEPUTY_GOVERNANCE.md), the design/research record for the
   confused-deputy "complete but hard fix." It evaluates four approaches (deputy-side
