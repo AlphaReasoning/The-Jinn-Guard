@@ -396,6 +396,12 @@ helpers, and **privileged MCP tool servers** reachable by non-denylisted paths.
 3. **Govern the deputy / propagate identity** (the complete but hard fix): the
    deputy acts under the caller's capability rather than its ambient root
    (designation = authority). Attribution across a shared daemon is genuinely hard.
+   Designed in [`DEPUTY_GOVERNANCE.md`](DEPUTY_GOVERNANCE.md) (#57): four approaches
+   evaluated; the tractable near-term increment is to make the #55/#56 connect
+   defense **peer-identity-keyed instead of path-keyed** (deny a governed connect to
+   any socket *owned by an ungoverned privileged process*), which collapses the
+   abstract-namespace / bind-mount / unlisted-deputy residual; deputy *action
+   attribution* remains open research.
 4. **Detect unconditionally — IMPLEMENTED (#58).** A governed agent connecting to
    a container/VM/init control socket is a high-signal event, so it is now surfaced
    independently of the verdict: each attempt emits a `[JINNGUARD DEPUTY ALERT]`

@@ -9,6 +9,18 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Deputy-governance design note — caller-identity propagation (JG #57).** Adds
+  [`DEPUTY_GOVERNANCE.md`](DEPUTY_GOVERNANCE.md), the design/research record for the
+  confused-deputy "complete but hard fix." It evaluates four approaches (deputy-side
+  LSM mediation, an authenticating broker, capability tokens, kernel-side credential
+  correlation) and identifies the **smallest buildable increment** on stock BPF-LSM:
+  make the #55/#56 connect defense **peer-identity-keyed instead of path-keyed** —
+  deny a governed agent's connect to any socket *owned by an ungoverned privileged
+  process*, which collapses the abstract-namespace / bind-mount / unlisted-deputy
+  residual into one rule. Anti-lockout invariants and a 5.14-verifier feasibility
+  caveat are spelled out; deputy *action attribution* is documented as open research.
+  Design only — no enforcement change in this entry. Cross-linked from
+  [`THREAT_MODEL.md`](THREAT_MODEL.md).
 - **Supply-chain policy enforced in CI + CycloneDX SBOM (JG #46).** A committed
   `deny.toml` is now gated on every push/PR by a `cargo deny check` job covering
   four axes: known security **advisories** (yanked crates denied; the single
