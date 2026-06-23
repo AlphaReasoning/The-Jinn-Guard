@@ -993,12 +993,44 @@ impl LineageRegistry {
     }
 }
 
+/// The PII-free projection of an `ObservationRecord` that is committed to the
+/// tamper-evident hash chain (#61, GDPR Art. 25 data-protection-by-design).
+///
+/// Directly identifying or content-bearing fields — `executable_path`, the
+/// `command_line` argv, and the raw `uid`/`gid` — are deliberately **absent**
+/// here. In their place the chain carries:
+///   * `subject_pseudonym` — a stable per-install pseudonym of the actor
+///     (Art. 4(5)); reversible only by the operator holding the pseudonym salt.
+///   * `pii_ref` — an opaque handle to the entry's row in the erasable
+///     `audit_pii` store.
+///   * `pii_commitment` — `HMAC(per-record salt, canonical PII)`. This binds the
+///     immutable chain to the personal data *without disclosing it*; once the
+///     row's salt is destroyed on erasure the commitment is no longer linkable
+///     to any candidate plaintext (crypto-shredding).
+///
+/// The upshot: the chain stays fully verifiable forever, yet a data subject's
+/// personal data can be erased (Art. 17) by deleting the matching `audit_pii`
+/// rows — which never touches the chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactedObservation {
+    pub pid: u32,
+    pub start_time: u64,
+    pub namespace_observed: bool,
+    pub namespace_pid_inode: Option<u64>,
+    pub namespace_net_inode: Option<u64>,
+    pub socket_peer_verified: bool,
+    pub observed_at_unix_secs: u64,
+    pub subject_pseudonym: String,
+    pub pii_ref: String,
+    pub pii_commitment: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub index: u64,
     pub timestamp_secs: u64,
     pub prev_hash: String,
-    pub observation: ObservationRecord,
+    pub observation: RedactedObservation,
     pub intent: SemanticIntent,
     pub assessment: RiskAssessment,
     pub decision: PolicyDecision,
@@ -1010,7 +1042,7 @@ impl AuditEntry {
         index: u64,
         timestamp_secs: u64,
         prev_hash: &str,
-        observation: &ObservationRecord,
+        observation: &RedactedObservation,
         intent: &SemanticIntent,
         assessment: &RiskAssessment,
         decision: &PolicyDecision,
@@ -1035,6 +1067,60 @@ impl AuditEntry {
     }
 }
 
+/// The personal data extracted out of the chain into the erasable `audit_pii`
+/// store (#61). Serialized canonically (struct field order is stable) to form
+/// the bytes the per-record commitment is computed over.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PiiBundle {
+    pub uid: u32,
+    pub gid: u32,
+    pub executable_path: Option<String>,
+    pub command_line: Vec<String>,
+}
+
+/// Outcome of re-walking the JSONL hash chain. `intact` holds whether every
+/// link verifies; it is unaffected by PII erasure, because erasure only deletes
+/// rows from `audit_pii` and never touches the chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainVerification {
+    pub entries: usize,
+    pub intact: bool,
+    pub first_broken_index: Option<u64>,
+}
+
+/// Read `n` cryptographically-random bytes from the OS CSPRNG. Used for
+/// per-record commitment salts and the per-install pseudonym salt. On Linux
+/// `/dev/urandom` is always available; the (defensive) fallback mixes the clock
+/// so a salt is never all-zero even in a degraded environment.
+fn os_random_bytes(n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+    {
+        return buf;
+    }
+    let seed = now_unix_secs().to_le_bytes();
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = seed[i % seed.len()] ^ (i as u8).wrapping_mul(31);
+    }
+    buf
+}
+
+/// `HMAC-SHA256(key, data)` as lowercase hex. The HMAC construction means that
+/// without `key` the output cannot be linked back to (or brute-forced against)
+/// a candidate `data` — which is exactly the property crypto-shredding relies on
+/// once the key is destroyed.
+fn hmac_hex(key: &[u8], data: &[u8]) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(data);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 pub struct AuditLogger {
     /// JSONL file path (kept for backward-compat and the tamper-evident hash chain).
     file_path: String,
@@ -1044,6 +1130,14 @@ pub struct AuditLogger {
     /// Without this, two concurrent governed decisions can both read the same
     /// last index and produce duplicate audit indices / a broken hash chain.
     write_guard: Mutex<()>,
+    /// Per-install secret salt that maps a uid to its stable `subject_pseudonym`
+    /// (Art. 4(5) pseudonymisation). Persisted once in `audit_meta`; held by the
+    /// operator so a data-subject request can be resolved to a pseudonym.
+    pseudonym_salt: Vec<u8>,
+    /// #61 data minimisation (Art. 5(1)(c)): when set (`JINNGUARD_AUDIT_MINIMIZE_ARGV=1`),
+    /// command-line arguments are never persisted — only their count is kept — so
+    /// the most sensitive free-text field is not collected in the first place.
+    minimize_argv: bool,
 }
 
 impl AuditLogger {
@@ -1059,7 +1153,7 @@ impl AuditLogger {
                 timestamp_secs INTEGER,
                 prev_hash      TEXT,
                 pid            INTEGER,
-                uid            INTEGER,
+                subject        TEXT,
                 intent_class   TEXT,
                 fused_risk     REAL,
                 trust_score    REAL,
@@ -1067,14 +1161,153 @@ impl AuditLogger {
                 reason         TEXT,
                 entry_hash     TEXT,
                 full_json      TEXT
-            );",
+            );
+            -- #61: erasable personal-data store, separate from the immutable
+            -- chain. Deleting a subject's rows here crypto-shreds their PII
+            -- (the per-record salt goes with them) while every chain hash in
+            -- audit_log / the JSONL file still verifies.
+            CREATE TABLE IF NOT EXISTS audit_pii (
+                pii_ref         TEXT PRIMARY KEY,
+                idx             INTEGER,
+                subject         TEXT,
+                salt            TEXT,
+                uid             INTEGER,
+                gid             INTEGER,
+                executable_path TEXT,
+                command_line    TEXT,
+                created_secs    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS audit_pii_subject ON audit_pii(subject);
+            CREATE TABLE IF NOT EXISTS audit_meta (k TEXT PRIMARY KEY, v TEXT);",
         )
-        .expect("AuditLogger: failed to create audit_log table");
+        .expect("AuditLogger: failed to create audit tables");
+
+        // Load (or generate once) the per-install pseudonym salt.
+        let pseudonym_salt = {
+            let existing: rusqlite::Result<String> = conn.query_row(
+                "SELECT v FROM audit_meta WHERE k = 'pseudonym_salt'",
+                [],
+                |row| row.get(0),
+            );
+            match existing.ok().and_then(|h| hex::decode(h).ok()) {
+                Some(salt) if !salt.is_empty() => salt,
+                _ => {
+                    let salt = os_random_bytes(32);
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO audit_meta (k, v) VALUES ('pseudonym_salt', ?1)",
+                        params![hex::encode(&salt)],
+                    );
+                    salt
+                }
+            }
+        };
+
         Self {
             file_path: file_path.to_string(),
             db: Arc::new(Mutex::new(conn)),
             write_guard: Mutex::new(()),
+            pseudonym_salt,
+            minimize_argv: std::env::var("JINNGUARD_AUDIT_MINIMIZE_ARGV")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
+    }
+
+    /// Builder override for argv data-minimisation (Art. 5(1)(c)). Defaults from
+    /// `JINNGUARD_AUDIT_MINIMIZE_ARGV`; this lets a deployment (or a test) set it
+    /// explicitly. When on, command-line argument *values* are never persisted.
+    pub fn with_argv_minimization(mut self, on: bool) -> Self {
+        self.minimize_argv = on;
+        self
+    }
+
+    /// Stable pseudonym for a uid under this install's salt. Lets an operator map
+    /// a data-subject request (resolved to a uid) to the `subject_pseudonym`
+    /// recorded in the chain, then erase it via [`erase_subject`].
+    pub fn pseudonym_for_uid(&self, uid: u32) -> String {
+        hmac_hex(&self.pseudonym_salt, &uid.to_be_bytes())
+    }
+
+    /// GDPR Art. 17 erasure: delete every personal-data row for a subject
+    /// pseudonym from `audit_pii`, destroying their per-record commitment salts.
+    /// Returns the number of rows erased. The hash chain is untouched and still
+    /// verifies — [`verify_chain`] passes identically before and after.
+    pub fn erase_subject(&self, subject_pseudonym: &str) -> Result<usize> {
+        let conn = self
+            .db
+            .lock()
+            .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+        let n = conn.execute(
+            "DELETE FROM audit_pii WHERE subject = ?1",
+            params![subject_pseudonym],
+        )?;
+        Ok(n)
+    }
+
+    /// GDPR Art. 15 right of access: return every personal-data bundle currently
+    /// held for a subject pseudonym (empty once the subject has been erased).
+    pub fn read_subject_pii(&self, subject_pseudonym: &str) -> Result<Vec<PiiBundle>> {
+        let conn = self
+            .db
+            .lock()
+            .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT uid, gid, executable_path, command_line FROM audit_pii \
+             WHERE subject = ?1 ORDER BY idx ASC",
+        )?;
+        let rows = stmt.query_map(params![subject_pseudonym], |row| {
+            let uid: i64 = row.get(0)?;
+            let gid: i64 = row.get(1)?;
+            let exec: Option<String> = row.get(2)?;
+            let argv_json: String = row.get(3)?;
+            Ok((uid, gid, exec, argv_json))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (uid, gid, exec, argv_json) = row?;
+            out.push(PiiBundle {
+                uid: uid as u32,
+                gid: gid as u32,
+                executable_path: exec,
+                command_line: serde_json::from_str(&argv_json).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Re-walk the JSONL hash chain and confirm every link verifies. Reads only
+    /// the chain (no PII), so it returns the same result before and after an
+    /// erasure — the proof that crypto-shredding does not weaken tamper-evidence.
+    pub fn verify_chain(&self) -> Result<ChainVerification> {
+        let content = fs::read_to_string(&self.file_path).unwrap_or_default();
+        let mut prev = "0".repeat(64);
+        let mut count = 0usize;
+        for line in content.lines().filter(|l| !l.is_empty()) {
+            let entry: AuditEntry = serde_json::from_str(line)?;
+            let recomputed = AuditEntry::calculate_hash(
+                entry.index,
+                entry.timestamp_secs,
+                &entry.prev_hash,
+                &entry.observation,
+                &entry.intent,
+                &entry.assessment,
+                &entry.decision,
+            );
+            if entry.prev_hash != prev || entry.hash != recomputed {
+                return Ok(ChainVerification {
+                    entries: count,
+                    intact: false,
+                    first_broken_index: Some(entry.index),
+                });
+            }
+            prev = entry.hash.clone();
+            count += 1;
+        }
+        Ok(ChainVerification {
+            entries: count,
+            intact: true,
+            first_broken_index: None,
+        })
     }
 
     pub fn log(
@@ -1093,28 +1326,60 @@ impl AuditLogger {
             .map_err(|_| anyhow!("AuditLogger: write mutex poisoned"))?;
         let (next_index, prev_hash) = self.get_last_entry_info()?;
         let now = now_unix_secs();
+
+        // ── Redact: split the observation into a PII-free projection (chained)
+        // and an erasable PII bundle, bound to the chain via a per-record HMAC
+        // commitment whose salt lives only with the (erasable) PII row (#61). ──
+        let command_line = if self.minimize_argv {
+            // Data minimisation: keep only the count, never the argument values.
+            vec![format!(
+                "<argv redacted: {} args>",
+                observation.command_line.len()
+            )]
+        } else {
+            observation.command_line.clone()
+        };
+        let pii = PiiBundle {
+            uid: observation.uid,
+            gid: observation.gid,
+            executable_path: observation.executable_path.clone(),
+            command_line,
+        };
+        let pii_canonical = serde_json::to_vec(&pii)?;
+        let salt = os_random_bytes(32);
+        let pii_ref = hex::encode(os_random_bytes(16));
+        let subject_pseudonym = self.pseudonym_for_uid(observation.uid);
+        let pii_commitment = hmac_hex(&salt, &pii_canonical);
+
+        let redacted = RedactedObservation {
+            pid: observation.pid,
+            start_time: observation.start_time,
+            namespace_observed: observation.namespace_observed,
+            namespace_pid_inode: observation.namespace_pid_inode,
+            namespace_net_inode: observation.namespace_net_inode,
+            socket_peer_verified: observation.socket_peer_verified,
+            observed_at_unix_secs: observation.observed_at_unix_secs,
+            subject_pseudonym: subject_pseudonym.clone(),
+            pii_ref: pii_ref.clone(),
+            pii_commitment,
+        };
+
         let current_hash = AuditEntry::calculate_hash(
-            next_index,
-            now,
-            &prev_hash,
-            observation,
-            intent,
-            assessment,
-            decision,
+            next_index, now, &prev_hash, &redacted, intent, assessment, decision,
         );
 
         let entry = AuditEntry {
             index: next_index,
             timestamp_secs: now,
             prev_hash,
-            observation: observation.clone(),
+            observation: redacted,
             intent: intent.clone(),
             assessment: assessment.clone(),
             decision: decision.clone(),
             hash: current_hash.clone(),
         };
 
-        // ── 1. Append to the JSONL file (tamper-evident chain; tests read this) ──
+        // ── 1. Append the PII-free entry to the JSONL chain (tests read this) ──
         let serialized = serde_json::to_string(&entry)? + "\n";
         {
             use std::io::Write;
@@ -1125,14 +1390,15 @@ impl AuditLogger {
             file.write_all(serialized.as_bytes())?;
         }
 
-        // ── 2. Insert into SQLite for structured querying ──
+        // ── 2. Mirror the PII-free entry into SQLite and store the personal data
+        // in the separate, erasable `audit_pii` table. ──
         let full_json = serde_json::to_string(&entry)?;
         let intent_class_str = format!("{:?}", entry.intent.class);
         let verdict_str = format!("{:?}", entry.decision.verdict);
         if let Ok(conn) = self.db.lock() {
             let _ = conn.execute(
                 "INSERT INTO audit_log \
-                 (idx, timestamp_secs, prev_hash, pid, uid, intent_class, \
+                 (idx, timestamp_secs, prev_hash, pid, subject, intent_class, \
                   fused_risk, trust_score, verdict, reason, entry_hash, full_json) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
@@ -1140,7 +1406,7 @@ impl AuditLogger {
                     entry.timestamp_secs as i64,
                     &entry.prev_hash,
                     entry.observation.pid as i64,
-                    entry.observation.uid as i64,
+                    &subject_pseudonym,
                     &intent_class_str,
                     entry.assessment.fused_risk,
                     entry.assessment.trust_score,
@@ -1148,6 +1414,23 @@ impl AuditLogger {
                     &entry.decision.reason,
                     &current_hash,
                     &full_json,
+                ],
+            );
+            let _ = conn.execute(
+                "INSERT INTO audit_pii \
+                 (pii_ref, idx, subject, salt, uid, gid, executable_path, \
+                  command_line, created_secs) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    &pii_ref,
+                    entry.index as i64,
+                    &subject_pseudonym,
+                    hex::encode(&salt),
+                    pii.uid as i64,
+                    pii.gid as i64,
+                    pii.executable_path.as_deref(),
+                    serde_json::to_string(&pii.command_line).unwrap_or_default(),
+                    now as i64,
                 ],
             );
         }
@@ -1497,6 +1780,139 @@ mod tests {
             indices, expected,
             "audit indices must be a contiguous 0..N with no duplicates (race-free)"
         );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    // ── #61: GDPR/erasure-safe audit logging ──────────────────────────────────
+
+    /// Build (intent, assessment, decision) for an observation so the #61 tests
+    /// can drive `AuditLogger::log` without repeating the boilerplate.
+    fn audit_inputs(obs: &ObservationRecord) -> (SemanticIntent, RiskAssessment, PolicyDecision) {
+        let semantic = SemanticIntent {
+            class: IntentClass::ReadOnly,
+            confidence: 0.9,
+            risk_score: 20.0,
+            signals: vec!["read_only".to_string()],
+        };
+        let capability = CapabilityProfile::from_observation(obs, &[]);
+        let assessment = RiskAssessment::assess(obs, &semantic, &capability, Some(20.0));
+        let decision = PolicyDecision::allow(&assessment);
+        (semantic, assessment, decision)
+    }
+
+    fn pii_observation(uid: u32) -> ObservationRecord {
+        ObservationRecord {
+            pid: 4242,
+            start_time: 1,
+            uid,
+            gid: uid,
+            executable_path: Some("/home/alice/secret-tool".to_string()),
+            command_line: vec!["secret-tool".to_string(), "--password=hunter2".to_string()],
+            namespace_observed: true,
+            namespace_pid_inode: Some(10),
+            namespace_net_inode: Some(20),
+            socket_peer_verified: true,
+            observed_at_unix_secs: 1,
+        }
+    }
+
+    #[test]
+    fn audit_chain_holds_no_pii_and_survives_erasure() {
+        let path = "/tmp/test_audit_gdpr_erase.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        let obs = pii_observation(4242);
+        let (intent, assessment, decision) = audit_inputs(&obs);
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+
+        // (1) The immutable chain must contain NO personal data.
+        let chain = fs::read_to_string(path).unwrap();
+        for needle in ["alice", "hunter2", "secret-tool"] {
+            assert!(
+                !chain.contains(needle),
+                "PII '{needle}' leaked into the immutable chain:\n{chain}"
+            );
+        }
+        assert!(chain.contains("pii_commitment") && chain.contains("subject_pseudonym"));
+
+        // (2) The chain verifies intact.
+        let before = logger.verify_chain().unwrap();
+        assert!(
+            before.intact && before.entries == 2,
+            "chain should verify: {before:?}"
+        );
+
+        // (3) Erase the subject (GDPR Art. 17). Two entries -> two PII rows gone.
+        let subject = logger.pseudonym_for_uid(4242);
+        assert_eq!(logger.read_subject_pii(&subject).unwrap().len(), 2);
+        assert_eq!(logger.erase_subject(&subject).unwrap(), 2);
+        assert!(logger.read_subject_pii(&subject).unwrap().is_empty());
+        // Idempotent: nothing left to erase.
+        assert_eq!(logger.erase_subject(&subject).unwrap(), 0);
+
+        // (4) The chain STILL verifies after erasure — crypto-shredding does not
+        // weaken tamper-evidence (this is the property the reviewer asked about).
+        let after = logger.verify_chain().unwrap();
+        assert!(
+            after.intact && after.entries == 2,
+            "chain must survive erasure: {after:?}"
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_pseudonym_is_stable_and_per_subject() {
+        let path = "/tmp/test_audit_gdpr_pseudo.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        // Stable for the same uid, distinct across uids.
+        assert_eq!(
+            logger.pseudonym_for_uid(1000),
+            logger.pseudonym_for_uid(1000)
+        );
+        assert_ne!(
+            logger.pseudonym_for_uid(1000),
+            logger.pseudonym_for_uid(1001)
+        );
+        // It is a pseudonym, not the raw uid.
+        assert_ne!(logger.pseudonym_for_uid(1000), "1000");
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_argv_minimization_never_persists_argument_values() {
+        let path = "/tmp/test_audit_gdpr_minimize.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path).with_argv_minimization(true);
+        let obs = pii_observation(7000);
+        let (intent, assessment, decision) = audit_inputs(&obs);
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+
+        let subject = logger.pseudonym_for_uid(7000);
+        let pii = logger.read_subject_pii(&subject).unwrap();
+        assert_eq!(pii.len(), 1);
+        // The sensitive argument value is never stored; only the count survives.
+        assert_eq!(
+            pii[0].command_line,
+            vec!["<argv redacted: 2 args>".to_string()]
+        );
+        assert!(!pii[0].command_line.iter().any(|a| a.contains("hunter2")));
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(&db_path);
