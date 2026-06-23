@@ -361,6 +361,53 @@ fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
 // parse_body, verify_envelope}.
 // ---------------------------------------------------------------------------
 
+/// Upper bound on remembered replay nonces. At ~40 bytes/entry this caps the
+/// replay cache near ~40 MB; the effective replay window stays at the last
+/// MAX_REPLAY_ENTRIES accepted proposals — far beyond any in-flight reuse.
+const MAX_REPLAY_ENTRIES: usize = 1 << 20;
+
+/// Bounded replay cache (JG-RT-002). Remembers recently-seen
+/// `(agent, sequence_counter)` pairs so a replayed proposal is rejected, while
+/// capping memory so a long-lived — or authenticated-but-hostile — client cannot
+/// grow it without bound. At capacity the oldest nonce is evicted (FIFO).
+struct ReplayGuard {
+    seen: HashSet<(String, u64)>,
+    order: std::collections::VecDeque<(String, u64)>,
+    cap: usize,
+}
+
+impl ReplayGuard {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record a nonce. Returns `true` if it is NEW (not a replay), `false` if it
+    /// has been seen within the current bounded window.
+    fn observe(&mut self, key: (String, u64)) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.seen.len(), self.order.len());
+        self.order.len()
+    }
+}
+
 fn runtime_policy_denial(
     runtime_policy: &RuntimePolicy,
     proposal: &ClientProposal,
@@ -1205,7 +1252,7 @@ async fn handle_client_connection(
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
     secret_file: Option<String>,
-    nonce_store: Arc<Mutex<HashSet<(String, u64)>>>,
+    nonce_store: Arc<Mutex<ReplayGuard>>,
 ) {
     metrics::record_proposal();
     let Some(peer) = get_socket_peer_credentials(&stream) else {
@@ -1417,7 +1464,7 @@ async fn handle_client_connection(
             .unwrap_or_else(|| "anonymous".to_string());
         let replay_detected = {
             let mut seen = nonce_store.lock().unwrap();
-            !seen.insert((agent_key.clone(), proposal.sequence_counter))
+            !seen.observe((agent_key.clone(), proposal.sequence_counter))
         };
         if replay_detected {
             println!(
@@ -2709,6 +2756,37 @@ fn path_matches_any(path: &str, patterns: &[String]) -> bool {
 }
 
 #[cfg(test)]
+mod replay_guard_tests {
+    use super::ReplayGuard;
+
+    #[test]
+    fn new_nonce_accepts_replay_rejects() {
+        let mut g = ReplayGuard::with_capacity(8);
+        assert!(g.observe(("a".to_string(), 1)), "first sight is new");
+        assert!(!g.observe(("a".to_string(), 1)), "same nonce is a replay");
+        assert!(g.observe(("a".to_string(), 2)), "next seq is new");
+        // Per-agent namespacing: same seq, different agent, is not a replay.
+        assert!(g.observe(("b".to_string(), 1)));
+    }
+
+    #[test]
+    fn capacity_is_bounded_and_evicts_fifo() {
+        let cap = 4;
+        let mut g = ReplayGuard::with_capacity(cap);
+        for seq in 0..1000u64 {
+            assert!(g.observe(("agent".to_string(), seq)));
+        }
+        // Memory never grows past the cap, no matter how many nonces are seen.
+        assert_eq!(g.len(), cap, "replay cache must stay bounded at capacity");
+        // The most-recent `cap` nonces are still remembered as replays.
+        assert!(!g.observe(("agent".to_string(), 999)));
+        // An evicted (old) nonce is outside the window — accepted again (the
+        // documented bounded-window trade-off, not unbounded memory).
+        assert!(g.observe(("agent".to_string(), 0)));
+    }
+}
+
+#[cfg(test)]
 mod exit_code_tests {
     use super::exit_codes;
 
@@ -3908,7 +3986,8 @@ async fn run() -> Result<()> {
     )));
     let audit_logger = Arc::new(AuditLogger::new(&args.audit_log));
     let telemetry_store: TelemetryStore = Arc::new(Mutex::new(HashMap::new()));
-    let nonce_store: Arc<Mutex<HashSet<(String, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
+    let nonce_store: Arc<Mutex<ReplayGuard>> =
+        Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES)));
 
     // Metrics: opt-in Prometheus endpoint on loopback (JINNGUARD_METRICS_PORT).
     metrics::init();

@@ -9,6 +9,18 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Internal red-team batch 1 — fixed 3 reachable issues (JG #59).** See
+  [`RED_TEAM_FINDINGS.md`](RED_TEAM_FINDINGS.md). **JG-RT-001 (HIGH):** the MCP
+  gateway allocated a request body directly from the attacker-controlled
+  `Content-Length` with no bound — a remote, unauthenticated (mTLS off) memory-
+  exhaustion DoS; now capped at 4 MiB (`MAX_MCP_BODY_BYTES`) before allocation.
+  **JG-RT-002 (MED):** the replay nonce cache grew unbounded; replaced with a bounded
+  FIFO `ReplayGuard` (2²⁰ entries) so a long-lived or authenticated-hostile client
+  can no longer exhaust daemon memory. **JG-RT-003 (MED):** the gateway's upstream
+  forwarder now refuses control characters in client-derived method/path/Host,
+  closing a CRLF/request-smuggling vector defensively. All three covered by new unit
+  tests; `ts_wire`, audit persistence, secret loading and the new mTLS path reviewed
+  and found sound.
 - **Optional mTLS for the MCP gateway (JG #11).** The MCP enforcement proxy can now
   require **mutual TLS**: pass `--mcp-tls-cert`, `--mcp-tls-key` and `--mcp-tls-ca`
   together and the gateway presents its certificate and **requires + verifies a

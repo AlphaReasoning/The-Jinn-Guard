@@ -189,6 +189,11 @@ fn params_contains_protected_resource(value: &Value) -> bool {
 // HTTP/1.1 minimal parser
 // ---------------------------------------------------------------------------
 
+/// Upper bound on an MCP request body, in bytes. A `Content-Length` above this is
+/// refused before any body buffer is allocated, so a hostile header cannot drive an
+/// unbounded allocation (JG-RT-001). Matches the UDS wire protocol's 4 MiB ceiling.
+const MAX_MCP_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 struct HttpRequest {
     method: String,
     path: String,
@@ -234,11 +239,19 @@ async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Resu
         }
     }
 
-    // Body
+    // Body. Bound the declared length BEFORE allocating: the gateway listens on
+    // 0.0.0.0 and (unless mTLS is enabled) is unauthenticated, so an attacker-set
+    // `Content-Length` must never drive an unbounded allocation. Mirrors the UDS
+    // wire protocol's MAX_PAYLOAD_LEN cap (JG-RT-001).
     let content_length: usize = headers
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if content_length > MAX_MCP_BODY_BYTES {
+        anyhow::bail!(
+            "declared Content-Length {content_length} exceeds limit {MAX_MCP_BODY_BYTES}"
+        );
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         stream.read_exact(&mut body).await?;
@@ -748,15 +761,26 @@ async fn forward_to_upstream(
     original_headers: &HashMap<String, String>,
     body: &[u8],
 ) -> anyhow::Result<(u16, String, Vec<u8>)> {
+    // Defense-in-depth (JG-RT-003): the request line/headers we send upstream are
+    // built from client-controlled `method`, `path` and `Host`. Refuse any control
+    // character (CR/LF/NUL) so a crafted value can never inject a header or smuggle
+    // a second request into the upstream connection, independent of the inbound
+    // parser's line handling.
+    let host = original_headers
+        .get("host")
+        .cloned()
+        .unwrap_or_else(|| upstream_addr.to_string());
+    for (field, value) in [("method", method), ("path", path), ("host", host.as_str())] {
+        if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            anyhow::bail!("refusing to forward: control character in request {field}");
+        }
+    }
+
     let mut upstream = TcpStream::connect(upstream_addr)
         .await
         .map_err(|e| anyhow::anyhow!("upstream connect failed: {e}"))?;
 
     // Build minimal HTTP/1.1 request.
-    let host = original_headers
-        .get("host")
-        .cloned()
-        .unwrap_or_else(|| upstream_addr.to_string());
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -937,7 +961,7 @@ pub(crate) async fn run_mcp_gateway(
 }
 
 #[cfg(test)]
-mod mcp_mtls_tests {
+mod mcp_gateway_tests {
     use super::*;
     use openssl::asn1::Asn1Time;
     use openssl::hash::MessageDigest;
@@ -1024,5 +1048,58 @@ mod mcp_mtls_tests {
         for p in [cert_path, key_path] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    // JG-RT-001: an attacker-controlled Content-Length must not drive allocation.
+    #[tokio::test]
+    async fn rejects_oversized_content_length_before_allocating() {
+        let req = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_MCP_BODY_BYTES + 1
+        );
+        let mut input: &[u8] = req.as_bytes();
+        let result = read_http_request(&mut input).await;
+        assert!(
+            result.is_err(),
+            "an over-limit Content-Length must be refused, not allocated"
+        );
+    }
+
+    // JG-RT-003: a control character in client-derived method/path/Host must be
+    // refused before anything is written upstream (the guard runs before connect,
+    // so no live upstream is needed to exercise it).
+    #[tokio::test]
+    async fn refuses_to_forward_crlf_in_request_line() {
+        let headers = HashMap::new();
+        let err = forward_to_upstream("127.0.0.1:1", "GET", "/x\r\nEvil: 1", &headers, b"")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control character"), "got: {err}");
+
+        let mut bad_host = HashMap::new();
+        bad_host.insert("host".to_string(), "h\r\nX-Smuggle: 1".to_string());
+        let err = forward_to_upstream("127.0.0.1:1", "GET", "/", &bad_host, b"")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control character"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn parses_request_within_body_limit() {
+        let body = b"{\"jsonrpc\":\"2.0\"}";
+        let req = format!(
+            "POST /rpc HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let mut input: &[u8] = req.as_bytes();
+        let parsed = read_http_request(&mut input)
+            .await
+            .expect("valid request parses");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/rpc");
+        assert_eq!(parsed.body, body);
     }
 }
