@@ -1251,7 +1251,7 @@ async fn handle_client_connection(
     registry_store: Arc<Mutex<LineageRegistry>>,
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
-    secret_file: Option<String>,
+    secret: Arc<Vec<u8>>,
     nonce_store: Arc<Mutex<ReplayGuard>>,
 ) {
     metrics::record_proposal();
@@ -1357,8 +1357,7 @@ async fn handle_client_connection(
         };
 
         // STEP 4: Verify HMAC signature against the inner payload string.
-        let secret = load_secret_from_file(secret_file.as_deref());
-        if !ts_wire::verify_envelope(&envelope, &secret) {
+        if !ts_wire::verify_envelope(&envelope, secret.as_slice()) {
             println!("[deny] pid={} HMAC verification failed", observation.pid);
             emit_daemon_decision_explanation(
                 "DENY",
@@ -1539,6 +1538,38 @@ async fn handle_client_connection(
             }
         }
 
+        // STEP 8.25: Lineage sequence monotonicity. ReplayGuard catches exact
+        // duplicate nonces; the persisted lineage catches out-of-order but
+        // otherwise fresh signed proposals for the same agent.
+        let lineage_sequence_error = {
+            let mut reg = registry_store.lock().unwrap();
+            reserve_lineage_sequence(
+                &mut reg,
+                &agent_key,
+                &observation,
+                proposal.sequence_counter,
+            )
+            .err()
+        };
+        if let Some(err) = lineage_sequence_error {
+            println!(
+                "[deny] pid={} lineage sequence rejected agent={} seq={} err={}",
+                observation.pid, agent_key, proposal.sequence_counter, err
+            );
+            emit_daemon_decision_explanation(
+                "DENY",
+                "DENY_REPLAY_ATTACK",
+                "runtime_governance",
+                &peer_source,
+                Some(&proposal),
+                Some(&agent_key),
+                None,
+            );
+            audit_denied(&audit_logger, &observation, &proposal, "DENY_REPLAY_ATTACK");
+            deny(&mut stream, b"SIGNAL: DENY_REPLAY_ATTACK\n").await;
+            return;
+        }
+
         // STEP 8.5: Canary tripwire. A decoy ("canary") resource is a honeytoken
         // that no legitimate intent references. We short-circuit DENY *before* the
         // allowlist so that even an otherwise-permitted intent cannot reach a
@@ -1689,15 +1720,8 @@ async fn handle_client_connection(
             if node.max_sequence_quota > 0 {
                 let quota_exhausted = {
                     let mut reg = registry_store.lock().unwrap();
-                    let placeholder_assessment = RiskAssessment {
-                        observed_risk: 0.0,
-                        semantic_risk: 0.0,
-                        topology_risk: 0.0,
-                        declared_risk: None,
-                        fused_risk: 0.0,
-                        trust_score: 100.0,
-                        reasons: vec!["quota_placeholder_assessment".to_string()],
-                    };
+                    let placeholder_assessment =
+                        lineage_placeholder_assessment("quota_placeholder_assessment");
                     let lineage = reg
                         .data
                         .lineages
@@ -1761,6 +1785,17 @@ async fn handle_client_connection(
                 Some(&assessment),
             );
             let _ = write_framed_response(&mut stream, 1, b"SIGNAL: ALLOW\n").await;
+            {
+                let mut reg = registry_store.lock().unwrap();
+                update_lineage_after_decision(
+                    &mut reg,
+                    &agent_key,
+                    &observation,
+                    proposal.sequence_counter,
+                    &assessment,
+                    quota_reserved,
+                );
+            }
             let _ = audit_logger.log(&observation, &semantic_intent, &assessment, &decision);
             continue;
         }
@@ -1785,6 +1820,17 @@ async fn handle_client_connection(
                     Some(&assessment),
                 );
                 let _ = write_framed_response(&mut stream, 1, b"SIGNAL: ALLOW\n").await;
+                {
+                    let mut reg = registry_store.lock().unwrap();
+                    update_lineage_after_decision(
+                        &mut reg,
+                        &agent_key,
+                        &observation,
+                        proposal.sequence_counter,
+                        &assessment,
+                        quota_reserved,
+                    );
+                }
                 let _ = audit_logger.log(&observation, &semantic_intent, &assessment, &decision);
                 continue;
             }
@@ -2056,6 +2102,40 @@ async fn handle_client_connection(
     }
 }
 
+fn lineage_placeholder_assessment(reason: &str) -> RiskAssessment {
+    RiskAssessment {
+        observed_risk: 0.0,
+        semantic_risk: 0.0,
+        topology_risk: 0.0,
+        declared_risk: None,
+        fused_risk: 0.0,
+        trust_score: 100.0,
+        reasons: vec![reason.to_string()],
+    }
+}
+
+fn reserve_lineage_sequence(
+    reg: &mut LineageRegistry,
+    lineage_key: &str,
+    observation: &ObservationRecord,
+    sequence: u64,
+) -> Result<(), String> {
+    let placeholder_assessment = lineage_placeholder_assessment("sequence_placeholder_assessment");
+    let lineage = reg
+        .data
+        .lineages
+        .entry(lineage_key.to_string())
+        .or_insert_with(|| AgentLineage::new(observation, sequence, &placeholder_assessment));
+
+    lineage
+        .validate_sequence(sequence)
+        .map_err(|err| err.to_string())?;
+    lineage.last_seen_unix_secs = observation.observed_at_unix_secs;
+    lineage.last_sequence = sequence;
+    let _ = reg.save();
+    Ok(())
+}
+
 fn update_lineage_after_decision(
     reg: &mut LineageRegistry,
     lineage_key: &str,
@@ -2076,6 +2156,7 @@ fn update_lineage_after_decision(
     if !quota_reserved {
         lineage.decisions_seen += 1;
     }
+    let _ = reg.save();
 }
 
 // ---------------------------------------------------------------------------
@@ -4066,7 +4147,9 @@ async fn run() -> Result<()> {
         fs::remove_file(&args.socket_path)?;
     }
 
-    // Load secret.
+    // Load the admission secret once at startup. Runtime rotation is a supervised
+    // restart operation; per-frame file re-reads let a missing secret file crash
+    // an already-running daemon mid-connection (JG-RT-006).
     let secret = Arc::new(load_secret_from_file(args.secret_file.as_deref()));
 
     // Load initial policy.
@@ -4424,7 +4507,7 @@ async fn run() -> Result<()> {
                 let registry_clone = Arc::clone(&registry_store);
                 let logger_clone = Arc::clone(&audit_logger);
                 let telemetry_clone = Arc::clone(&telemetry_store);
-                let secret_file = args.secret_file.clone();
+                let secret_clone = Arc::clone(&secret);
                 let nonce_clone = Arc::clone(&nonce_store);
                 tokio::spawn(async move {
                     handle_client_connection(
@@ -4433,7 +4516,7 @@ async fn run() -> Result<()> {
                         registry_clone,
                         logger_clone,
                         telemetry_clone,
-                        secret_file,
+                        secret_clone,
                         nonce_clone,
                     )
                     .await;

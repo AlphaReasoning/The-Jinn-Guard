@@ -118,9 +118,41 @@ runs its armed enforcement tests with hardening enabled (5.14/6.12/6.17), so a d
 that broke BPF map ops / `/proc` enrichment / enforcement fails CI. Unit test
 `effective_retained_mask_keeps_required_drops_dangerous` pins the mask invariants.
 
+## Batch 4 — admission-secret lifetime
+
+### JG-RT-006 — Per-frame secret reload enables local daemon crash (LOW, fixed)
+The UDS verdict loop loaded the HMAC secret inside `handle_client_connection` for
+every framed proposal. Startup correctly failed closed when no secret was available,
+but after a successful start a privileged local actor who removed or temporarily hid
+the backing `--secret-file` could make the next frame trigger `fatal` and terminate
+the daemon. That is not a signature-bypass or fail-open issue — verification still
+requires the correct key — but it is an avoidable local availability failure.
+- **Fix:** load the admission secret once at startup and pass the cached
+  `Arc<Vec<u8>>` into UDS connection tasks, matching the MCP gateway's existing
+  behavior. Secret rotation remains a supervised restart operation (as documented
+  in the operator runbook). Integration test:
+  `test_cached_secret_survives_mid_connection_secret_file_removal`.
+
+## Batch 5 — lineage / quota integration flow
+
+### JG-RT-007 — UDS lineage ordering and persistence gaps (MED, fixed)
+The primary UDS verdict path had three related lineage/accounting gaps. First, it
+used `ReplayGuard` to reject exact duplicate `(agent, sequence_counter)` pairs but
+never called `AgentLineage::validate_sequence`, so an authenticated client could send
+`seq=100` and then a different signed proposal with `seq=99`; the second proposal was
+not an exact replay and could pass policy. Second, UDS lineage updates were in-memory
+only: unlike the MCP gateway path, the daemon never called `LineageRegistry::save()`,
+so restart lost `last_sequence` and quota history. Third, the post-gate ALLOW
+fast-paths (`system_process_immunity`, `outside_enforcement_scope`) could reserve a
+quota slot but then `continue` without updating the lineage's `last_sequence` /
+risk state.
+- **Fix:** reserve monotonic sequence state under the lineage lock after identity
+  is known, persist UDS lineage updates via the shared helper, and route the two
+  post-gate ALLOW fast-paths through that helper. Integration tests:
+  `test_out_of_order_sequence_is_denied_by_lineage`,
+  `test_outside_scope_fast_path_persists_lineage_state`.
+
 ## Remaining surfaces (future batches)
 
-- Per-request secret re-read inside the connection loop (a missing-file mid-connection
-  triggers `fatal`/exit — fail-closed, but a privileged local actor can crash the
-  daemon; low severity, fix deferred to a batch that reworks secret caching).
-- Integration-level flows (multi-step lineage, quota accounting).
+- No known open findings in the reviewed UDS/MCP lineage and quota flow. Broader
+  end-to-end stress remains useful before closing #59.

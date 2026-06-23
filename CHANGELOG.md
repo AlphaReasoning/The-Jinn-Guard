@@ -9,6 +9,23 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Internal red-team batch 5 — lineage/quota integration fixes (JG-RT-007, MED).**
+  The UDS verdict path rejected exact duplicate nonces but did not enforce the
+  persisted lineage monotonic sequence invariant, so a valid signer could send a
+  lower, fresh sequence after a higher one. UDS lineage updates also stayed
+  in-memory only, unlike the MCP path, and the post-gate ALLOW fast-paths could
+  quota-count without refreshing lineage state. The daemon now reserves monotonic
+  sequence state under the lineage lock, persists UDS lineage updates, and routes
+  system-immunity / outside-scope ALLOWs through the shared lineage helper.
+  Integration tests added for out-of-order denial and fast-path persistence.
+- **Internal red-team batch 4 — admission-secret caching (JG-RT-006, LOW).** The
+  UDS verdict loop reloaded the HMAC secret file for every framed proposal, so a
+  privileged local actor who removed the backing `--secret-file` after startup could
+  make the next frame trigger `SECRET_MISSING` and terminate the daemon. The
+  admission secret is now loaded once at startup and shared with UDS connection
+  tasks, matching the MCP gateway path; rotation remains a supervised restart
+  operation. Integration test added for a two-frame connection where the secret file
+  is removed between frames.
 - **Full effective-set capability deprivilege (JG #11 / #59 batch 3).** Under
   `JINNGUARD_HARDEN_CAPS=1`, after BPF attach the daemon now reduces its **live**
   (effective + permitted) capabilities to the minimal `RETAINED_CAPS` via `capset(2)`
