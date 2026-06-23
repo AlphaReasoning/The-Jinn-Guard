@@ -260,8 +260,10 @@ Consistent with the threat model's honesty bar:
   detecting the agent's control-channel access (#55/#56/#58), not by governing the
   deputy itself — the complete fix (caller-identity propagation) is open research
   (#57, [`THREAT_MODEL.md` "Confused deputy"](THREAT_MODEL.md)).
-- **Supply-chain verifiability** (SBOM, signed reproducible builds, SLSA) is an
-  open item ([`ROADMAP.md`](ROADMAP.md) / #46).
+- **Supply-chain verifiability** is *partly* in place (#46): a committed
+  `deny.toml` is gated on every push/PR by `cargo deny check` (advisories,
+  licenses, bans, sources), and CI publishes a CycloneDX SBOM artifact per build.
+  **Signed/reproducible builds and SLSA provenance remain open** (JG #46).
 
 ---
 

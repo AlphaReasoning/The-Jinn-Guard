@@ -37,6 +37,8 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "Unlicense",
+    # foldhash (transitive via hashbrown, only under feature-gated builds).
+    "Zlib",
 ]
 
 # Our own unpublished workspace crates carry no `license` field; skip them.
