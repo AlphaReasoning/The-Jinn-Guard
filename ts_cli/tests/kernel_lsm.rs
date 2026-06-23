@@ -1292,3 +1292,129 @@ agent_nodes:
     drop(daemon);
     let _ = fs::remove_dir_all(root);
 }
+
+/// JG #43 — anti-lockout dual of `test_kernel_governance_subtree_is_unsheddable`.
+/// Governance is confined to the cgroup subtree, so a task *outside* that scope —
+/// the operator's shell, host services, the desktop — must never be denied, even
+/// with the kernel floors armed. We prove it with one operation evaluated twice:
+/// a non-allowlisted exec is DENIED inside the governed cgroup, then the SAME exec
+/// SUCCEEDS once the actor steps out to the root cgroup. If scope confinement ever
+/// regressed into a host-wide deny, this is the test that catches the lockout.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_ungoverned_host_is_never_locked_out() {
+    let root = fs_root("no_lockout");
+    let daemon = DaemonGuard::spawn("no_lockout", root.to_str().unwrap());
+    // `/bin/true` is not in the policy's allowed_executables, so it is denied for
+    // governed tasks (default-deny exec) but is otherwise a harmless host binary.
+    let probe = first_existing(&["/bin/true", "/usr/bin/true"]);
+
+    // spawn() left us in the governed cgroup: the exec must be denied here.
+    let in_scope = command_status_success(Command::new(&probe));
+
+    // Step out to the root cgroup. We are now an ordinary, ungoverned host process.
+    CgroupScope::leave();
+    let out_of_scope = command_status_success(Command::new(&probe));
+
+    assert!(
+        matches!(&in_scope, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "baseline: a non-allowlisted exec inside the governed cgroup must be denied, \
+         got {in_scope:?}"
+    );
+    assert!(
+        out_of_scope.is_ok(),
+        "JG #43 anti-lockout: the SAME exec must succeed outside the governed scope — \
+         governance must never lock out the host/operator, got {out_of_scope:?}"
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// JG #43 — the governor's control channel must survive maximal lockdown. With the
+/// IPv4 egress floor (#54 `default_deny`), the AF_UNIX allowlist floor (#56
+/// `unix_default_deny`), and the built-in orchestrator denylist (#55) all armed at
+/// once and NO operator allowlist entries, a governed agent must STILL be able to
+/// (a) reach the Jinn Guard control socket — self-allowlisted unconditionally for
+/// anti-lockout — and (b) reach loopback, which the IPv4 floor exempts so local
+/// services are never severed. A non-allowlisted unix connect is asserted denied in
+/// the same breath, so the reachability assertions cannot pass vacuously: the floors
+/// really are armed. This proves the three egress floors compose without locking out
+/// the governor.
+#[test]
+#[ignore = "requires root/CAP_BPF, BPF LSM boot param, and /usr/lib/jinnguard/jinnguard_lsm.o"]
+fn test_kernel_anti_lockout_governor_reachable_under_all_floors() {
+    let root = fs_root("all_floors");
+    let blocked_sock = "/tmp/jg_kernel_lsm_all_floors_blocked.sock";
+    let _ = fs::remove_file(blocked_sock);
+
+    // Arm every egress floor at once, with empty operator allowlists: only the
+    // daemon's own socket (added unconditionally by the loader) and loopback (a
+    // structural in-kernel exemption) should get through.
+    let policy = format!(
+        r#"
+global_safety_ceiling: 90.0
+network_policy:
+  default_deny: true
+  unix_default_deny: true
+  allowed_ips: []
+  allowed_unix_sockets: []
+agent_nodes:
+  - id: "kernel_agent"
+    privilege_tier: 1
+    max_sequence_quota: 0
+    allowed_intents: []
+    allowed_executables:
+      - "/bin/echo"
+    denied_write_paths:
+      - "{root}"
+    denied_unlink_paths:
+      - "{root}"
+    invariants: []
+"#,
+        root = root.to_str().unwrap(),
+    );
+
+    let daemon = DaemonGuard::spawn_with_policy("all_floors", root.to_str().unwrap(), &policy, &[]);
+
+    // A loopback service to prove the IPv4 floor exempts 127.0.0.0/8.
+    let loopback_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let loopback_addr = loopback_listener.local_addr().unwrap();
+    let (lo_running, lo_thread) = spawn_accept_loop(loopback_listener);
+
+    // A live non-allowlisted unix listener, so a denied connect is attributable to
+    // the verdict and not to a missing peer.
+    let blocked_listener = UnixListener::bind(blocked_sock).unwrap();
+    let (blk_running, blk_thread) = spawn_unix_accept_loop(blocked_listener);
+
+    // spawn() left us in the governed cgroup.
+    let to_daemon = UnixStream::connect(&daemon.socket_path).map(|_| ());
+    let to_loopback =
+        TcpStream::connect_timeout(&loopback_addr, Duration::from_millis(250)).map(|_| ());
+    let to_blocked = UnixStream::connect(blocked_sock).map(|_| ());
+
+    // Leave the governed cgroup BEFORE asserting so teardown runs ungoverned.
+    CgroupScope::leave();
+    finish_accept_loop(lo_running, lo_thread);
+    finish_accept_loop(blk_running, blk_thread);
+    let _ = fs::remove_file(blocked_sock);
+
+    assert!(
+        to_daemon.is_ok(),
+        "JG #43 anti-lockout: the Jinn Guard control socket must stay reachable with \
+         default_deny + unix_default_deny both armed, got {to_daemon:?}"
+    );
+    assert!(
+        to_loopback.is_ok(),
+        "JG #43 anti-lockout: loopback must stay reachable under IPv4 default_deny so \
+         local services are not severed, got {to_loopback:?}"
+    );
+    assert!(
+        matches!(&to_blocked, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "JG #43: a non-allowlisted unix connect must be denied (proving the floors are \
+         actually armed), got {to_blocked:?}"
+    );
+
+    drop(daemon);
+    let _ = fs::remove_dir_all(root);
+}

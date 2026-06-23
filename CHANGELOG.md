@@ -9,6 +9,18 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Anti-lockout invariants regression-tested on real kernels (JG #43).** Two new
+  armed `kernel_lsm` tests assert the guarantees that keep governance from bricking
+  the host: (1) `test_kernel_ungoverned_host_is_never_locked_out` — the dual of the
+  unsheddable-subtree test — proves the *same* operation denied inside the governed
+  cgroup succeeds once the actor steps out of scope, so the operator's shell/desktop
+  is structurally never denied; (2)
+  `test_kernel_anti_lockout_governor_reachable_under_all_floors` — with the IPv4
+  egress floor (#54), the AF_UNIX allowlist floor (#56), and the orchestrator
+  denylist (#55) all armed and no operator allowlist entries, the Jinn Guard control
+  socket and loopback stay reachable while a non-allowlisted unix connect is denied
+  in the same run (so the reachability assertions are non-vacuous). Both run in the
+  three-distro real-kernel matrix (6.12 / 6.17 / 5.14).
 - **Z3 solver per-check timeout (250 ms), fail-closed.** The SMT solver now runs
   under a bounded timeout so a pathological or maliciously complex policy cannot
   stall a decision; on timeout Z3 returns `Unknown`, which is treated as **DENY**.
