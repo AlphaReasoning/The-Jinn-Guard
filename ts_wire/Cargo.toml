@@ -2,6 +2,8 @@
 name = "ts_wire"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+publish = false
 description = "Pure, panic-free decoders for the Jinn Guard wire protocol (frame + signed envelope) — the externally reachable attack surface, isolated so it can be fuzzed."
 
 [dependencies]

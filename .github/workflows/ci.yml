@@ -280,7 +280,54 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # Job 7: Real-kernel LSM enforcement matrix (self-hosted, privileged)
+  # Job 7: Supply-chain verification (cargo-deny + CycloneDX SBOM) — #46
+  #
+  # Gates every push/PR (NOT the dispatch-only matrix) on the supply-chain policy
+  # in deny.toml: known security advisories, license compliance, banned/wildcard
+  # crates, and crate source provenance. Then emits a CycloneDX SBOM of the full
+  # dependency graph and publishes it as a build artifact so every binary we ship
+  # has a machine-readable, downloadable bill of materials.
+  #
+  # cargo-deny runs from the official prebuilt-binary action (no source compile),
+  # so this job stays fast and does not need the Rust build cache.
+  # ─────────────────────────────────────────────────────────────────────────────
+  supply-chain:
+    name: Supply chain (cargo-deny + SBOM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Enforce deny.toml. `check` runs all four sections (advisories, bans,
+      # licenses, sources); any violation fails the build. Pinned to the version
+      # the policy was authored and validated against.
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # Surface advisory warnings in the log without failing on them twice;
+          # deny.toml already sets the deny/warn severity per section.
+          command-arguments: "--hide-inclusion-graph"
+
+      # Generate a CycloneDX SBOM (JSON) of the resolved dependency graph straight
+      # from Cargo.lock. syft needs no build, so this is cheap and deterministic.
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: jinnguard-sbom-${{ github.sha }}.cyclonedx.json
+          output-file: jinnguard-sbom.cyclonedx.json
+
+      # Keep the SBOM as a downloadable artifact alongside the release binary.
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinnguard-sbom-${{ github.sha }}
+          path: jinnguard-sbom.cyclonedx.json
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 8: Real-kernel LSM enforcement matrix (self-hosted, privileged)
   #
   # Setup, per-distro requirements, and gotchas: docs/ci-self-hosted-runners.md
   # GitHub-hosted runners cannot enable the BPF LSM (boot param) or attach LSM

@@ -1,0 +1,60 @@
+# Supply-chain policy for `cargo deny` (#46).
+#
+# Run locally: `cargo deny check`
+# CI: the "Supply chain (cargo-deny)" job runs this on every push/PR.
+#
+# It checks the entire dependency graph for (a) known security advisories,
+# (b) license compliance, (c) banned / wildcard dependencies, and (d) crate
+# source provenance. Anything outside this policy fails the build.
+
+[advisories]
+# Refuse to build against a yanked crate version.
+yanked = "deny"
+# Vulnerabilities, unsound, and unmaintained advisories deny by default; the
+# only accepted exceptions are listed here with an explicit rationale.
+ignore = [
+    # rustls-pemfile 1.0.4 — UNMAINTAINED (RUSTSEC-2025-0134), not a
+    # vulnerability. Pulled in transitively by reqwest 0.11; no safe upgrade
+    # exists until reqwest is bumped to 0.12+. It is a thin wrapper around the
+    # PEM parser now living in rustls-pki-types. Tracked for removal with the
+    # reqwest upgrade.
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+# Allowlist of permissive licenses actually present in the graph (enumerated
+# with `cargo deny list`). Copyleft (GPL/LGPL) is intentionally NOT allowed; the
+# one tri-licensed dependency (r-efi) is accepted via its MIT/Apache-2.0 OR.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    # foldhash (transitive via hashbrown, only under feature-gated builds).
+    "Zlib",
+]
+
+# Our own unpublished workspace crates carry no `license` field; skip them.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate versions of a crate are a warning (common and mostly harmless in a
+# large graph), but wildcard version requirements are denied — except for the
+# internal workspace path dependencies (ts_wire / ts_checker), which legitimately
+# carry no version requirement.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Every crate must come from crates.io — no unknown registries or git sources.
+unknown-registry = "deny"
+unknown-git = "deny"

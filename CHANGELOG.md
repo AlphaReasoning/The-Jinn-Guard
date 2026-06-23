@@ -9,6 +9,19 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Security / hardening
+- **Supply-chain policy enforced in CI + CycloneDX SBOM (JG #46).** A committed
+  `deny.toml` is now gated on every push/PR by a `cargo deny check` job covering
+  four axes: known security **advisories** (yanked crates denied; the single
+  accepted exception — `RUSTSEC-2025-0134`, the *unmaintained* `rustls-pemfile`
+  pulled transitively via `reqwest` 0.11, not a vulnerability — is documented
+  inline with a removal trigger), **license** compliance (explicit permissive
+  allowlist; copyleft denied), **banned/wildcard** crates (wildcard versions
+  denied except internal workspace path deps), and crate **source** provenance
+  (crates.io only). The same job emits a CycloneDX SBOM of the resolved
+  dependency graph and publishes it as a downloadable build artifact, so every
+  binary ships with a machine-readable bill of materials. The three workspace
+  crates now declare `license = "Apache-2.0"` and `publish = false`. (SLSA
+  provenance and signed/reproducible builds remain open sub-items of #46.)
 - **GDPR/erasure-safe audit logging — crypto-shredding + data minimisation (JG #61).**
   The tamper-evident SHA-256 hash chain previously embedded personal data
   (uid/gid, executable path, full command-line argv) directly in each entry,
