@@ -38,7 +38,7 @@ jobs:
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install system dependencies
         run: |
@@ -58,7 +58,7 @@ jobs:
           cp target/release/ts_cli dist/ts_cli
 
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
           format: cyclonedx-json
@@ -74,7 +74,7 @@ jobs:
           echo "hashes=$(base64 -w0 checksums.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-dist
           path: dist/
@@ -91,7 +91,7 @@ jobs:
       actions: read # read the workflow run for provenance
       id-token: write # keyless signing of the provenance
       contents: write # attach provenance to the release
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563 # v2.0.0
     with:
       base64-subjects: "${{ needs.build.outputs.hashes }}"
       upload-assets: true
@@ -108,16 +108,16 @@ jobs:
       contents: write # create the release / upload assets
       id-token: write # cosign keyless signing
     steps:
-      - uses: actions/checkout@v5 # needed for the RELEASE_INTEGRITY.md release body
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5; needed for the RELEASE_INTEGRITY.md release body
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-dist
           path: dist
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign artifacts (keyless)
         run: |
@@ -132,7 +132,7 @@ jobs:
           ls -1
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/ts_cli
