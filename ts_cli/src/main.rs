@@ -4395,6 +4395,9 @@ async fn run() -> Result<()> {
             ),
         }
     }
+    if let Some(config) = metrics::otlp_config_from_env() {
+        tokio::spawn(metrics::serve_otlp(config));
+    }
 
     eprintln!("[startup] initializing LSM verdict loop");
     if let Err(err) = start_lsm_verdict_loop(

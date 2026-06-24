@@ -67,6 +67,10 @@ clang + bpftool) and install to `/usr/lib/jinnguard/lsm/`.
 | `JINNGUARD_GOVERN_CGROUP=<dir>` | Confine kernel enforcement to one cgroup-v2; all other tasks pass through. | unset = global |
 | `JINNGUARD_HARDEN_CAPS=1` | After BPF load: set `no_new_privs`, drop dangerous caps from the bounding set, **and** reduce the live (effective+permitted) set to the minimal `RETAINED_CAPS` via `capset(2)` (#11). | off |
 | `JINNGUARD_METRICS_PORT=<port>` | Serve Prometheus metrics on `127.0.0.1:<port>/metrics`. | off |
+| `JINNGUARD_OTLP_ENDPOINT=<url>` | Push OTLP/HTTP JSON metrics to `<url>`; base collector URLs get `/v1/metrics` appended. | off |
+| `JINNGUARD_OTLP_INTERVAL_SECS=<n>` | OTLP metrics export interval. | `30` |
+| `JINNGUARD_OTLP_TIMEOUT_SECS=<n>` | OTLP metrics request timeout. | `5` |
+| `JINNGUARD_OTLP_HEADERS=k=v,...` | Optional OTLP HTTP headers; values are never logged. | unset |
 | `JINNGUARD_AUDIT_SALT_MAX_AGE_SECS=<n>` | Auto-rotate the audit pseudonym salt at startup once it is older than `n` seconds (limits long-horizon pseudonym correlation). Erasure/access still cover prior epochs. | off (no rotation) |
 | `JINNGUARD_SECRET_FILE=<path>` | HMAC secret file location. | `/etc/jinnguard/secret` |
 | `ENABLE_EXPLAINABILITY=1` | Verbose per-decision explanations in the log. | off |
@@ -147,6 +151,22 @@ Key series:
 | `jinnguard_audit_salt_epoch` | Active pseudonym-salt epoch (increments on rotation) |
 | `jinnguard_audit_erasures_total` / `jinnguard_audit_erased_rows_total` | Honoured Art. 17 erasures (accountability) |
 | `jinnguard_build_info{version}` | Build version |
+
+### OTLP metrics export (opt-in)
+
+Set `JINNGUARD_OTLP_ENDPOINT` to push the same metrics to an OTLP/HTTP collector.
+The exporter uses JSON-encoded OTLP protobuf payloads and `Content-Type:
+application/json`; no telemetry leaves the host unless this endpoint is set.
+
+```bash
+Environment=JINNGUARD_OTLP_ENDPOINT=http://127.0.0.1:4318
+Environment=JINNGUARD_OTLP_INTERVAL_SECS=30
+```
+
+Standard OpenTelemetry endpoint variables are also accepted:
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is used as an exact metrics URL, and
+`OTEL_EXPORTER_OTLP_ENDPOINT` is treated as a base URL with `/v1/metrics`
+appended.
 
 Suggested alerts: daemon down (`up == 0` / no `uptime` scrape), a sudden spike in
 `jinnguard_denials_total`, any rise in a `DENY_REPLAY_ATTACK` series, any
