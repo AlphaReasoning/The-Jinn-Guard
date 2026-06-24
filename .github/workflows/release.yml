@@ -10,9 +10,11 @@
 # Verification instructions (cosign verify-blob + slsa-verifier, expected OIDC
 # identity) live in RELEASE_INTEGRITY.md.
 #
-# NOTE: this workflow is inert until a maintainer pushes a `v*` tag. Before
-# cutting the first signed release, confirm the slsa-github-generator tag pinned
-# below is current (https://github.com/slsa-framework/slsa-github-generator/releases).
+# NOTE: this workflow is inert until a maintainer pushes a `v*` tag. The SLSA
+# reusable workflow must be referenced by version tag instead of raw commit SHA:
+# the generator validates that its builder ref has the form `refs/tags/vX.Y.Z`.
+# Before cutting a signed release, confirm the tag below is current
+# (https://github.com/slsa-framework/slsa-github-generator/releases).
 name: Release
 
 on:
@@ -82,7 +84,7 @@ jobs:
       actions: read # read the workflow run for provenance
       id-token: write # keyless signing of the provenance
       contents: write # attach provenance to the release
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563 # v2.0.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
     with:
       base64-subjects: "${{ needs.build.outputs.hashes }}"
       upload-assets: true
@@ -138,3 +140,4 @@ jobs:
             dist/rebuild-and-compare.txt.pem
           fail_on_unmatched_files: true
           body_path: RELEASE_INTEGRITY.md
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
