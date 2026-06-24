@@ -5,7 +5,8 @@
 #   1. verifies the release binary is reproducible and emits a CycloneDX SBOM,
 #   2. generates SLSA v3 build provenance for the artifacts,
 #   3. signs the binary, SBOM, and rebuild report with cosign,
-#   4. publishes everything to a GitHub Release.
+#   4. uploads all assets to a draft GitHub Release,
+#   5. publishes the draft only after the required assets are present.
 #
 # Verification instructions (cosign verify-blob + slsa-verifier, expected OIDC
 # identity) live in RELEASE_INTEGRITY.md.
@@ -75,11 +76,12 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # SLSA v3 provenance for the built artifacts (official reusable workflow).
-  # Produces a signed in-toto attestation and attaches it to the release.
+  # Produces a signed in-toto attestation and attaches it to the draft release
+  # after the signed release artifacts have created that draft.
   # ───────────────────────────────────────────────────────────────────────────
   provenance:
     name: SLSA provenance
-    needs: [build]
+    needs: [build, sign-and-release]
     permissions:
       actions: read # read the workflow run for provenance
       id-token: write # keyless signing of the provenance
@@ -88,13 +90,15 @@ jobs:
     with:
       base64-subjects: "${{ needs.build.outputs.hashes }}"
       upload-assets: true
+      draft-release: "true"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # Keyless (Sigstore) signatures for the binary and SBOM, then publish the
-  # GitHub Release with all artifacts + detached signatures + certificates.
+  # Keyless (Sigstore) signatures for the binary and SBOM, then stage a draft
+  # GitHub Release with all artifacts + detached signatures + certificates. The
+  # release stays draft until the SLSA provenance job uploads its attestation.
   # ───────────────────────────────────────────────────────────────────────────
   sign-and-release:
-    name: Sign + publish release
+    name: Sign + stage draft release
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
@@ -140,4 +144,99 @@ jobs:
             dist/rebuild-and-compare.txt.pem
           fail_on_unmatched_files: true
           body_path: RELEASE_INTEGRITY.md
-          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          draft: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Immutable-release repositories only allow asset uploads while a release is a
+  # draft. Publish after both the signed artifacts and SLSA provenance are
+  # attached, and fail closed if any required asset is missing.
+  # ───────────────────────────────────────────────────────────────────────────
+  publish-release:
+    name: Publish staged release
+    needs: [sign-and-release, provenance]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # publish the staged release
+    steps:
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ contains(github.ref_name, '-rc') }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repo = os.environ["REPOSITORY"]
+          tag = os.environ["TAG_NAME"]
+          is_prerelease = os.environ["IS_PRERELEASE"].lower() == "true"
+          token = os.environ["GH_TOKEN"]
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "jinnguard-release-publish",
+          }
+
+          def request(method, url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  body = resp.read().decode()
+                  return json.loads(body) if body else {}
+
+          releases = []
+          page = 1
+          while True:
+              batch = request(
+                  "GET",
+                  f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}",
+              )
+              releases.extend(batch)
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          matches = [release for release in releases if release.get("tag_name") == tag]
+          if not matches:
+              raise SystemExit(f"release for tag {tag} was not created")
+          release = next((item for item in matches if item.get("draft")), matches[0])
+          if not release.get("draft"):
+              raise SystemExit(f"release for tag {tag} is already published")
+
+          assets = {asset["name"] for asset in release.get("assets", [])}
+          required = {
+              "ts_cli",
+              "jinnguard-sbom.cyclonedx.json",
+              "rebuild-and-compare.txt",
+              "checksums.txt",
+              "ts_cli.sig",
+              "ts_cli.pem",
+              "jinnguard-sbom.cyclonedx.json.sig",
+              "jinnguard-sbom.cyclonedx.json.pem",
+              "rebuild-and-compare.txt.sig",
+              "rebuild-and-compare.txt.pem",
+          }
+          missing = sorted(required - assets)
+          if not any(name.endswith(".intoto.jsonl") for name in assets):
+              missing.append("*.intoto.jsonl")
+          if missing:
+              raise SystemExit("release is missing required assets: " + ", ".join(missing))
+
+          updated = request(
+              "PATCH",
+              f"https://api.github.com/repos/{repo}/releases/{release['id']}",
+              {"draft": False, "prerelease": is_prerelease, "name": tag},
+          )
+          print(
+              "published release id={id} tag={tag} prerelease={prerelease}".format(
+                  id=updated["id"],
+                  tag=updated["tag_name"],
+                  prerelease=updated["prerelease"],
+              )
+          )
+          PY
