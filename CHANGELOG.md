@@ -8,6 +8,14 @@ validated research prototype / controlled-pilot MVP; see
 
 Operability and review-driven hardening (moving toward pilot-ready).
 
+### Added
+- **rpm-ostree BPF-LSM arming helper.** Added `deploy/arm-lsm-ostree.sh` for
+  immutable hosts booted via rpm-ostree. The helper is a non-ostree no-op,
+  preserves every module in `/sys/kernel/security/lsm`, stages `lsm=...,bpf`
+  with `rpm-ostree kargs` without touching grub, prints the computed change
+  before applying it, and prints the exact revert command. The installer invokes
+  it only on `/run/ostree-booted` hosts before the existing BPF-LSM active check.
+
 ### Security / hardening
 - **Internal red-team batch 5 — lineage/quota integration fixes (JG-RT-007, MED).**
   The UDS verdict path rejected exact duplicate nonces but did not enforce the

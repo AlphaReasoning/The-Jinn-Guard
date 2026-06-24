@@ -260,6 +260,15 @@ repo — happy to talk.
     ```
     (List the modules already in `/sys/kernel/security/lsm` plus `bpf`; an
     explicit `lsm=` replaces the kernel default, so include the full set.)
+  - **rpm-ostree / immutable hosts** should not hand-edit grub. On a booted
+    ostree host, stage the full active LSM set plus `bpf` declaratively:
+    ```
+    sudo deploy/arm-lsm-ostree.sh
+    sudo systemctl reboot
+    ```
+    The helper prints the exact `rpm-ostree kargs` change before applying it and
+    prints the one-line revert (`rpm-ostree kargs --delete=lsm=...`; or
+    `rpm-ostree rollback` before reboot). Off ostree hosts, it is a no-op.
 - bpftool installed for `vmlinux.h` generation
   (Debian: `bpftool`; Ubuntu: `linux-tools-generic`)
 
