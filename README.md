@@ -577,6 +577,7 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | Structured, machine-parseable CLI exit codes for startup failures (`code=`/`kind=`) | ✅ Done |
 | Opt-in capability hardening after BPF load — `no_new_privs` + bounding-set drop (`JINNGUARD_HARDEN_CAPS=1`) | ✅ Done |
 | Prometheus `/metrics` + `/healthz` endpoint (opt-in `JINNGUARD_METRICS_PORT`, loopback) | ✅ Done |
+| OTLP/HTTP JSON metrics export (opt-in `JINNGUARD_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_*`) | ✅ Done |
 | Operator runbook ([`OPERATOR_RUNBOOK.md`](OPERATOR_RUNBOOK.md)): install, monitor, upgrade/rollback, incident response | ✅ Done |
 
 ### 🔴 Remaining gaps before 100%
@@ -584,7 +585,5 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | Gap | Effort |
 |---|---|
 | mTLS for optional RootAI remote semantic service | Medium |
-| OpenTelemetry export (the Prometheus endpoint exists; OTel/push not yet) | Medium |
 | Multi-distribution / multi-kernel validation matrix (Debian 13/6.12 + Ubuntu 24.04/6.17 + AlmaLinux 9/5.14 done; broaden coverage over time) | Medium |
-| Full effective-set deprivilege after load (beyond the opt-in bounding-set hardening) | Medium |
 | Automated HMAC key rotation | Medium |

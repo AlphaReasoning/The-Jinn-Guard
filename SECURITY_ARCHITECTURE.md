@@ -79,7 +79,7 @@ against each plane.
 | `ebpf_monitor.rs` | Loads the LSM objects, programs the policy maps (allow/deny lists, scope, runtime controls), and runs the kernel→user-space request/verdict loop. |
 | `fleet_policy.rs` | Verifies signed, versioned policy bundles from an external fleet control plane (gated behind the `fleet` feature; off by default). |
 | `mcp_gateway.rs` | Optional MCP integration surface for agent frameworks. |
-| `metrics.rs` | Dependency-free Prometheus `/metrics` (loopback-only, opt-in). |
+| `metrics.rs` | Prometheus `/metrics` (loopback-only) and OTLP/HTTP JSON export (both opt-in). |
 | `system_immunity.rs` | The operator/host-immunity allowlist — paths and processes that are *never* subject to denial (anti-lockout). |
 
 ### 2.3 Kernel plane — eBPF-LSM objects (`bpf/lsm/`)

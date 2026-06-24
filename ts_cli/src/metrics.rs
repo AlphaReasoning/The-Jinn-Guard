@@ -1,15 +1,19 @@
-//! Lightweight, dependency-free Prometheus metrics for Jinn Guard.
+//! Lightweight Prometheus and OTLP metrics for Jinn Guard.
 //!
 //! Counters are process-global atomics; denial reasons are kept in a small map
 //! so every `DENY_*` signal is captured without enumerating them here. The
 //! `/metrics` endpoint is **opt-in** (`JINNGUARD_METRICS_PORT`) and binds to
 //! loopback only, so enabling it never exposes anything off-host by default and
-//! changes no existing behavior when unset.
+//! changes no existing behavior when unset. OTLP/HTTP export is also opt-in
+//! (`JINNGUARD_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_*`) and uses JSON-encoded
+//! OTLP protobuf payloads over the already-present `reqwest` dependency.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
 
 #[derive(Default)]
 struct Metrics {
@@ -37,6 +41,7 @@ struct Metrics {
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 static START: OnceLock<Instant> = OnceLock::new();
+static START_UNIX_NANO: OnceLock<u64> = OnceLock::new();
 
 fn m() -> &'static Metrics {
     METRICS.get_or_init(Metrics::default)
@@ -46,9 +51,18 @@ fn m() -> &'static Metrics {
 pub fn init() {
     let _ = m();
     let _ = START.get_or_init(Instant::now);
+    let _ = START_UNIX_NANO.get_or_init(now_unix_nano);
     // Optimistic until the first chain verification reports otherwise, so the
     // gauge never reads "broken" merely because no check has run yet.
     m().audit_chain_intact.store(1, Ordering::Relaxed);
+}
+
+fn now_unix_nano() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn uptime_seconds() -> u64 {
@@ -272,6 +286,326 @@ pub fn render() -> String {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtlpConfig {
+    pub endpoint: String,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub headers: Vec<(String, String)>,
+}
+
+impl OtlpConfig {
+    fn from_env() -> Option<Self> {
+        let (endpoint, append_metrics_path) =
+            if let Ok(value) = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
+                (value, false)
+            } else if let Ok(value) = std::env::var("JINNGUARD_OTLP_ENDPOINT") {
+                (value, true)
+            } else if let Ok(value) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+                (value, true)
+            } else {
+                return None;
+            };
+
+        let interval = if let Some(secs) = parse_env_u64("JINNGUARD_OTLP_INTERVAL_SECS") {
+            Duration::from_secs(secs.max(1))
+        } else if let Some(ms) = parse_env_u64("OTEL_METRIC_EXPORT_INTERVAL") {
+            Duration::from_millis(ms.max(1_000))
+        } else {
+            Duration::from_secs(30)
+        };
+        let timeout_secs = parse_env_u64("JINNGUARD_OTLP_TIMEOUT_SECS")
+            .map(|secs| secs.max(1))
+            .unwrap_or(5);
+        let headers = std::env::var("JINNGUARD_OTLP_HEADERS")
+            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_HEADERS"))
+            .map(|raw| parse_otlp_headers(&raw))
+            .unwrap_or_default();
+
+        Some(Self {
+            endpoint: normalize_otlp_endpoint(&endpoint, append_metrics_path),
+            interval,
+            timeout: Duration::from_secs(timeout_secs),
+            headers,
+        })
+    }
+}
+
+pub fn otlp_config_from_env() -> Option<OtlpConfig> {
+    OtlpConfig::from_env()
+}
+
+fn parse_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+fn normalize_otlp_endpoint(endpoint: &str, append_metrics_path: bool) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if !append_metrics_path || trimmed.ends_with("/v1/metrics") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1/metrics")
+    }
+}
+
+fn parse_otlp_headers(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn otlp_attr(key: &str, value: impl Into<String>) -> Value {
+    json!({
+        "key": key,
+        "value": { "stringValue": value.into() }
+    })
+}
+
+fn otlp_data_point(
+    value: u64,
+    attrs: Vec<Value>,
+    start_unix_nano: u64,
+    time_unix_nano: u64,
+) -> Value {
+    json!({
+        "attributes": attrs,
+        "startTimeUnixNano": start_unix_nano.to_string(),
+        "timeUnixNano": time_unix_nano.to_string(),
+        "asInt": value.to_string(),
+    })
+}
+
+fn otlp_sum_metric(name: &str, description: &str, points: Vec<Value>, monotonic: bool) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "unit": "1",
+        "sum": {
+            "aggregationTemporality": 2,
+            "isMonotonic": monotonic,
+            "dataPoints": points,
+        }
+    })
+}
+
+fn otlp_gauge_metric(name: &str, description: &str, points: Vec<Value>) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "unit": "1",
+        "gauge": { "dataPoints": points }
+    })
+}
+
+/// Render the current metrics as an OTLP/HTTP JSON ExportMetricsServiceRequest.
+pub fn render_otlp_json() -> Value {
+    init();
+    let g = m();
+    let start = *START_UNIX_NANO.get_or_init(now_unix_nano);
+    let now = now_unix_nano();
+    let mut metrics = Vec::new();
+
+    let point = |value, attrs| otlp_data_point(value, attrs, start, now);
+
+    metrics.push(otlp_gauge_metric(
+        "jinnguard_build_info",
+        "Build information.",
+        vec![point(
+            1,
+            vec![otlp_attr("version", env!("CARGO_PKG_VERSION"))],
+        )],
+    ));
+    metrics.push(otlp_gauge_metric(
+        "jinnguard_uptime_seconds",
+        "Daemon uptime in seconds.",
+        vec![point(uptime_seconds(), vec![])],
+    ));
+    metrics.push(otlp_sum_metric(
+        "jinnguard_proposals_total",
+        "Governance proposals received.",
+        vec![point(g.proposals_total.load(Ordering::Relaxed), vec![])],
+        true,
+    ));
+    metrics.push(otlp_sum_metric(
+        "jinnguard_decisions_total",
+        "Userspace governance decisions by verdict.",
+        vec![
+            point(
+                g.decisions_allow_total.load(Ordering::Relaxed),
+                vec![otlp_attr("verdict", "allow")],
+            ),
+            point(
+                g.decisions_deny_total.load(Ordering::Relaxed),
+                vec![otlp_attr("verdict", "deny")],
+            ),
+        ],
+        true,
+    ));
+
+    let mut denial_points = Vec::new();
+    if let Ok(map) = g.deny_reasons.lock() {
+        for (reason, count) in map.iter() {
+            denial_points.push(point(*count, vec![otlp_attr("reason", reason)]));
+        }
+    }
+    metrics.push(otlp_sum_metric(
+        "jinnguard_denials_total",
+        "Userspace denials by reason.",
+        denial_points,
+        true,
+    ));
+
+    metrics.push(otlp_sum_metric(
+        "jinnguard_kernel_events_total",
+        "Synchronous kernel-LSM decisions observed.",
+        vec![point(g.kernel_events_total.load(Ordering::Relaxed), vec![])],
+        true,
+    ));
+    metrics.push(otlp_sum_metric(
+        "jinnguard_kernel_decisions_total",
+        "Kernel-LSM decisions by verdict.",
+        vec![
+            point(
+                g.kernel_allow_total.load(Ordering::Relaxed),
+                vec![otlp_attr("verdict", "allow")],
+            ),
+            point(
+                g.kernel_deny_total.load(Ordering::Relaxed),
+                vec![otlp_attr("verdict", "deny")],
+            ),
+        ],
+        true,
+    ));
+
+    let mut deputy_points = Vec::new();
+    if let Ok(map) = g.deputy_attempts.lock() {
+        for (key, count) in map.iter() {
+            let (orchestrator, verdict) = key.split_once('|').unwrap_or((key.as_str(), "deny"));
+            deputy_points.push(point(
+                *count,
+                vec![
+                    otlp_attr("orchestrator", orchestrator),
+                    otlp_attr("verdict", verdict),
+                ],
+            ));
+        }
+    }
+    metrics.push(otlp_sum_metric(
+        "jinnguard_orchestrator_socket_attempts_total",
+        "Governed-agent connect attempts to orchestrator/init control sockets.",
+        deputy_points,
+        true,
+    ));
+
+    metrics.push(otlp_gauge_metric(
+        "jinnguard_audit_chain_entries",
+        "Entries in the tamper-evident audit chain.",
+        vec![point(g.audit_chain_entries.load(Ordering::Relaxed), vec![])],
+    ));
+    metrics.push(otlp_gauge_metric(
+        "jinnguard_audit_chain_intact",
+        "Whether the last chain verification passed (1=intact).",
+        vec![point(g.audit_chain_intact.load(Ordering::Relaxed), vec![])],
+    ));
+    metrics.push(otlp_gauge_metric(
+        "jinnguard_audit_salt_epoch",
+        "Active pseudonym-salt epoch.",
+        vec![point(g.audit_salt_epoch.load(Ordering::Relaxed), vec![])],
+    ));
+    metrics.push(otlp_sum_metric(
+        "jinnguard_audit_erasures_total",
+        "Honoured erasure requests.",
+        vec![point(
+            g.audit_erasures_total.load(Ordering::Relaxed),
+            vec![],
+        )],
+        true,
+    ));
+    metrics.push(otlp_sum_metric(
+        "jinnguard_audit_erased_rows_total",
+        "PII rows removed by erasure requests.",
+        vec![point(
+            g.audit_erased_rows_total.load(Ordering::Relaxed),
+            vec![],
+        )],
+        true,
+    ));
+
+    json!({
+        "resourceMetrics": [{
+            "resource": {
+                "attributes": [
+                    otlp_attr("service.name", "jinnguard"),
+                    otlp_attr("service.version", env!("CARGO_PKG_VERSION")),
+                ]
+            },
+            "scopeMetrics": [{
+                "scope": {
+                    "name": "jinnguard.metrics",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "metrics": metrics,
+            }]
+        }]
+    })
+}
+
+async fn export_otlp_once(client: &reqwest::Client, config: &OtlpConfig) -> Result<(), String> {
+    let mut req = client
+        .post(&config.endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&render_otlp_json());
+
+    for (key, value) in &config.headers {
+        let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|err| format!("invalid OTLP header name {key:?}: {err}"))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|err| format!("invalid OTLP header value for {key:?}: {err}"))?;
+        req = req.header(name, value);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|err| format!("OTLP export failed: {err}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("OTLP export returned HTTP {}", response.status()))
+    }
+}
+
+/// Periodically export metrics to an OTLP/HTTP JSON endpoint. Errors are logged
+/// and do not affect governance decisions or local Prometheus metrics.
+pub async fn serve_otlp(config: OtlpConfig) {
+    let client = match reqwest::Client::builder().timeout(config.timeout).build() {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("[metrics] could not create OTLP HTTP client: {err}");
+            return;
+        }
+    };
+    eprintln!(
+        "[metrics] OTLP/HTTP JSON exporter enabled: endpoint={} interval={}s timeout={}s",
+        config.endpoint,
+        config.interval.as_secs(),
+        config.timeout.as_secs()
+    );
+    loop {
+        if let Err(err) = export_otlp_once(&client, &config).await {
+            eprintln!("[metrics] {err}");
+        }
+        tokio::time::sleep(config.interval).await;
+    }
+}
+
 /// Serve `GET /metrics` on `127.0.0.1:<port>` until the process exits. Loopback
 /// only by design: exposing metrics off-host is an explicit operator choice
 /// (e.g. via a reverse proxy), never a default.
@@ -371,5 +705,68 @@ mod tests {
         assert!(text.contains("# TYPE jinnguard_audit_erasures_total counter"));
         // Every audit series renders a value line (numeric), not just metadata.
         assert!(text.contains("jinnguard_audit_chain_intact "));
+    }
+
+    #[test]
+    fn otlp_endpoint_normalization_and_headers_are_operator_friendly() {
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318", true),
+            "http://127.0.0.1:4318/v1/metrics"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318/v1/metrics", true),
+            "http://127.0.0.1:4318/v1/metrics"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("http://collector/custom", false),
+            "http://collector/custom"
+        );
+        assert_eq!(
+            parse_otlp_headers("Authorization=Bearer abc, x-scope = prod "),
+            vec![
+                ("Authorization".to_string(), "Bearer abc".to_string()),
+                ("x-scope".to_string(), "prod".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_otlp_json_emits_core_metrics_payload() {
+        init();
+        record_proposal();
+        record_response(b"SIGNAL: DENY_RUNTIME_POLICY\n");
+        record_kernel_decision(false);
+        record_orchestrator_socket_attempt("docker", true);
+        set_audit_chain_entries(7);
+
+        let payload = render_otlp_json();
+        let metrics = payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .expect("OTLP metrics array");
+
+        let names: Vec<&str> = metrics
+            .iter()
+            .filter_map(|metric| metric["name"].as_str())
+            .collect();
+        for expected in [
+            "jinnguard_proposals_total",
+            "jinnguard_decisions_total",
+            "jinnguard_kernel_decisions_total",
+            "jinnguard_orchestrator_socket_attempts_total",
+            "jinnguard_audit_chain_entries",
+        ] {
+            assert!(names.contains(&expected), "missing OTLP metric {expected}");
+        }
+
+        let proposals = metrics
+            .iter()
+            .find(|metric| metric["name"] == "jinnguard_proposals_total")
+            .expect("proposals metric");
+        let point = &proposals["sum"]["dataPoints"][0];
+        assert!(
+            point["asInt"].as_str().is_some(),
+            "OTLP JSON 64-bit integers must be strings"
+        );
+        assert_eq!(proposals["sum"]["isMonotonic"], true);
     }
 }
