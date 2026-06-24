@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -142,6 +143,7 @@ impl CapabilityProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentClass {
+    Boot,
     ReadOnly,
     FileWrite,
     NetworkAccess,
@@ -157,6 +159,56 @@ pub struct SemanticIntent {
     pub confidence: f64,
     pub risk_score: f64,
     pub signals: Vec<String>,
+}
+
+pub const BOOT_MARKER_SIGNAL: &str = "jinnguard.boot_marker";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootProvenance {
+    pub ostree_booted: bool,
+    pub ostree_commit: Option<String>,
+    pub kernel_release: Option<String>,
+}
+
+impl BootProvenance {
+    fn collect() -> Self {
+        Self::collect_from(Path::new("/run/ostree-booted"))
+    }
+
+    fn collect_from(ostree_booted_path: &Path) -> Self {
+        let ostree_booted = ostree_booted_path.exists();
+        let ostree_commit = if ostree_booted {
+            read_booted_ostree_checksum()
+        } else {
+            None
+        };
+        Self {
+            ostree_booted,
+            ostree_commit,
+            kernel_release: read_kernel_release(),
+        }
+    }
+
+    fn ostree_commit_label(&self) -> &str {
+        if !self.ostree_booted {
+            "non-ostree"
+        } else {
+            self.ostree_commit.as_deref().unwrap_or("null")
+        }
+    }
+
+    fn kernel_release_label(&self) -> &str {
+        self.kernel_release.as_deref().unwrap_or("unknown")
+    }
+
+    fn signals(&self) -> Vec<String> {
+        vec![
+            BOOT_MARKER_SIGNAL.to_string(),
+            format!("ostree_booted={}", self.ostree_booted),
+            format!("ostree_commit={}", self.ostree_commit_label()),
+            format!("kernel_release={}", self.kernel_release_label()),
+        ]
+    }
 }
 
 pub trait SemanticAnalysisService {
@@ -1684,6 +1736,72 @@ impl AuditLogger {
         Ok(())
     }
 
+    /// Append one synthetic boot marker through the same tamper-evident chain as
+    /// normal decisions. Provenance is observability-only: collection failures
+    /// collapse to `null`/`unknown` payload values and must never affect startup
+    /// or enforcement.
+    pub fn log_boot_marker(&self) -> Result<()> {
+        self.log_boot_marker_with_provenance(BootProvenance::collect())
+    }
+
+    fn log_boot_marker_with_provenance(&self, provenance: BootProvenance) -> Result<()> {
+        let pid = std::process::id();
+        let self_metadata = fs::metadata("/proc/self").ok();
+        let observation = ObservationRecord {
+            pid,
+            start_time: get_process_start_time(pid).unwrap_or(0),
+            uid: self_metadata
+                .as_ref()
+                .map(|metadata| metadata.uid())
+                .unwrap_or(0),
+            gid: self_metadata
+                .as_ref()
+                .map(|metadata| metadata.gid())
+                .unwrap_or(0),
+            executable_path: Some("jinnguard.boot_marker".to_string()),
+            command_line: vec!["jinnguard.boot_marker".to_string()],
+            namespace_observed: true,
+            namespace_pid_inode: get_namespace_inode(pid, "pid"),
+            namespace_net_inode: get_namespace_inode(pid, "net"),
+            socket_peer_verified: true,
+            observed_at_unix_secs: now_unix_secs(),
+        };
+        let intent = SemanticIntent {
+            class: IntentClass::Boot,
+            confidence: 1.0,
+            risk_score: 0.0,
+            signals: provenance.signals(),
+        };
+        let assessment = RiskAssessment {
+            observed_risk: 0.0,
+            semantic_risk: 0.0,
+            topology_risk: 0.0,
+            declared_risk: None,
+            fused_risk: 0.0,
+            trust_score: 100.0,
+            reasons: vec![
+                "boot_marker".to_string(),
+                format!("ostree_booted={}", provenance.ostree_booted),
+                format!("ostree_commit={}", provenance.ostree_commit_label()),
+                format!("kernel_release={}", provenance.kernel_release_label()),
+            ],
+        };
+        let decision = PolicyDecision {
+            verdict: PolicyVerdict::Allow,
+            reason: format!(
+                "boot_marker:ostree_booted={};ostree_commit={};kernel_release={}",
+                provenance.ostree_booted,
+                provenance.ostree_commit_label(),
+                provenance.kernel_release_label()
+            ),
+            risk_score: 0.0,
+            trust_score: 100.0,
+            constraints: None,
+        };
+
+        self.log(&observation, &intent, &assessment, &decision)
+    }
+
     /// #11 Run a full chain verification and publish the result to the metrics
     /// endpoint (`jinnguard_audit_chain_intact` / `jinnguard_audit_chain_entries`).
     /// Intended for a periodic daemon health tick; kept off the hot `log()` path
@@ -1757,6 +1875,53 @@ fn append_field(target: &mut String, value: Option<&str>) {
         target.push(' ');
         target.push_str(value);
     }
+}
+
+fn read_kernel_release() -> Option<String> {
+    let output = Command::new("uname").arg("-r").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .and_then(|value| sanitize_marker_value(&value))
+}
+
+fn read_booted_ostree_checksum() -> Option<String> {
+    let output = Command::new("rpm-ostree")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    booted_ostree_checksum_from_status_json(&stdout)
+}
+
+fn booted_ostree_checksum_from_status_json(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let deployments = value.get("deployments")?.as_array()?;
+    deployments
+        .iter()
+        .find(|deployment| {
+            deployment
+                .get("booted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .and_then(|deployment| deployment.get("checksum"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(sanitize_marker_value)
+}
+
+fn sanitize_marker_value(value: &str) -> Option<String> {
+    let sanitized: String = value
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_control() { '_' } else { ch })
+        .collect();
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -2149,6 +2314,75 @@ mod tests {
             verification.intact,
             "JSONL hash chain must continue from JSONL after a mirror write failure"
         );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn booted_ostree_checksum_selects_booted_deployment() {
+        let status = r#"{
+            "deployments": [
+                {"booted": false, "checksum": "oldcommit"},
+                {"booted": true, "checksum": "bootedcommit"}
+            ]
+        }"#;
+
+        assert_eq!(
+            booted_ostree_checksum_from_status_json(status),
+            Some("bootedcommit".to_string())
+        );
+        assert_eq!(
+            booted_ostree_checksum_from_status_json(r#"{"deployments":[]}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn audit_boot_marker_is_first_chain_entry_on_fresh_log() {
+        let path = "/tmp/test_audit_boot_marker.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        logger
+            .log_boot_marker_with_provenance(BootProvenance {
+                ostree_booted: false,
+                ostree_commit: None,
+                kernel_release: Some("6.17.0-test".to_string()),
+            })
+            .unwrap();
+
+        let obs = observation();
+        let (intent, assessment, decision) = audit_inputs(&obs);
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        let entries: Vec<AuditEntry> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap())
+            .collect();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[0].intent.class, IntentClass::Boot);
+        assert!(entries[0]
+            .intent
+            .signals
+            .contains(&BOOT_MARKER_SIGNAL.to_string()));
+        assert!(entries[0]
+            .intent
+            .signals
+            .contains(&"ostree_commit=non-ostree".to_string()));
+        assert!(entries[0]
+            .intent
+            .signals
+            .contains(&"kernel_release=6.17.0-test".to_string()));
+        assert_eq!(entries[1].index, 1);
+        assert_eq!(entries[1].prev_hash, entries[0].hash);
+        assert!(logger.verify_chain().unwrap().intact);
+
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(&db_path);
     }

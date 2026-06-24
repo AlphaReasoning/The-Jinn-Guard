@@ -4379,6 +4379,9 @@ async fn run() -> Result<()> {
         &args.lineage_file,
     )));
     let audit_logger = Arc::new(AuditLogger::new(&args.audit_log));
+    if let Err(err) = audit_logger.log_boot_marker() {
+        eprintln!("[audit] boot marker skipped: {err:#}");
+    }
     let telemetry_store: TelemetryStore = Arc::new(Mutex::new(HashMap::new()));
     let nonce_store: Arc<Mutex<ReplayGuard>> =
         Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES)));
