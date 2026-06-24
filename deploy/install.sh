@@ -138,6 +138,9 @@ if [ "$KMAJ" -lt 5 ] || ([ "$KMAJ" -eq 5 ] && [ "$KMIN" -lt 16 ]); then
     echo "ERROR: Linux 5.16+ required. Found: $(uname -r)"; exit 1
 fi
 # BPF LSM active check
+if [[ -e /run/ostree-booted ]]; then
+    "$SCRIPT_DIR/arm-lsm-ostree.sh"
+fi
 if ! grep -q "bpf" /sys/kernel/security/lsm 2>/dev/null; then
     echo "ERROR: Add lsm=bpf to kernel boot params and reboot"; exit 1
 fi
