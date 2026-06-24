@@ -23,7 +23,7 @@ jobs:
     name: Build (release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install system dependencies
         run: |
@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y libz3-dev keyutils
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -41,7 +41,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-target-release-${{ hashFiles('**/Cargo.lock') }}
@@ -52,7 +52,7 @@ jobs:
         run: cargo build --release 2>&1
 
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ts_cli-release-${{ github.sha }}
           path: target/release/ts_cli
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install system dependencies
         run: |
@@ -73,7 +73,7 @@ jobs:
           sudo apt-get install -y libz3-dev keyutils
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -83,7 +83,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-target-test-${{ hashFiles('**/Cargo.lock') }}
@@ -92,7 +92,7 @@ jobs:
             ${{ runner.os }}-cargo-target-release-
 
       - name: Download release binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ts_cli-release-${{ github.sha }}
           path: target/release/
@@ -130,7 +130,7 @@ jobs:
     name: Fleet feature gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install system dependencies
         run: |
@@ -138,7 +138,7 @@ jobs:
           sudo apt-get install -y libz3-dev keyutils
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -148,7 +148,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-target-fleet-${{ hashFiles('**/Cargo.lock') }}
@@ -171,7 +171,7 @@ jobs:
     name: Bench (compile check)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install system dependencies
         run: |
@@ -179,7 +179,7 @@ jobs:
           sudo apt-get install -y libz3-dev keyutils
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -189,7 +189,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-target-bench-${{ hashFiles('**/Cargo.lock') }}
@@ -206,7 +206,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install system dependencies
         run: |
@@ -214,7 +214,7 @@ jobs:
           sudo apt-get install -y libz3-dev keyutils
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -236,7 +236,7 @@ jobs:
     name: Format check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install rustfmt
         run: rustup component add rustfmt
@@ -251,7 +251,7 @@ jobs:
     name: Build eBPF LSM objects
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install clang, llvm, libbpf-dev
         run: |
@@ -276,7 +276,7 @@ jobs:
           done
 
       - name: Upload eBPF LSM objects
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jinnguard-lsm-objects-${{ github.sha }}
           path: bpf/lsm/*.o
@@ -298,13 +298,13 @@ jobs:
     name: Supply chain (cargo-deny + SBOM)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       # Enforce deny.toml. `check` runs all four sections (advisories, bans,
       # licenses, sources); any violation fails the build. Pinned to the version
       # the policy was authored and validated against.
       - name: cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check
           # Surface advisory warnings in the log without failing on them twice;
@@ -314,7 +314,7 @@ jobs:
       # Generate a CycloneDX SBOM (JSON) of the resolved dependency graph straight
       # from Cargo.lock. syft needs no build, so this is cheap and deterministic.
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
           format: cyclonedx-json
@@ -323,7 +323,7 @@ jobs:
 
       # Keep the SBOM as a downloadable artifact alongside the release binary.
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jinnguard-sbom-${{ github.sha }}
           path: jinnguard-sbom.cyclonedx.json
@@ -370,7 +370,7 @@ jobs:
             kernel: "5.14"
     runs-on: [self-hosted, bpf-lsm, "${{ matrix.label }}"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Show host kernel / distro
         run: |
