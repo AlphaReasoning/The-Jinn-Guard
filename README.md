@@ -268,7 +268,10 @@ repo — happy to talk.
     ```
     The helper prints the exact `rpm-ostree kargs` change before applying it and
     prints the one-line revert (`rpm-ostree kargs --delete=lsm=...`; or
-    `rpm-ostree rollback` before reboot). Off ostree hosts, it is a no-op.
+    `rpm-ostree rollback` before reboot). Off ostree hosts, it is a no-op. On
+    daemon startup, the audit chain records a boot marker with the booted ostree
+    commit, kernel release, and ostree/non-ostree flag. rpm-ostree provides
+    platform immutability; it does not perform Jinn Guard action blocking.
 - bpftool installed for `vmlinux.h` generation
   (Debian: `bpftool`; Ubuntu: `linux-tools-generic`)
 

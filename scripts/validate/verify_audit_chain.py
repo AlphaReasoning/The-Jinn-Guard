@@ -38,6 +38,7 @@ import struct
 import sys
 
 GENESIS = "0" * 64
+BOOT_MARKER_SIGNAL = "jinnguard.boot_marker"
 
 
 def _extract_object(line, key, start):
@@ -88,6 +89,26 @@ def recompute_hash(line, index, timestamp_secs, prev_hash):
     return h.hexdigest()
 
 
+def _boot_marker_from_entry(entry):
+    """Return boot-marker provenance if this entry carries it."""
+    intent = entry.get("intent") or {}
+    signals = intent.get("signals") or []
+    if intent.get("class") != "Boot" and BOOT_MARKER_SIGNAL not in signals:
+        return None
+
+    provenance = {}
+    for signal in signals:
+        if not isinstance(signal, str) or "=" not in signal:
+            continue
+        key, value = signal.split("=", 1)
+        provenance[key] = value
+    return {
+        "ostree_booted": provenance.get("ostree_booted", "unknown"),
+        "ostree_commit": provenance.get("ostree_commit", "unknown"),
+        "kernel_release": provenance.get("kernel_release", "unknown"),
+    }
+
+
 def verify(path):
     """Return (ok: bool, message: str, n_entries: int)."""
     with open(path, encoding="utf-8") as f:
@@ -97,6 +118,7 @@ def verify(path):
 
     prev = GENESIS
     expected_index = 0
+    boot_marker = None
     for n, line in enumerate(lines):
         try:
             entry = json.loads(line)
@@ -127,8 +149,23 @@ def verify(path):
 
         prev = stored_hash
         expected_index += 1
+        if boot_marker is None:
+            boot_marker = _boot_marker_from_entry(entry)
 
-    return True, "%d entries — links intact, every content hash matches" % len(lines), len(lines)
+    msg = "%d entries — links intact, every content hash matches" % len(lines)
+    if boot_marker:
+        msg += (
+            " — boot marker: ostree_commit=%s kernel_release=%s ostree_booted=%s"
+            % (
+                boot_marker["ostree_commit"],
+                boot_marker["kernel_release"],
+                boot_marker["ostree_booted"],
+            )
+        )
+    else:
+        msg += " — boot marker: not found"
+
+    return True, msg, len(lines)
 
 
 def main(argv):

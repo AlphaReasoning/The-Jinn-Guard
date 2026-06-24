@@ -9,6 +9,12 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Audit boot marker for ostree provenance.** The daemon now appends one
+  synthetic boot marker through the normal audit hash-chain at startup before
+  governed decisions. The marker records the ostree/non-ostree host flag, booted
+  ostree commit when available, and kernel release; provenance failures collapse
+  to `null`/`unknown` and never gate startup or enforcement. The independent
+  audit-chain verifier now surfaces the marker after integrity verification.
 - **rpm-ostree BPF-LSM arming helper.** Added `deploy/arm-lsm-ostree.sh` for
   immutable hosts booted via rpm-ostree. The helper is a non-ostree no-op,
   preserves every module in `/sys/kernel/security/lsm`, stages `lsm=...,bpf`
