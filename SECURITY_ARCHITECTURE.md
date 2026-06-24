@@ -74,7 +74,7 @@ against each plane.
 | Module | Responsibility |
 |---|---|
 | `main.rs` | The 16-step gate chain (STEP 1–16), CLI/daemon lifecycle, the kernel verdict loop. |
-| `governance.rs` | Lineage registry (per-`(pid,start_time)` sequence ordering + quota), `RiskAssessment`, the `ExecutionBroker`, and the **tamper-evident `AuditLogger`** (hash chain + erasable PII store, #61). |
+| `governance.rs` | Lineage registry (per-`(pid,start_time)` sequence ordering + quota), semantic scoring (local heuristic plus optional RootAI over mTLS), `RiskAssessment`, the `ExecutionBroker`, and the **tamper-evident `AuditLogger`** (hash chain + erasable PII store, #61). |
 | `explainability.rs` | Turns a raw LSM/proposal event into an `ObservationRecord` + intent/risk classification with a human-readable reason. |
 | `ebpf_monitor.rs` | Loads the LSM objects, programs the policy maps (allow/deny lists, scope, runtime controls), and runs the kernel→user-space request/verdict loop. |
 | `fleet_policy.rs` | Verifies signed, versioned policy bundles from an external fleet control plane (gated behind the `fleet` feature; off by default). |
@@ -178,6 +178,8 @@ loudest signal of an uncovered escape path.
   local Unix-domain socket. The shipped system uses a **symmetric MAC**, not
   mTLS/PKI (the historical [`red-team-report.md`](red-team-report.md) describes an
   aspirational mTLS model — the accurate, shipped design is HMAC-over-UDS).
+  Optional RootAI remote scoring uses outbound HTTPS/mTLS only for scorer
+  transport and never replaces proposal authentication or enforcement gates.
 - **Identity (B3):** the daemon does not trust the self-declared `agent_id`. It
   cross-checks `SO_PEERCRED` peer credentials and binds decisions to a
   per-`(pid, start_time)` **lineage**, so a restarted/forked process cannot

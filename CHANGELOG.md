@@ -9,6 +9,14 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Optional RootAI remote semantic scorer over mTLS.** The daemon can now use a
+  remote RootAI semantic scorer with `--rootai-url <https-url>` plus
+  `--rootai-tls-cert`, `--rootai-tls-key` and `--rootai-tls-ca` supplied
+  together. Partial TLS config is a fatal startup error, plaintext remote URLs
+  are rejected, and `--rootai-url` is mutually exclusive with the local
+  `--rootai-socket`. Runtime remote failures, oversized responses, parse errors,
+  or low-confidence responses fail soft to the local heuristic classifier so the
+  scorer never gates daemon availability or creates a new allow path.
 - **Audit boot marker for ostree provenance.** The daemon now appends one
   synthetic boot marker through the normal audit hash-chain at startup before
   governed decisions. The marker records the ostree/non-ostree host flag, booted

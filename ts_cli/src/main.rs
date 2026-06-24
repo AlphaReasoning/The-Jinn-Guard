@@ -22,8 +22,8 @@ use clap::Parser;
 use governance::{
     AgentLineage, AuditLogger, CapabilityProfile, ClientProposal, CombinedSemanticService,
     ConstraintSet, ExecutionBroker, ExecutionRequest, IntentClass, LineageRegistry,
-    ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment, SemanticAnalysisService,
-    SemanticIntent,
+    ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment, RootAiRemote,
+    SemanticAnalysisService, SemanticIntent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +115,23 @@ struct CliArgs {
     /// Remote policy server URL (HTTPS)
     #[arg(long)]
     policy_server: Option<String>,
+    /// Optional local RootAI semantic scorer Unix socket. Mutually exclusive
+    /// with --rootai-url. If unavailable, the daemon falls back to heuristics.
+    #[arg(long)]
+    rootai_socket: Option<String>,
+    /// Optional remote RootAI semantic scorer URL. Requires
+    /// --rootai-tls-cert, --rootai-tls-key and --rootai-tls-ca together.
+    #[arg(long)]
+    rootai_url: Option<String>,
+    /// RootAI remote mTLS client certificate chain PEM.
+    #[arg(long)]
+    rootai_tls_cert: Option<String>,
+    /// RootAI remote mTLS client private key PEM.
+    #[arg(long)]
+    rootai_tls_key: Option<String>,
+    /// RootAI remote mTLS CA bundle PEM used to verify the scorer endpoint.
+    #[arg(long)]
+    rootai_tls_ca: Option<String>,
     /// Policy refresh interval in seconds
     #[arg(long, default_value_t = 60)]
     policy_refresh_secs: u64,
@@ -1326,15 +1343,30 @@ fn proposal_trips_canary<'a>(
 // handle_client_connection
 // ---------------------------------------------------------------------------
 
-async fn handle_client_connection(
-    mut stream: tokio::net::UnixStream,
+struct ClientConnectionContext {
     current_policy: PolicyConfig,
     registry_store: Arc<Mutex<LineageRegistry>>,
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
     secret: Arc<Vec<u8>>,
     nonce_store: Arc<Mutex<ReplayGuard>>,
+    semantic_service: Arc<CombinedSemanticService>,
+}
+
+async fn handle_client_connection(
+    mut stream: tokio::net::UnixStream,
+    ctx: ClientConnectionContext,
 ) {
+    let ClientConnectionContext {
+        current_policy,
+        registry_store,
+        audit_logger,
+        telemetry_store,
+        secret,
+        nonce_store,
+        semantic_service,
+    } = ctx;
+
     metrics::record_proposal();
     let Some(peer) = get_socket_peer_credentials(&stream) else {
         println!("[deny] failed to resolve kernel peer credentials");
@@ -1932,10 +1964,6 @@ async fn handle_client_connection(
         }
 
         // STEP 12: Risk assessment.
-        let semantic_service = CombinedSemanticService {
-            rootai_socket_path: None,
-            fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
         let semantic_intent = semantic_service.classify(&proposal);
         let capability_profile =
             CapabilityProfile::from_observation(&observation, &proposal.requested_capabilities);
@@ -4385,6 +4413,44 @@ async fn run() -> Result<()> {
     let telemetry_store: TelemetryStore = Arc::new(Mutex::new(HashMap::new()));
     let nonce_store: Arc<Mutex<ReplayGuard>> =
         Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES)));
+    let rootai_remote = match (
+        args.rootai_url.clone(),
+        args.rootai_tls_cert.clone(),
+        args.rootai_tls_key.clone(),
+        args.rootai_tls_ca.clone(),
+    ) {
+        (None, None, None, None) => None,
+        (Some(url), Some(cert), Some(key), Some(ca)) => {
+            match RootAiRemote::from_mtls_files(url, &cert, &key, &ca) {
+                Ok(remote) => {
+                    eprintln!("[startup] RootAI remote semantic scorer mTLS enabled");
+                    Some(remote)
+                }
+                Err(err) => exit_codes::fatal(
+                    exit_codes::EX_CONFIG,
+                    "ROOTAI_TLS_CONFIG",
+                    &format!("{err:#}"),
+                ),
+            }
+        }
+        _ => exit_codes::fatal(
+            exit_codes::EX_CONFIG,
+            "ROOTAI_TLS_CONFIG",
+            "RootAI remote requires --rootai-url, --rootai-tls-cert, --rootai-tls-key and --rootai-tls-ca together",
+        ),
+    };
+    if args.rootai_socket.is_some() && rootai_remote.is_some() {
+        exit_codes::fatal(
+            exit_codes::EX_CONFIG,
+            "ROOTAI_CONFIG",
+            "--rootai-socket and --rootai-url are mutually exclusive",
+        );
+    }
+    let semantic_service = Arc::new(CombinedSemanticService {
+        rootai_socket_path: args.rootai_socket.clone(),
+        rootai_remote,
+        fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    });
 
     // Metrics: opt-in Prometheus endpoint on loopback (JINNGUARD_METRICS_PORT).
     metrics::init();
@@ -4746,17 +4812,18 @@ async fn run() -> Result<()> {
                 let telemetry_clone = Arc::clone(&telemetry_store);
                 let secret_clone = Arc::clone(&secret);
                 let nonce_clone = Arc::clone(&nonce_store);
+                let semantic_clone = Arc::clone(&semantic_service);
                 tokio::spawn(async move {
-                    handle_client_connection(
-                        stream,
-                        policy_snapshot,
-                        registry_clone,
-                        logger_clone,
-                        telemetry_clone,
-                        secret_clone,
-                        nonce_clone,
-                    )
-                    .await;
+                    let ctx = ClientConnectionContext {
+                        current_policy: policy_snapshot,
+                        registry_store: registry_clone,
+                        audit_logger: logger_clone,
+                        telemetry_store: telemetry_clone,
+                        secret: secret_clone,
+                        nonce_store: nonce_clone,
+                        semantic_service: semantic_clone,
+                    };
+                    handle_client_connection(stream, ctx).await;
                 });
             }
             Err(err) => println!("Worker interface connection drop error: {}", err),

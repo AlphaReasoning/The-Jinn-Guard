@@ -469,11 +469,15 @@ returns `Unknown`, which the daemon treats as **DENY** — the timeout fails
 reachable DoS.
 
 **Hardening direction.** The classifier is pluggable: the optional RootAI semantic
-service can replace the keyword heuristic with a model-based scorer. Strengthening
-daemon-authoritative scoring — and, longer term, eBPF-traced interpreter
-child-process attribution (cf. §7.4) — is the path to making the risk input
-trustworthy enough that the formal layer becomes load-bearing rather than
-advisory.
+service can replace the keyword heuristic with a model-based scorer. When the
+remote scorer is enabled, the daemon requires `https://` plus client certificate,
+client key, and CA bundle flags together, builds an mTLS client, and treats
+transport, TLS, parse, size, or low-confidence failures as heuristic fallback.
+RootAI remains an observability/scoring input, not an availability dependency and
+not an independent allow path. Strengthening daemon-authoritative scoring — and,
+longer term, eBPF-traced interpreter child-process attribution (cf. §7.4) — is
+the path to making the risk input trustworthy enough that the formal layer becomes
+load-bearing rather than advisory.
 
 ---
 

@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientProposal {
@@ -293,8 +293,81 @@ impl SemanticAnalysisService for LocalHeuristicSemanticService {
 
 pub struct CombinedSemanticService {
     pub rootai_socket_path: Option<String>,
+    pub rootai_remote: Option<RootAiRemote>,
     /// Counts fallback-to-heuristic events since daemon start (for telemetry).
     pub fallback_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Clone)]
+pub struct RootAiRemote {
+    endpoint: String,
+    client: reqwest::blocking::Client,
+    max_response_bytes: usize,
+}
+
+impl RootAiRemote {
+    const TIMEOUT: Duration = Duration::from_millis(80);
+    const MAX_RESPONSE_BYTES: usize = 65_536;
+
+    pub fn from_mtls_files(
+        endpoint: String,
+        cert_path: &str,
+        key_path: &str,
+        ca_path: &str,
+    ) -> Result<Self> {
+        if !endpoint.starts_with("https://") {
+            return Err(anyhow!("RootAI remote endpoint must use https://"));
+        }
+
+        let cert_pem =
+            fs::read(cert_path).map_err(|err| anyhow!("RootAI client cert read failed: {err}"))?;
+        let key_pem =
+            fs::read(key_path).map_err(|err| anyhow!("RootAI client key read failed: {err}"))?;
+        let client_cert = openssl::x509::X509::from_pem(&cert_pem)
+            .map_err(|err| anyhow!("RootAI client cert invalid: {err}"))?;
+        let client_key = openssl::pkey::PKey::private_key_from_pem(&key_pem)
+            .map_err(|err| anyhow!("RootAI client key invalid: {err}"))?;
+        let mut pkcs12 = openssl::pkcs12::Pkcs12::builder();
+        pkcs12
+            .name("jinnguard-rootai")
+            .pkey(&client_key)
+            .cert(&client_cert);
+        let identity_der = pkcs12
+            .build2("")
+            .and_then(|identity| identity.to_der())
+            .map_err(|err| anyhow!("RootAI client identity invalid: {err}"))?;
+        let identity = reqwest::Identity::from_pkcs12_der(&identity_der, "")
+            .map_err(|err| anyhow!("RootAI client identity invalid: {err}"))?;
+        let ca_pem =
+            fs::read(ca_path).map_err(|err| anyhow!("RootAI CA bundle read failed: {err}"))?;
+        let ca = reqwest::Certificate::from_pem(&ca_pem)
+            .map_err(|err| anyhow!("RootAI CA bundle invalid: {err}"))?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Self::TIMEOUT)
+            .identity(identity)
+            .add_root_certificate(ca)
+            .danger_accept_invalid_certs(false)
+            .build()
+            .map_err(|err| anyhow!("RootAI HTTPS client build failed: {err}"))?;
+
+        Ok(Self {
+            endpoint,
+            client,
+            max_response_bytes: Self::MAX_RESPONSE_BYTES,
+        })
+    }
+
+    #[cfg(test)]
+    fn insecure_http_for_test(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            client: reqwest::blocking::Client::builder()
+                .timeout(Self::TIMEOUT)
+                .build()
+                .expect("test RootAI HTTP client"),
+            max_response_bytes: Self::MAX_RESPONSE_BYTES,
+        }
+    }
 }
 
 /// Wire request sent to the RootAI socket service.
@@ -344,6 +417,16 @@ impl SemanticAnalysisService for CombinedSemanticService {
                 }
             }
         }
+        if let Some(ref remote) = self.rootai_remote {
+            match self.query_rootai_remote(remote, proposal) {
+                Ok(intent) => return intent,
+                Err(_) => {
+                    // Silent fallback — increment telemetry counter only.
+                    self.fallback_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         LocalHeuristicSemanticService.classify(proposal)
     }
 }
@@ -354,6 +437,9 @@ impl CombinedSemanticService {
     pub fn rootai_available(&self) -> bool {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
+        if self.rootai_remote.is_some() {
+            return true;
+        }
         if let Some(ref path) = self.rootai_socket_path {
             match UnixStream::connect(path) {
                 Ok(stream) => {
@@ -366,6 +452,36 @@ impl CombinedSemanticService {
         } else {
             false
         }
+    }
+
+    /// Internal: POST a bounded JSON request to a remote RootAI scorer over the
+    /// preconfigured HTTPS client. Any transport, TLS, parse, or low-confidence
+    /// result fails back to the local heuristic at the call site.
+    fn query_rootai_remote(
+        &self,
+        remote: &RootAiRemote,
+        proposal: &ClientProposal,
+    ) -> Result<SemanticIntent> {
+        let req = RootAiRequest {
+            prompt: proposal.prompt.as_deref(),
+            intent_name: proposal.intent_name.as_deref(),
+            plan: proposal.plan.as_deref(),
+            source_code: proposal.source_code.as_deref(),
+        };
+        let response = remote
+            .client
+            .post(&remote.endpoint)
+            .json(&req)
+            .send()
+            .map_err(|err| anyhow!("RootAI remote request failed: {err}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("RootAI remote returned HTTP {}", response.status()));
+        }
+        let body = read_blocking_response_limited(response, remote.max_response_bytes)?;
+        let resp: RootAiResponse = serde_json::from_slice(&body)
+            .map_err(|err| anyhow!("RootAI remote deserialize: {err}"))?;
+
+        self.trust_rootai_response(resp, "rootai_remote_classified")
     }
 
     /// Internal: open UDS connection to RootAI with 80 ms timeout, send a
@@ -422,6 +538,10 @@ impl CombinedSemanticService {
         let resp: RootAiResponse =
             serde_json::from_slice(&resp_buf).map_err(|e| anyhow!("RootAI deserialize: {}", e))?;
 
+        self.trust_rootai_response(resp, "rootai_classified")
+    }
+
+    fn trust_rootai_response(&self, resp: RootAiResponse, signal: &str) -> Result<SemanticIntent> {
         // Only trust the response when confidence is high enough.
         if resp.confidence < 0.7 {
             return Err(anyhow!("RootAI confidence too low: {:.3}", resp.confidence));
@@ -434,7 +554,7 @@ impl CombinedSemanticService {
             class,
             confidence: resp.confidence,
             risk_score,
-            signals: vec!["rootai_classified".to_string()],
+            signals: vec![signal.to_string()],
         })
     }
 }
@@ -1899,6 +2019,31 @@ fn read_booted_ostree_checksum() -> Option<String> {
     booted_ostree_checksum_from_status_json(&stdout)
 }
 
+fn read_blocking_response_limited(
+    mut response: reqwest::blocking::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    if let Some(len) = response.content_length() {
+        if len > limit as u64 {
+            return Err(anyhow!(
+                "RootAI remote response declares {len} bytes; limit is {limit}"
+            ));
+        }
+    }
+
+    let mut body = Vec::new();
+    let mut limited = response.by_ref().take(limit as u64 + 1);
+    limited
+        .read_to_end(&mut body)
+        .map_err(|err| anyhow!("RootAI remote response read failed: {err}"))?;
+    if body.len() > limit {
+        return Err(anyhow!("RootAI remote response exceeds {limit} bytes"));
+    }
+    Ok(body)
+}
+
 fn booted_ostree_checksum_from_status_json(raw: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let deployments = value.get("deployments")?.as_array()?;
@@ -1955,6 +2100,41 @@ mod tests {
         }
     }
 
+    fn proposal_with_text(text: &str) -> ClientProposal {
+        ClientProposal {
+            session_privilege_bit: Some(0.0),
+            action_risk_score: Some(10.0),
+            sequence_counter: 1,
+            intent_name: Some(text.to_string()),
+            prompt: None,
+            plan: None,
+            source_code: None,
+            requested_capabilities: vec![],
+            proposed_action: None,
+            context_vars: std::collections::HashMap::new(),
+        }
+    }
+
+    fn spawn_rootai_http_response(response_body: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}/classify")
+    }
+
     #[test]
     fn declared_low_risk_cannot_lower_semantic_risk() {
         let proposal = ClientProposal {
@@ -1982,6 +2162,59 @@ mod tests {
 
         assert!(assessment.fused_risk >= semantic.risk_score);
         assert!(assessment.fused_risk >= 90.0);
+    }
+
+    #[test]
+    fn rootai_remote_high_confidence_response_is_used() {
+        let endpoint = spawn_rootai_http_response(
+            r#"{"intent_class":"process_execution","risk_score":81.5,"confidence":0.91}"#,
+        );
+        let fallback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let semantic_service = CombinedSemanticService {
+            rootai_socket_path: None,
+            rootai_remote: Some(RootAiRemote::insecure_http_for_test(endpoint)),
+            fallback_count: Arc::clone(&fallback_count),
+        };
+
+        let intent = semantic_service.classify(&proposal_with_text("read only"));
+
+        assert_eq!(intent.class, IntentClass::ProcessExecution);
+        assert_eq!(intent.risk_score, 81.5);
+        assert_eq!(intent.confidence, 0.91);
+        assert_eq!(intent.signals, vec!["rootai_remote_classified".to_string()]);
+        assert_eq!(fallback_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rootai_remote_low_confidence_falls_back_to_heuristic() {
+        let endpoint = spawn_rootai_http_response(
+            r#"{"intent_class":"process_execution","risk_score":99.0,"confidence":0.20}"#,
+        );
+        let fallback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let semantic_service = CombinedSemanticService {
+            rootai_socket_path: None,
+            rootai_remote: Some(RootAiRemote::insecure_http_for_test(endpoint)),
+            fallback_count: Arc::clone(&fallback_count),
+        };
+
+        let intent = semantic_service.classify(&proposal_with_text("read list"));
+
+        assert_eq!(intent.class, IntentClass::ReadOnly);
+        assert!(intent.signals.contains(&"read_only".to_string()));
+        assert_eq!(fallback_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn rootai_remote_mtls_requires_https_endpoint() {
+        let result = RootAiRemote::from_mtls_files(
+            "http://127.0.0.1:1/classify".to_string(),
+            "/missing/client.crt",
+            "/missing/client.key",
+            "/missing/ca.crt",
+        );
+
+        let err = result.err().expect("http endpoint must be rejected");
+        assert!(err.to_string().contains("https://"));
     }
 
     #[test]
