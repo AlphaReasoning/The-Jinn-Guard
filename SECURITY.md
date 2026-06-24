@@ -4,6 +4,10 @@ Jinn Guard is a kernel-level enforcement security tool and a **validated researc
 prototype**. We take security reports seriously and welcome good-faith research —
 including attempts to break the enforcement guarantees.
 
+External researchers who want a structured target list should start with
+[`BREAK_IT_CHALLENGE.md`](BREAK_IT_CHALLENGE.md). Vulnerabilities still need to
+be reported privately first through the process below.
+
 ## Reporting a vulnerability
 
 **Please report privately first.** Do not open a public issue for a security

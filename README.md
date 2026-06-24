@@ -533,6 +533,11 @@ cargo check
 > **Independent reviewers:** see [`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md)
 > and run `bash scripts/run_professor_validation.sh` for a one-command, tiered
 > validation of everything below.
+>
+> **Security researchers:** see [`BREAK_IT_CHALLENGE.md`](BREAK_IT_CHALLENGE.md)
+> for the public break-it challenge scope, rules of engagement, and report
+> template. Vulnerabilities should be reported privately first through
+> [`SECURITY.md`](SECURITY.md).
 
 **Validated on three real hosts — Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9 / kernel 5.14 (SELinux Enforcing):**
 
@@ -578,6 +583,7 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | Opt-in capability hardening after BPF load — `no_new_privs` + bounding-set drop (`JINNGUARD_HARDEN_CAPS=1`) | ✅ Done |
 | Prometheus `/metrics` + `/healthz` endpoint (opt-in `JINNGUARD_METRICS_PORT`, loopback) | ✅ Done |
 | OTLP/HTTP JSON metrics export (opt-in `JINNGUARD_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_*`) | ✅ Done |
+| Public break-it challenge scope and reporting template ([`BREAK_IT_CHALLENGE.md`](BREAK_IT_CHALLENGE.md)) | ✅ Done |
 | Operator runbook ([`OPERATOR_RUNBOOK.md`](OPERATOR_RUNBOOK.md)): install, monitor, upgrade/rollback, incident response | ✅ Done |
 
 ### 🔴 Remaining gaps before 100%
