@@ -385,7 +385,13 @@ checkout and artifact handling.
   `contents: read`. The release workflow already used explicit per-job write/OIDC
   permissions only where publishing and signing require them.
 
-## Remaining surfaces (future batches)
+## Closeout
 
-- No known open findings in the reviewed UDS/MCP lineage and quota flow. Broader
-  end-to-end stress remains useful before closing #59.
+- Internal red-team batches JG-RT-001 through JG-RT-025 are fixed or explicitly
+  documented as defense-in-depth residuals.
+- Post-merge real-kernel validation passed on the supported self-hosted matrix:
+  Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /
+  kernel 5.14. The AlmaLinux timeout accounting fix in PR #33 preserved hard
+  failures for fail-open, incorrect verdicts, and denied-side timeouts.
+- No known open findings remain in the reviewed UDS, MCP, lineage, quota, fleet,
+  BPF map-loading, deployment, or CI-permission surfaces.
