@@ -85,6 +85,15 @@ that chains to the CA bundle. Omit all three for plaintext (default). Supplying 
 *partial* set is a fatal config error (`code=78 kind=MCP_TLS_CONFIG`) — the daemon
 refuses to start rather than silently fall back to plaintext.
 
+**RootAI remote semantic scorer mTLS (optional).** Pass `--rootai-url <https-url>`,
+`--rootai-tls-cert <pem>`, `--rootai-tls-key <pem>` and `--rootai-tls-ca <pem>`
+together to use a remote semantic scorer over HTTPS with mutual TLS. Omit all
+four for the local heuristic classifier (default). Supplying a partial set is a
+fatal config error (`code=78 kind=ROOTAI_TLS_CONFIG`), and `--rootai-url` is
+mutually exclusive with `--rootai-socket`. Runtime scorer failures,
+low-confidence responses, oversized responses, parse failures, or TLS errors fall
+back to the local heuristic and do not change enforcement availability.
+
 ### Policy
 
 `/etc/jinnguard/policy.yaml` defines agents, allowlists, denylists, quotas,

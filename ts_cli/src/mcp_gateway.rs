@@ -602,6 +602,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     let semantic_service = CombinedSemanticService {
         rootai_socket_path: None,
+        rootai_remote: None,
         fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let semantic_intent = semantic_service.classify(&proposal);
