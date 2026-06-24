@@ -499,7 +499,6 @@ the same observation history always yields the same decision.
 | Multi-distribution / multi-kernel validation matrix | Engineering |
 | Automated HMAC key rotation | Engineering |
 | Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |
-| OpenTelemetry / push-based metrics (a loopback Prometheus `/metrics` endpoint already ships) | Operability |
 
 **Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup
 failures use structured machine-parseable exit codes; opt-in post-load
@@ -515,6 +514,11 @@ live (effective + permitted) capability set to the minimal `RETAINED_CAPS` via
 capability — not merely cannot re-acquire it. Validated under load on the real-kernel
 matrix: the armed enforcement tests run with hardening enabled on 5.14/6.12/6.17, so a
 drop that broke BPF map ops or enforcement would fail CI.
+
+**OTLP/HTTP metrics export** (#11) now provides opt-in push telemetry via
+`JINNGUARD_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_*`, using the same in-process
+metrics registry as the loopback Prometheus endpoint without adding a new
+OpenTelemetry dependency tree.
 
 ---
 
