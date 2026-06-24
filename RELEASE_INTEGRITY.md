@@ -8,7 +8,8 @@ pushed version tag (`v*`). Each release publishes:
 |---|---|
 | `ts_cli` | the release binary |
 | `jinnguard-sbom.cyclonedx.json` | CycloneDX SBOM of the full dependency graph |
-| `checksums.txt` | sha256 of the binary and SBOM (the SLSA subjects) |
+| `rebuild-and-compare.txt` | reproducible-build verification report |
+| `checksums.txt` | sha256 of the binary, SBOM, and rebuild report (the SLSA subjects) |
 | `*.sig` / `*.pem` | cosign keyless detached signature + signing certificate per artifact |
 | `*.intoto.jsonl` | SLSA v3 build provenance attestation |
 
@@ -35,6 +36,15 @@ cosign verify-blob \
   ts_cli
 ```
 The same command with the SBOM's `.pem`/`.sig` verifies the SBOM.
+The rebuild report is signed the same way:
+```sh
+cosign verify-blob \
+  --certificate rebuild-and-compare.txt.pem \
+  --signature rebuild-and-compare.txt.sig \
+  --certificate-identity-regexp '^https://github.com/AlphaReasoning/The-Jinn-Guard/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  rebuild-and-compare.txt
+```
 
 ### 3. SLSA provenance
 Using [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier):
@@ -47,17 +57,42 @@ slsa-verifier verify-artifact ts_cli \
 This proves the binary was produced by the expected workflow from the expected
 source at the expected tag — not substituted after the fact.
 
-## Reproducible builds — honest scope
+## Reproducible builds — verified scope
 
-`release.yml` pins `SOURCE_DATE_EPOCH` to the tagged commit's timestamp and builds
-with `--locked` (the committed `Cargo.lock` fixes every dependency version). This
-removes the most common sources of timestamp/dependency nondeterminism, **but the
-build is not yet independently verified to be bit-for-bit reproducible.** A full
-reproducible-build guarantee (pinned toolchain image, stripped build paths, a
-documented `rebuild-and-compare` procedure) is tracked as the remaining open
-sub-item of #46 and is **not claimed here**. Until it is verified and documented,
-trust in an artifact rests on the **provenance + signature** above, not on
-independent rebuild.
+Release reproducibility is verified by
+[`scripts/rebuild_and_compare_release.sh`](scripts/rebuild_and_compare_release.sh).
+The script:
+
+- archives the tagged commit into two clean source directories,
+- builds `ts_cli` twice with `cargo build -p ts_cli --release --locked`,
+- pins `SOURCE_DATE_EPOCH` to the tagged commit timestamp,
+- disables incremental compilation,
+- remaps source and Cargo-home paths out of the binary,
+- strips symbols, and
+- byte-compares the two resulting release binaries.
+
+`rust-toolchain.toml` pins the release compiler to a concrete toolchain version.
+`release.yml` publishes only the binary that passed the rebuild comparison, and
+it includes the signed `rebuild-and-compare.txt` report in the release assets.
+Normal PR/push CI also runs the same rebuild comparison so regressions are caught
+before a release tag is cut.
+
+To verify locally:
+
+```sh
+git fetch --tags
+git checkout <the release tag>
+scripts/rebuild_and_compare_release.sh \
+  --ref <the release tag> \
+  --output /tmp/ts_cli.rebuilt \
+  --report /tmp/rebuild-and-compare.txt
+sha256sum /tmp/ts_cli.rebuilt
+```
+
+The rebuilt binary's hash should match the `ts_cli` entry in `checksums.txt`.
+This is a Linux x86_64, pinned-toolchain reproducibility claim for the release
+binary. It is still separate from the SLSA provenance and Sigstore authenticity
+checks above, which prove where the published artifact came from.
 
 ## What the supply-chain story covers now
 
@@ -67,4 +102,5 @@ independent rebuild.
   every release.
 - **Build provenance** — SLSA v3 attestation per release (this document).
 - **Authenticity** — cosign keyless signatures per release artifact.
-- **Open** — independently-verified reproducible builds.
+- **Reproducibility** — the release binary is rebuilt twice from clean archives
+  and byte-compared before publication.

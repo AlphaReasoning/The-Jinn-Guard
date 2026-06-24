@@ -584,6 +584,7 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | Prometheus `/metrics` + `/healthz` endpoint (opt-in `JINNGUARD_METRICS_PORT`, loopback) | ✅ Done |
 | OTLP/HTTP JSON metrics export (opt-in `JINNGUARD_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_*`) | ✅ Done |
 | Public break-it challenge scope and reporting template ([`BREAK_IT_CHALLENGE.md`](BREAK_IT_CHALLENGE.md)) | ✅ Done |
+| Verified reproducible release build gate ([`RELEASE_INTEGRITY.md`](RELEASE_INTEGRITY.md)) | ✅ Done |
 | Operator runbook ([`OPERATOR_RUNBOOK.md`](OPERATOR_RUNBOOK.md)): install, monitor, upgrade/rollback, incident response | ✅ Done |
 
 ### 🔴 Remaining gaps before 100%

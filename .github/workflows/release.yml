@@ -2,9 +2,9 @@
 #
 # Fires ONLY on a version tag push (`v*`), so it never runs on ordinary push/PR
 # CI. On a tagged release it:
-#   1. builds the release binary and a CycloneDX SBOM,
+#   1. verifies the release binary is reproducible and emits a CycloneDX SBOM,
 #   2. generates SLSA v3 build provenance for the artifacts,
-#   3. signs the binary + SBOM with cosign (keyless / Sigstore OIDC),
+#   3. signs the binary, SBOM, and rebuild report with cosign,
 #   4. publishes everything to a GitHub Release.
 #
 # Verification instructions (cosign verify-blob + slsa-verifier, expected OIDC
@@ -28,9 +28,9 @@ env:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # Build the release artifacts and emit their sha256 subjects for SLSA.
-  # SOURCE_DATE_EPOCH is pinned to the tagged commit's timestamp as a first step
-  # toward reproducibility (see RELEASE_INTEGRITY.md for the honest scope).
+  # Build the release artifacts and emit their sha256 subjects for SLSA. The
+  # binary is accepted only after two clean git-archive rebuilds byte-compare
+  # equal under the pinned toolchain.
   # ───────────────────────────────────────────────────────────────────────────
   build:
     name: Build release artifacts
@@ -45,17 +45,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y libz3-dev keyutils
 
-      - name: Pin SOURCE_DATE_EPOCH to the tagged commit
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
-
-      - name: Build release
-        run: cargo build --release --locked
-
-      - name: Stage artifacts
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp target/release/ts_cli dist/ts_cli
+      - name: Rebuild and compare release binary
+        run: scripts/rebuild_and_compare_release.sh --output dist/ts_cli --report dist/rebuild-and-compare.txt
 
       - name: Generate CycloneDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -69,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ts_cli jinnguard-sbom.cyclonedx.json > checksums.txt
+          sha256sum ts_cli jinnguard-sbom.cyclonedx.json rebuild-and-compare.txt > checksums.txt
           cat checksums.txt
           echo "hashes=$(base64 -w0 checksums.txt)" >> "$GITHUB_OUTPUT"
 
@@ -123,7 +114,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          for f in ts_cli jinnguard-sbom.cyclonedx.json; do
+          for f in ts_cli jinnguard-sbom.cyclonedx.json rebuild-and-compare.txt; do
             cosign sign-blob --yes \
               --output-signature "$f.sig" \
               --output-certificate "$f.pem" \
@@ -137,10 +128,13 @@ jobs:
           files: |
             dist/ts_cli
             dist/jinnguard-sbom.cyclonedx.json
+            dist/rebuild-and-compare.txt
             dist/checksums.txt
             dist/ts_cli.sig
             dist/ts_cli.pem
             dist/jinnguard-sbom.cyclonedx.json.sig
             dist/jinnguard-sbom.cyclonedx.json.pem
+            dist/rebuild-and-compare.txt.sig
+            dist/rebuild-and-compare.txt.pem
           fail_on_unmatched_files: true
           body_path: RELEASE_INTEGRITY.md
