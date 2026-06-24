@@ -102,9 +102,11 @@ ok "Secret permissions set to root:jinnguard mode 0440"
 
 info "Loading secret into Linux kernel keyring (session keyring @s)..."
 if command -v keyctl &>/dev/null; then
-    keyctl add user jinnguard_hmac_key "$(cat /etc/jinnguard/secret)" @s || \
-        warn "keyctl add failed — daemon will fall back to file-based secret"
-    ok "Key 'jinnguard_hmac_key' loaded into @s"
+    if keyctl padd user jinnguard_hmac_key @s < /etc/jinnguard/secret >/dev/null; then
+        ok "Key 'jinnguard_hmac_key' loaded into @s"
+    else
+        warn "keyctl padd failed — daemon will fall back to file-based secret"
+    fi
 else
     warn "keyutils not found — install with: apt install keyutils"
     warn "Daemon will fall back to /etc/jinnguard/secret on startup"

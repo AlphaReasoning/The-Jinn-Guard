@@ -353,7 +353,7 @@ The installer will:
 
 ```bash
 # Load existing secret into kernel keyring
-keyctl add user jinnguard_hmac_key "$(cat /etc/jinnguard/secret)" @s
+keyctl padd user jinnguard_hmac_key @s < /etc/jinnguard/secret
 
 # Verify the key is present
 keyctl show @s

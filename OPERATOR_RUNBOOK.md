@@ -231,7 +231,7 @@ Notes:
 ### Suspected key compromise
 
 Rotate the HMAC secret: write a new value to `/etc/jinnguard/secret`, update the
-keyring (`keyctl add user jinnguard_hmac_key "$(cat /etc/jinnguard/secret)" @s`),
+keyring (`keyctl padd user jinnguard_hmac_key @s < /etc/jinnguard/secret`),
 restart. All in-flight proposals signed with the old key are then rejected.
 
 ---

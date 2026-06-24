@@ -17,7 +17,7 @@ pub mod mcp_gateway;
 pub mod metrics;
 pub mod system_immunity;
 
-use anyhow::Result;
+use anyhow::{Context as AnyhowContext, Result};
 use clap::Parser;
 use governance::{
     AgentLineage, AuditLogger, CapabilityProfile, ClientProposal, CombinedSemanticService,
@@ -29,18 +29,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "kernel_telemetry")]
 use std::thread;
-#[cfg(feature = "kernel_telemetry")]
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::timeout;
 use ts_checker::PolicyEngine;
 use ts_wire::{BodyReject, FrameReject, SignedEnvelope};
 use z3::{Config as Z3Config, Context as Z3Context};
@@ -252,34 +252,53 @@ fn default_ceiling() -> f64 {
     95.0
 }
 
+fn policy_config_from_yaml(yaml: PolicyYaml, allow_anonymous_override: bool) -> PolicyConfig {
+    let agent_nodes: HashMap<String, AgentNodePolicy> = yaml
+        .agent_nodes
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+    PolicyConfig {
+        upper_safety_boundary: yaml.global_safety_ceiling,
+        minimum_trust_score: 100.0 - yaml.global_safety_ceiling,
+        agent_nodes,
+        // Support both field names for compatibility
+        deny_anonymous_agents: yaml.deny_anonymous_agents || yaml.deny_anonymous,
+        allow_anonymous_override,
+        network_policy: yaml.network_policy,
+        runtime_policy: yaml.runtime_policy,
+        fleet_policy_min_version: yaml.fleet_policy_min_version,
+        accept_cross_machine_lineage: yaml.accept_cross_machine_lineage,
+        canary_resources: yaml.canary_resources,
+    }
+}
+
+fn parse_policy_content(content: &str, allow_anonymous_override: bool) -> Result<PolicyConfig> {
+    let yaml = serde_yaml::from_str::<PolicyYaml>(content).context("invalid policy YAML")?;
+    let scope = yaml.enforcement_scope.governed_path_prefixes.clone();
+    let policy = policy_config_from_yaml(yaml, allow_anonymous_override);
+    // Sync the process-wide enforcement scope only after a successful parse. A
+    // malformed hot-reload must keep the last good active policy and scope.
+    set_governed_scope_prefixes(&scope);
+    Ok(policy)
+}
+
+fn try_load_policy_from_path(
+    policy_file: &str,
+    allow_anonymous_override: bool,
+) -> Result<PolicyConfig> {
+    let content = fs::read_to_string(policy_file)
+        .with_context(|| format!("failed to read policy file {policy_file:?}"))?;
+    parse_policy_content(&content, allow_anonymous_override)
+}
+
 fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
-    if let Ok(content) = fs::read_to_string(policy_file) {
-        if let Ok(yaml) = serde_yaml::from_str::<PolicyYaml>(&content) {
-            let agent_nodes: HashMap<String, AgentNodePolicy> = yaml
-                .agent_nodes
-                .into_iter()
-                .map(|n| (n.id.clone(), n))
-                .collect();
-            // Sync the process-wide enforcement scope with the active policy.
-            // Runs on initial load and every hot-reload through this function.
-            set_governed_scope_prefixes(&yaml.enforcement_scope.governed_path_prefixes);
-            return PolicyConfig {
-                upper_safety_boundary: yaml.global_safety_ceiling,
-                minimum_trust_score: 100.0 - yaml.global_safety_ceiling,
-                agent_nodes,
-                // Support both field names for compatibility
-                deny_anonymous_agents: yaml.deny_anonymous_agents || yaml.deny_anonymous,
-                allow_anonymous_override: false,
-                network_policy: yaml.network_policy,
-                runtime_policy: yaml.runtime_policy,
-                fleet_policy_min_version: yaml.fleet_policy_min_version,
-                accept_cross_machine_lineage: yaml.accept_cross_machine_lineage,
-                canary_resources: yaml.canary_resources,
-            };
-        }
+    if let Ok(policy) = try_load_policy_from_path(policy_file, false) {
+        return policy;
     }
     // No readable/valid policy: clear any previously-installed governed scope so
-    // a failed reload cannot leave stale enforcement widening in place.
+    // startup fallback preserves historical local-dev behavior without carrying
+    // a stale scope from an earlier in-process test.
     set_governed_scope_prefixes(&[]);
     PolicyConfig {
         upper_safety_boundary: 75.0,
@@ -301,25 +320,25 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
 /// YAML, so a malformed push leaves the current policy untouched.
 #[cfg(feature = "fleet")]
 fn parse_policy_yaml(content: &str, allow_anonymous: bool) -> Option<PolicyConfig> {
-    let yaml = serde_yaml::from_str::<PolicyYaml>(content).ok()?;
-    let agent_nodes: HashMap<String, AgentNodePolicy> = yaml
-        .agent_nodes
-        .into_iter()
-        .map(|n| (n.id.clone(), n))
-        .collect();
-    set_governed_scope_prefixes(&yaml.enforcement_scope.governed_path_prefixes);
-    Some(PolicyConfig {
-        upper_safety_boundary: yaml.global_safety_ceiling,
-        minimum_trust_score: 100.0 - yaml.global_safety_ceiling,
-        agent_nodes,
-        deny_anonymous_agents: yaml.deny_anonymous_agents || yaml.deny_anonymous,
-        allow_anonymous_override: allow_anonymous,
-        network_policy: yaml.network_policy,
-        runtime_policy: yaml.runtime_policy,
-        fleet_policy_min_version: yaml.fleet_policy_min_version,
-        accept_cross_machine_lineage: yaml.accept_cross_machine_lineage,
-        canary_resources: yaml.canary_resources,
-    })
+    parse_policy_content(content, allow_anonymous).ok()
+}
+
+fn ensure_control_socket_allowlist(policy: &mut PolicyConfig, socket_path: &str) {
+    let socket_path = socket_path.trim();
+    if socket_path.is_empty() {
+        return;
+    }
+    if !policy
+        .network_policy
+        .allowed_unix_sockets
+        .iter()
+        .any(|allowed| allowed == socket_path)
+    {
+        policy
+            .network_policy
+            .allowed_unix_sockets
+            .push(socket_path.to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +516,25 @@ fn parse_socket_mode(raw: &str) -> Result<u32> {
     let without_prefix = trimmed.strip_prefix("0o").unwrap_or(trimmed);
     u32::from_str_radix(without_prefix, 8)
         .map_err(|err| anyhow::anyhow!("invalid --socket-mode {raw:?}: {err}"))
+}
+
+fn remove_stale_unix_socket(socket_path: &str) -> Result<()> {
+    let path = Path::new(socket_path);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    if !metadata.file_type().is_socket() {
+        anyhow::bail!(
+            "refusing to remove non-socket at --socket-path {}",
+            path.display()
+        );
+    }
+
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1156,49 @@ fn get_socket_peer_credentials(stream: &tokio::net::UnixStream) -> Option<PeerCr
 // Framed I/O
 // ---------------------------------------------------------------------------
 
+const UDS_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const POLICY_REFRESH_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const POLICY_REFRESH_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+enum TimedReadError {
+    Io(std::io::Error),
+    TimedOut,
+}
+
+async fn read_exact_with_timeout<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    buf: &mut [u8],
+    duration: Duration,
+) -> Result<(), TimedReadError> {
+    match timeout(duration, stream.read_exact(buf)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(TimedReadError::Io(err)),
+        Err(_) => Err(TimedReadError::TimedOut),
+    }
+}
+
+async fn read_reqwest_text_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<String> {
+    if let Some(len) = response.content_length() {
+        if len > limit as u64 {
+            anyhow::bail!("response body declares {len} bytes; limit is {limit}");
+        }
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("response body exceeds limit {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|err| anyhow::anyhow!("response body is not UTF-8: {err}"))
+}
+
 async fn write_framed_response(
     stream: &mut tokio::net::UnixStream,
     version: u8,
@@ -1280,9 +1361,16 @@ async fn handle_client_connection(
     loop {
         // STEP 1: Read 5-byte protocol header: [4-byte big-endian length][1-byte version].
         let mut header = [0u8; 5];
-        if let Err(e) = stream.read_exact(&mut header).await {
-            println!("[deny] failed to read protocol header: {}", e);
-            return;
+        match read_exact_with_timeout(&mut stream, &mut header, UDS_FRAME_READ_TIMEOUT).await {
+            Ok(()) => {}
+            Err(TimedReadError::Io(e)) => {
+                println!("[deny] failed to read protocol header: {}", e);
+                return;
+            }
+            Err(TimedReadError::TimedOut) => {
+                println!("[deny] timed out reading protocol header");
+                return;
+            }
         }
 
         // STEP 2: Validate the frame header (version + length bound) via the
@@ -1318,9 +1406,16 @@ async fn handle_client_connection(
         };
 
         let mut buffer = vec![0u8; length];
-        if let Err(e) = stream.read_exact(&mut buffer).await {
-            println!("[deny] failed to read payload: {}", e);
-            return;
+        match read_exact_with_timeout(&mut stream, &mut buffer, UDS_FRAME_READ_TIMEOUT).await {
+            Ok(()) => {}
+            Err(TimedReadError::Io(e)) => {
+                println!("[deny] failed to read payload: {}", e);
+                return;
+            }
+            Err(TimedReadError::TimedOut) => {
+                println!("[deny] timed out reading payload");
+                return;
+            }
         }
 
         // STEP 3: Decode the body into a SignedEnvelope (UTF-8 + JSON) via the
@@ -2579,6 +2674,28 @@ fn classify_deputy_connect(request: &LsmRequest, verdict: Verdict) -> Option<Dep
 }
 
 #[cfg(test)]
+mod framed_io_tests {
+    use super::{read_exact_with_timeout, TimedReadError};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn uds_frame_read_times_out_on_partial_header() {
+        let (mut client, mut server) = tokio::io::duplex(8);
+        client
+            .write_all(&[0, 0])
+            .await
+            .expect("write partial header");
+
+        let mut header = [0u8; 5];
+        let err = read_exact_with_timeout(&mut server, &mut header, Duration::from_millis(10))
+            .await
+            .expect_err("partial header should time out");
+        assert!(matches!(err, TimedReadError::TimedOut), "got: {err:?}");
+    }
+}
+
+#[cfg(test)]
 mod deputy_detection_tests {
     use super::*;
 
@@ -2734,11 +2851,11 @@ mod deputy_detection_tests {
 fn lsm_network_verdict(request: &LsmRequest, policy: &NetworkPolicy) -> Verdict {
     let resource = request.effective_path();
     if request.family as i32 == libc::AF_UNIX {
-        if policy.default_deny
+        if policy.unix_default_deny
             && !policy
                 .allowed_unix_sockets
                 .iter()
-                .any(|allowed| resource.starts_with(allowed))
+                .any(|allowed| resource == allowed)
         {
             return explainability::explain_deny(
                 request,
@@ -2864,6 +2981,51 @@ mod replay_guard_tests {
         // An evicted (old) nonce is outside the window — accepted again (the
         // documented bounded-window trade-off, not unbounded memory).
         assert!(g.observe(("agent".to_string(), 0)));
+    }
+}
+
+#[cfg(test)]
+mod socket_startup_tests {
+    use super::remove_stale_unix_socket;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "jinnguard_socket_startup_{name}_{}",
+            std::process::id()
+        ));
+        path
+    }
+
+    #[test]
+    fn remove_stale_unix_socket_removes_only_socket_nodes() {
+        let path = temp_path("sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+
+        remove_stale_unix_socket(path.to_str().unwrap()).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_stale_unix_socket_refuses_regular_file() {
+        let path = temp_path("file");
+        let _ = std::fs::remove_file(&path);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"do not delete").unwrap();
+        drop(file);
+
+        let err = remove_stale_unix_socket(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("refusing to remove non-socket"), "got: {err}");
+        assert!(path.exists(), "regular file must not be removed");
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -3783,6 +3945,61 @@ mod escalation_tests {
     }
 }
 
+#[cfg(all(test, feature = "kernel_telemetry"))]
+mod kernel_network_policy_mirror_tests {
+    use super::{lsm_network_verdict, NetworkPolicy};
+    use crate::ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
+
+    fn unix_connect(path: &str) -> LsmRequest {
+        LsmRequest {
+            cookie: 1,
+            pid: std::process::id(),
+            req_type: LsmRequestType::Connect,
+            source_program: 0,
+            family: libc::AF_UNIX as u16,
+            tty: None,
+            is_interactive: false,
+            process_path: None,
+            resource: path.to_string(),
+            resolved_path: None,
+            payload_preview: vec![],
+        }
+    }
+
+    #[test]
+    fn unix_default_deny_uses_exact_allowlist_match() {
+        let policy = NetworkPolicy {
+            unix_default_deny: true,
+            allowed_unix_sockets: vec!["/tmp/allowed.sock".to_string()],
+            ..NetworkPolicy::default()
+        };
+
+        assert!(matches!(
+            lsm_network_verdict(&unix_connect("/tmp/allowed.sock"), &policy),
+            Verdict::Allow
+        ));
+        assert!(matches!(
+            lsm_network_verdict(&unix_connect("/tmp/allowed.sock.evil"), &policy),
+            Verdict::Deny
+        ));
+    }
+
+    #[test]
+    fn unix_connects_follow_unix_default_deny_not_ipv4_default_deny() {
+        let policy = NetworkPolicy {
+            default_deny: true,
+            unix_default_deny: false,
+            allowed_unix_sockets: Vec::new(),
+            ..NetworkPolicy::default()
+        };
+
+        assert!(matches!(
+            lsm_network_verdict(&unix_connect("/tmp/not-listed.sock"), &policy),
+            Verdict::Allow
+        ));
+    }
+}
+
 #[cfg(test)]
 mod identity_tracking_tests {
     use super::{lsm_intent_response_verdict, lsm_origin_gate_verdict};
@@ -4142,10 +4359,9 @@ async fn run() -> Result<()> {
         }
     }
 
-    // Remove stale socket.
-    if Path::new(&args.socket_path).exists() {
-        fs::remove_file(&args.socket_path)?;
-    }
+    // Remove only a stale Unix socket. Refuse regular files/symlinks so a
+    // misconfigured --socket-path can never become an arbitrary unlink.
+    remove_stale_unix_socket(&args.socket_path)?;
 
     // Load the admission secret once at startup. Runtime rotation is a supervised
     // restart operation; per-frame file re-reads let a missing secret file crash
@@ -4155,6 +4371,7 @@ async fn run() -> Result<()> {
     // Load initial policy.
     let mut initial_policy = load_policy_from_path(&args.policy_file);
     initial_policy.allow_anonymous_override = args.allow_anonymous;
+    ensure_control_socket_allowlist(&mut initial_policy, &args.socket_path);
     let active_policy = Arc::new(Mutex::new(initial_policy));
 
     // Shared state.
@@ -4200,6 +4417,7 @@ async fn run() -> Result<()> {
         let policy_file = args.policy_file.clone();
         let active_policy = Arc::clone(&active_policy);
         let allow_anonymous = args.allow_anonymous;
+        let socket_path = args.socket_path.clone();
         tokio::spawn(async move {
             let mut hup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
             loop {
@@ -4208,10 +4426,18 @@ async fn run() -> Result<()> {
                     "[config] SIGHUP received — reloading policy from {}",
                     policy_file
                 );
-                let mut new_policy = load_policy_from_path(&policy_file);
-                new_policy.allow_anonymous_override = allow_anonymous;
-                *active_policy.lock().unwrap() = new_policy;
-                println!("[config] Policy reloaded.");
+                match try_load_policy_from_path(&policy_file, allow_anonymous) {
+                    Ok(mut new_policy) => {
+                        ensure_control_socket_allowlist(&mut new_policy, &socket_path);
+                        *active_policy.lock().unwrap() = new_policy;
+                        println!("[config] Policy reloaded.");
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[config] policy reload rejected; keeping active policy: {err:#}"
+                        );
+                    }
+                }
             }
         });
     }
@@ -4221,75 +4447,71 @@ async fn run() -> Result<()> {
         let active_policy = Arc::clone(&active_policy);
         let refresh_secs = args.policy_refresh_secs;
         let allow_anonymous = args.allow_anonymous;
-        tokio::spawn(async move {
-            let mut etag: Option<String> = None;
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
-                // Build a reqwest client and fetch with If-None-Match
-                let client = match reqwest::Client::builder()
-                    .danger_accept_invalid_certs(false)
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("[policy-server] failed to build HTTP client: {e}");
-                        continue;
-                    }
-                };
-                let mut req = client.get(&policy_url);
-                if let Some(ref tag) = etag {
-                    req = req.header("If-None-Match", tag.as_str());
-                }
-                match req.send().await {
-                    Ok(resp) => {
-                        if resp.status() == 304 {
-                            // Not modified
-                            continue;
+        let socket_path = args.socket_path.clone();
+        match reqwest::Client::builder()
+            .danger_accept_invalid_certs(false)
+            .timeout(POLICY_REFRESH_FETCH_TIMEOUT)
+            .build()
+        {
+            Ok(client) => {
+                tokio::spawn(async move {
+                    let mut etag: Option<String> = None;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
+                        // Fetch with If-None-Match under a bounded request timeout.
+                        let mut req = client.get(&policy_url);
+                        if let Some(ref tag) = etag {
+                            req = req.header("If-None-Match", tag.as_str());
                         }
-                        let new_etag = resp
-                            .headers()
-                            .get("ETag")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_string());
-                        match resp.text().await {
-                            Ok(body) => {
-                                if let Ok(new_policy) = serde_yaml::from_str::<PolicyYaml>(&body) {
-                                    let nodes: HashMap<String, AgentNodePolicy> = new_policy
-                                        .agent_nodes
-                                        .into_iter()
-                                        .map(|n| (n.id.clone(), n))
-                                        .collect();
-                                    let cfg = PolicyConfig {
-                                        upper_safety_boundary: new_policy.global_safety_ceiling,
-                                        minimum_trust_score: 100.0
-                                            - new_policy.global_safety_ceiling,
-                                        agent_nodes: nodes,
-                                        deny_anonymous_agents: new_policy.deny_anonymous_agents
-                                            || new_policy.deny_anonymous,
-                                        allow_anonymous_override: allow_anonymous,
-                                        network_policy: new_policy.network_policy,
-                                        runtime_policy: new_policy.runtime_policy,
-                                        fleet_policy_min_version: new_policy
-                                            .fleet_policy_min_version,
-                                        accept_cross_machine_lineage: new_policy
-                                            .accept_cross_machine_lineage,
-                                        canary_resources: new_policy.canary_resources,
-                                    };
-                                    *active_policy.lock().unwrap() = cfg;
-                                    etag = new_etag;
-                                    println!(
-                                        "[policy-server] Policy refreshed from {}",
-                                        policy_url
-                                    );
+                        match req.send().await {
+                            Ok(resp) => {
+                                if resp.status() == 304 {
+                                    // Not modified
+                                    continue;
+                                }
+                                let new_etag = resp
+                                    .headers()
+                                    .get("ETag")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
+                                match read_reqwest_text_limited(resp, POLICY_REFRESH_MAX_BODY_BYTES)
+                                    .await
+                                {
+                                    Ok(body) => {
+                                        match parse_policy_content(&body, allow_anonymous) {
+                                            Ok(mut cfg) => {
+                                                ensure_control_socket_allowlist(
+                                                    &mut cfg,
+                                                    &socket_path,
+                                                );
+                                                *active_policy.lock().unwrap() = cfg;
+                                                etag = new_etag;
+                                                println!(
+                                                    "[policy-server] Policy refreshed from {}",
+                                                    policy_url
+                                                );
+                                            }
+                                            Err(err) => {
+                                                eprintln!(
+                                                    "[policy-server] invalid policy body; keeping active policy: {err:#}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[policy-server] failed to read body: {e}")
+                                    }
                                 }
                             }
-                            Err(e) => eprintln!("[policy-server] failed to read body: {e}"),
+                            Err(e) => eprintln!("[policy-server] fetch error: {e}"),
                         }
                     }
-                    Err(e) => eprintln!("[policy-server] fetch error: {e}"),
-                }
+                });
             }
-        });
+            Err(e) => {
+                eprintln!("[policy-server] failed to build HTTP client: {e}");
+            }
+        }
     }
 
     // ── Optional: SIGNED fleet-policy bundle refresh (open-core hook) ─────────
@@ -4313,6 +4535,7 @@ async fn run() -> Result<()> {
             None => (*secret).clone(),
         };
         let cache_path = args.fleet_policy_cache.clone();
+        let socket_path = args.socket_path.clone();
         tokio::spawn(async move {
             // Rollback floor: never accept a bundle older than this. Seeded from
             // the active policy and ratcheted up as newer bundles are applied.
@@ -4323,7 +4546,10 @@ async fn run() -> Result<()> {
             if let Some(ref cp) = cache_path {
                 if let Some(bundle) = fleet_policy::load_cached_bundle(cp) {
                     if bundle.version >= min_version && bundle.verify(&fleet_key) {
-                        if let Some(cfg) = parse_policy_yaml(&bundle.policy_yaml, allow_anonymous) {
+                        if let Some(mut cfg) =
+                            parse_policy_yaml(&bundle.policy_yaml, allow_anonymous)
+                        {
+                            ensure_control_socket_allowlist(&mut cfg, &socket_path);
                             *active_policy.lock().unwrap() = cfg;
                             applied_version = bundle.version;
                             min_version = min_version.max(bundle.version);
@@ -4336,7 +4562,10 @@ async fn run() -> Result<()> {
                 }
             }
 
-            let client = match reqwest::Client::builder().build() {
+            let client = match reqwest::Client::builder()
+                .timeout(POLICY_REFRESH_FETCH_TIMEOUT)
+                .build()
+            {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("[fleet] HTTP client build failed: {e}");
@@ -4362,13 +4591,14 @@ async fn run() -> Result<()> {
                     eprintln!("[fleet] server returned {}", resp.status());
                     continue;
                 }
-                let body = match resp.text().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("[fleet] read error: {e}");
-                        continue;
-                    }
-                };
+                let body =
+                    match read_reqwest_text_limited(resp, POLICY_REFRESH_MAX_BODY_BYTES).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[fleet] read error: {e}");
+                            continue;
+                        }
+                    };
                 let bundle: fleet_policy::PolicyBundle = match serde_json::from_str(&body) {
                     Ok(b) => b,
                     Err(e) => {
@@ -4404,7 +4634,8 @@ async fn run() -> Result<()> {
                     BundleDecision::Apply => {}
                 }
                 match parse_policy_yaml(&bundle.policy_yaml, allow_anonymous) {
-                    Some(cfg) => {
+                    Some(mut cfg) => {
+                        ensure_control_socket_allowlist(&mut cfg, &socket_path);
                         *active_policy.lock().unwrap() = cfg;
                         applied_version = bundle.version;
                         min_version = min_version.max(bundle.version);
@@ -4698,15 +4929,26 @@ mod interpreter_bypass_tests {
 mod governed_scope_tests {
     use super::{
         is_base_system_path, is_enforcement_target, is_path_in_test_scope, path_is_governed,
-        set_governed_scope_prefixes,
+        set_governed_scope_prefixes, try_load_policy_from_path,
     };
     use std::sync::Mutex;
+    use std::{fs, path::PathBuf};
 
     // Serialize tests that mutate the process-wide governed scope.
     static SCOPE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset() {
         set_governed_scope_prefixes(&[]);
+    }
+
+    fn temp_policy_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "jinnguard_policy_reload_{}_{}.yaml",
+            name,
+            std::process::id()
+        ));
+        path
     }
 
     #[test]
@@ -4783,6 +5025,50 @@ mod governed_scope_tests {
                 "ANTI-LOCKOUT: base-system path {p} must never be governed"
             );
         }
+        reset();
+    }
+
+    #[test]
+    fn failed_policy_try_load_keeps_existing_governed_scope() {
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        set_governed_scope_prefixes(&["/opt/jinn-agent".to_string()]);
+        let path = temp_policy_path("invalid");
+        fs::write(&path, "global_safety_ceiling: [not-valid").unwrap();
+
+        let err = try_load_policy_from_path(path.to_str().unwrap(), false).unwrap_err();
+
+        assert!(err.to_string().contains("invalid policy YAML"));
+        assert!(
+            path_is_governed("/opt/jinn-agent/runner"),
+            "failed reload must leave last good governed scope intact"
+        );
+        let _ = fs::remove_file(path);
+        reset();
+    }
+
+    #[test]
+    fn successful_policy_try_load_installs_scope_and_anonymous_deny() {
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        let path = temp_policy_path("valid");
+        fs::write(
+            &path,
+            r#"
+global_safety_ceiling: 80
+deny_anonymous_agents: true
+enforcement_scope:
+  governed_path_prefixes:
+    - /opt/jinn-agent
+"#,
+        )
+        .unwrap();
+
+        let policy = try_load_policy_from_path(path.to_str().unwrap(), false).unwrap();
+
+        assert!(policy.deny_anonymous_agents);
+        assert!(path_is_governed("/opt/jinn-agent/runner"));
+        let _ = fs::remove_file(path);
         reset();
     }
 }

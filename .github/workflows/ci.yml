@@ -8,6 +8,9 @@ on:
   # run on a self-hosted BPF-LSM runner (see the kernel-lsm-real job below).
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
