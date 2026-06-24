@@ -606,18 +606,6 @@ mod broker_policy {
         "systemctl stop",
     ];
 
-    /// Only these URL scheme+host prefixes are permitted for network requests.
-    pub const ALLOWED_URL_PREFIXES: &[&str] = &["https://"];
-
-    /// URL patterns that are explicitly denied even under https.
-    pub const DENIED_URL_PATTERNS: &[&str] = &[
-        "169.254.", // AWS/GCP instance metadata
-        "::1",
-        "localhost",
-        "127.0.0.",
-        "0.0.0.0",
-    ];
-
     /// Path prefixes that agents may NOT write to.
     pub const DENIED_PATH_PREFIXES: &[&str] = &[
         "/etc/",
@@ -628,6 +616,35 @@ mod broker_policy {
         "/run/jinnguard/",
         "/var/log/jinnguard/",
     ];
+}
+
+fn broker_https_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    parsed
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn broker_host_is_denied(host: &str) -> bool {
+    host == "localhost"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.starts_with("127.")
+        || host.starts_with("169.254.")
+}
+
+fn broker_host_matches_destination(host: &str, destination: &str) -> bool {
+    let destination = destination
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if destination.is_empty() {
+        return false;
+    }
+    host == destination || host.ends_with(&format!(".{destination}"))
 }
 
 impl ExecutionBroker {
@@ -655,11 +672,20 @@ impl ExecutionBroker {
             // Enforce network destination filter for constrained network requests.
             if let ProposedAction::NetworkRequest { ref url, .. } = request.action {
                 if !constraints.allowed_network_destinations.is_empty() {
-                    let url_lower = url.to_lowercase();
+                    let Some(host) = broker_https_host(url) else {
+                        return ExecutionDecision {
+                            permitted: false,
+                            constrained: true,
+                            reason: format!("CONSTRAINT_NETWORK_URL_NOT_ALLOWED:{}", url),
+                            action: request.action,
+                            policy_decision: request.policy_decision,
+                            active_constraints: Some(constraints),
+                        };
+                    };
                     let allowed = constraints
                         .allowed_network_destinations
                         .iter()
-                        .any(|dest| url_lower.contains(&dest.to_lowercase()));
+                        .any(|dest| broker_host_matches_destination(&host, dest));
                     if !allowed {
                         return ExecutionDecision {
                             permitted: false,
@@ -712,18 +738,12 @@ impl ExecutionBroker {
                 None
             }
             ProposedAction::NetworkRequest { method: _, url } => {
-                // Must start with an allowed prefix.
-                let allowed = broker_policy::ALLOWED_URL_PREFIXES
-                    .iter()
-                    .any(|prefix| url.starts_with(prefix));
-                if !allowed {
+                // Must parse as HTTPS and expose a concrete host.
+                let Some(host) = broker_https_host(url) else {
                     return Some(format!("BROKER_DENY_URL_SCHEME_NOT_ALLOWED:{}", url));
-                }
-                // Must not match a denied pattern.
-                for pattern in broker_policy::DENIED_URL_PATTERNS {
-                    if url.contains(pattern) {
-                        return Some(format!("BROKER_DENY_URL_PATTERN_MATCHED:{}", pattern));
-                    }
+                };
+                if broker_host_is_denied(&host) {
+                    return Some(format!("BROKER_DENY_URL_PATTERN_MATCHED:{}", host));
                 }
                 None
             }
@@ -862,8 +882,9 @@ impl LineageRegistry {
                 if let Ok(legacy) = serde_json::from_str::<RegistryData>(&content) {
                     data = legacy;
                     // Persist migrated data into SQLite immediately.
+                    let mut migration_ok = true;
                     for (key, lineage) in &data.lineages {
-                        let _ = conn.execute(
+                        if let Err(err) = conn.execute(
                             "INSERT OR REPLACE INTO lineages \
                              (key, pid, uid, gid, start_time, first_seen, last_seen, \
                               first_sequence, last_sequence, max_assessed_risk, \
@@ -883,10 +904,25 @@ impl LineageRegistry {
                                 lineage.decisions_seen as i64,
                                 lineage.executable_path.as_deref(),
                             ],
-                        );
+                        ) {
+                            eprintln!(
+                                "LineageRegistry: legacy JSON migration failed for key {key}: {err}; \
+                                 keeping legacy file for retry"
+                            );
+                            migration_ok = false;
+                            break;
+                        }
                     }
-                    // Remove the old JSON file after successful migration.
-                    let _ = fs::remove_file(file_path);
+                    // Remove the old JSON file only after every row is durably
+                    // copied. Dropping it after a partial migration can reset
+                    // sequence/quota history on the next restart.
+                    if migration_ok {
+                        if let Err(err) = fs::remove_file(file_path) {
+                            eprintln!(
+                                "LineageRegistry: migrated legacy JSON but could not remove {file_path}: {err}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1591,44 +1627,54 @@ impl AuditLogger {
         let full_json = serde_json::to_string(&entry)?;
         let intent_class_str = format!("{:?}", entry.intent.class);
         let verdict_str = format!("{:?}", entry.decision.verdict);
-        if let Ok(conn) = self.db.lock() {
-            let _ = conn.execute(
-                "INSERT INTO audit_log \
+        if let Ok(mut conn) = self.db.lock() {
+            let db_result: rusqlite::Result<()> = (|| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO audit_log \
                  (idx, timestamp_secs, prev_hash, pid, subject, intent_class, \
                   fused_risk, trust_score, verdict, reason, entry_hash, full_json) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![
-                    entry.index as i64,
-                    entry.timestamp_secs as i64,
-                    &entry.prev_hash,
-                    entry.observation.pid as i64,
-                    &subject_pseudonym,
-                    &intent_class_str,
-                    entry.assessment.fused_risk,
-                    entry.assessment.trust_score,
-                    &verdict_str,
-                    &entry.decision.reason,
-                    &current_hash,
-                    &full_json,
-                ],
-            );
-            let _ = conn.execute(
-                "INSERT INTO audit_pii \
+                    params![
+                        entry.index as i64,
+                        entry.timestamp_secs as i64,
+                        &entry.prev_hash,
+                        entry.observation.pid as i64,
+                        &subject_pseudonym,
+                        &intent_class_str,
+                        entry.assessment.fused_risk,
+                        entry.assessment.trust_score,
+                        &verdict_str,
+                        &entry.decision.reason,
+                        &current_hash,
+                        &full_json,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO audit_pii \
                  (pii_ref, idx, subject, salt, uid, gid, executable_path, \
                   command_line, created_secs) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![
-                    &pii_ref,
-                    entry.index as i64,
-                    &subject_pseudonym,
-                    hex::encode(&salt),
-                    pii.uid as i64,
-                    pii.gid as i64,
-                    pii.executable_path.as_deref(),
-                    serde_json::to_string(&pii.command_line).unwrap_or_default(),
-                    now as i64,
-                ],
-            );
+                    params![
+                        &pii_ref,
+                        entry.index as i64,
+                        &subject_pseudonym,
+                        hex::encode(&salt),
+                        pii.uid as i64,
+                        pii.gid as i64,
+                        pii.executable_path.as_deref(),
+                        serde_json::to_string(&pii.command_line).unwrap_or_default(),
+                        now as i64,
+                    ],
+                )?;
+                tx.commit()
+            })();
+            if let Err(err) = db_result {
+                eprintln!(
+                    "AuditLogger: SQLite mirror write failed after JSONL append; \
+                     hash chain will continue from JSONL: {err}"
+                );
+            }
         }
 
         // #11 monitoring: this entry's index is 0-based, so the chain now holds
@@ -1670,18 +1716,9 @@ impl AuditLogger {
     }
 
     fn get_last_entry_info(&self) -> Result<(u64, String)> {
-        // Primary: query the SQLite DB for the last row.
-        if let Ok(conn) = self.db.lock() {
-            let result: rusqlite::Result<(i64, String)> = conn.query_row(
-                "SELECT idx, entry_hash FROM audit_log ORDER BY id DESC LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            );
-            if let Ok((idx, hash)) = result {
-                return Ok((idx as u64 + 1, hash));
-            }
-        }
-        // Fallback: scan the JSONL file (covers first-run and migration scenarios).
+        // Primary: scan the JSONL chain. SQLite is a query mirror; if a prior
+        // mirror write failed after JSONL append, trusting SQLite first would
+        // fork the next JSONL hash link from stale state.
         if Path::new(&self.file_path).exists() {
             if let Ok(content) = fs::read_to_string(&self.file_path) {
                 let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
@@ -1690,6 +1727,18 @@ impl AuditLogger {
                         return Ok((entry.index + 1, entry.hash));
                     }
                 }
+            }
+        }
+        // Fallback: query the SQLite DB for installs that have not written a
+        // JSONL chain yet or for legacy deployments where the file is absent.
+        if let Ok(conn) = self.db.lock() {
+            let result: rusqlite::Result<(i64, String)> = conn.query_row(
+                "SELECT idx, entry_hash FROM audit_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            );
+            if let Ok((idx, hash)) = result {
+                return Ok((idx as u64 + 1, hash));
             }
         }
         Ok((0, "0".repeat(64)))
@@ -1856,6 +1905,7 @@ mod tests {
     fn test_lineage_registry_saving() {
         let path = "/tmp/test_lineage_reg.json";
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lineage_db_path(path));
         let mut reg = LineageRegistry::load_or_create(path);
         let obs = observation();
         let semantic = LocalHeuristicSemanticService.classify(&ClientProposal {
@@ -1880,6 +1930,75 @@ mod tests {
         let loaded = LineageRegistry::load_or_create(path);
         assert!(loaded.data.lineages.contains_key("42:12345"));
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lineage_db_path(path));
+    }
+
+    #[test]
+    fn lineage_legacy_json_kept_when_sqlite_migration_insert_fails() {
+        let path = "/tmp/test_lineage_migration_fail.json";
+        let db_path = lineage_db_path(path);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let obs = observation();
+        let semantic = LocalHeuristicSemanticService.classify(&ClientProposal {
+            session_privilege_bit: None,
+            action_risk_score: None,
+            sequence_counter: 1,
+            intent_name: None,
+            prompt: None,
+            plan: None,
+            source_code: None,
+            requested_capabilities: vec![],
+            proposed_action: None,
+            context_vars: std::collections::HashMap::new(),
+        });
+        let capability = CapabilityProfile::from_observation(&obs, &[]);
+        let assessment = RiskAssessment::assess(&obs, &semantic, &capability, None);
+        let mut data = RegistryData {
+            lineages: std::collections::HashMap::new(),
+        };
+        data.lineages.insert(
+            "42:12345".to_string(),
+            AgentLineage::new(&obs, 1, &assessment),
+        );
+        fs::write(path, serde_json::to_string(&data).unwrap()).unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS lineages (
+                    key               TEXT PRIMARY KEY,
+                    pid               INTEGER,
+                    uid               INTEGER,
+                    gid               INTEGER,
+                    start_time        INTEGER,
+                    first_seen        INTEGER,
+                    last_seen         INTEGER,
+                    first_sequence    INTEGER,
+                    last_sequence     INTEGER,
+                    max_assessed_risk REAL,
+                    decisions_seen    INTEGER,
+                    executable_path   TEXT
+                );
+                CREATE TRIGGER lineage_migration_abort
+                BEFORE INSERT ON lineages
+                BEGIN
+                    SELECT RAISE(ABORT, 'migration blocked');
+                END;",
+            )
+            .unwrap();
+        }
+
+        let loaded = LineageRegistry::load_or_create(path);
+
+        assert!(loaded.data.lineages.contains_key("42:12345"));
+        assert!(
+            Path::new(path).exists(),
+            "legacy JSON must stay on disk when SQLite migration fails"
+        );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]
@@ -1992,6 +2111,44 @@ mod tests {
             "audit indices must be a contiguous 0..N with no duplicates (race-free)"
         );
 
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_chain_continues_when_sqlite_mirror_insert_fails() {
+        let path = "/tmp/test_audit_logger_sqlite_gap.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        let obs = observation();
+        let (semantic, assessment, decision) = audit_inputs(&obs);
+
+        logger.log(&obs, &semantic, &assessment, &decision).unwrap();
+        {
+            let conn = logger.db.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER audit_log_abort_idx1
+                 BEFORE INSERT ON audit_log
+                 WHEN NEW.idx = 1
+                 BEGIN
+                     SELECT RAISE(ABORT, 'mirror blocked');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        logger.log(&obs, &semantic, &assessment, &decision).unwrap();
+        logger.log(&obs, &semantic, &assessment, &decision).unwrap();
+
+        let verification = logger.verify_chain().unwrap();
+        assert_eq!(verification.entries, 3);
+        assert!(
+            verification.intact,
+            "JSONL hash chain must continue from JSONL after a mirror write failure"
+        );
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(&db_path);
     }
@@ -2371,6 +2528,36 @@ mod tests {
     }
 
     #[test]
+    fn broker_blocks_case_insensitive_localhost_url() {
+        let request = ExecutionRequest {
+            action: ProposedAction::NetworkRequest {
+                method: "GET".to_string(),
+                url: "https://LOCALHOST/admin".to_string(),
+            },
+            observation: low_risk_observation(),
+            semantic_intent: SemanticIntent {
+                class: IntentClass::NetworkAccess,
+                confidence: 0.8,
+                risk_score: 30.0,
+                signals: vec![],
+            },
+            risk_assessment: RiskAssessment {
+                observed_risk: 0.0,
+                semantic_risk: 30.0,
+                topology_risk: 0.0,
+                declared_risk: None,
+                fused_risk: 30.0,
+                trust_score: 70.0,
+                reasons: vec![],
+            },
+            policy_decision: make_allowed_policy_decision(),
+        };
+        let decision = ExecutionBroker.decide(request);
+        assert!(!decision.permitted);
+        assert!(decision.reason.contains("BROKER_DENY_URL_PATTERN_MATCHED"));
+    }
+
+    #[test]
     fn broker_blocks_etc_write() {
         let request = ExecutionRequest {
             action: ProposedAction::FileWrite {
@@ -2432,35 +2619,75 @@ mod tests {
         assert!(decision
             .reason
             .contains("BROKER_DENY_PATH_TRAVERSAL_DETECTED"));
-        #[test]
-        fn broker_allows_safe_https_request() {
-            let request = ExecutionRequest {
-                action: ProposedAction::NetworkRequest {
-                    method: "GET".to_string(),
-                    url: "https://api.openai.com/v1/completions".to_string(),
-                },
-                observation: low_risk_observation(),
-                semantic_intent: SemanticIntent {
-                    class: IntentClass::NetworkAccess,
-                    confidence: 0.8,
-                    risk_score: 30.0,
-                    signals: vec!["network_access".to_string()],
-                },
-                risk_assessment: RiskAssessment {
-                    observed_risk: 0.0,
-                    semantic_risk: 30.0,
-                    topology_risk: 0.0,
-                    declared_risk: None,
-                    fused_risk: 30.0,
-                    trust_score: 70.0,
-                    reasons: vec![],
-                },
-                policy_decision: make_allowed_policy_decision(),
-            };
-            let decision = ExecutionBroker.decide(request);
-            assert!(decision.permitted);
-        }
-    } // broker_allows_safe_https_request
+    }
+
+    #[test]
+    fn broker_allows_safe_https_request() {
+        let request = ExecutionRequest {
+            action: ProposedAction::NetworkRequest {
+                method: "GET".to_string(),
+                url: "https://api.openai.com/v1/completions".to_string(),
+            },
+            observation: low_risk_observation(),
+            semantic_intent: SemanticIntent {
+                class: IntentClass::NetworkAccess,
+                confidence: 0.8,
+                risk_score: 30.0,
+                signals: vec!["network_access".to_string()],
+            },
+            risk_assessment: RiskAssessment {
+                observed_risk: 0.0,
+                semantic_risk: 30.0,
+                topology_risk: 0.0,
+                declared_risk: None,
+                fused_risk: 30.0,
+                trust_score: 70.0,
+                reasons: vec![],
+            },
+            policy_decision: make_allowed_policy_decision(),
+        };
+        let decision = ExecutionBroker.decide(request);
+        assert!(decision.permitted);
+    }
+
+    #[test]
+    fn constrained_network_destination_requires_host_match() {
+        let mut policy_decision = make_allowed_policy_decision();
+        policy_decision.verdict = PolicyVerdict::Constrain;
+        policy_decision.reason = "mid_risk".to_string();
+        policy_decision.constraints = Some(ConstraintSet {
+            allowed_network_destinations: vec!["api.example.com".to_string()],
+            ..ConstraintSet::default()
+        });
+        let request = ExecutionRequest {
+            action: ProposedAction::NetworkRequest {
+                method: "GET".to_string(),
+                url: "https://api.example.com.attacker.invalid/callback".to_string(),
+            },
+            observation: low_risk_observation(),
+            semantic_intent: SemanticIntent {
+                class: IntentClass::NetworkAccess,
+                confidence: 0.8,
+                risk_score: 50.0,
+                signals: vec!["network_access".to_string()],
+            },
+            risk_assessment: RiskAssessment {
+                observed_risk: 0.0,
+                semantic_risk: 50.0,
+                topology_risk: 0.0,
+                declared_risk: None,
+                fused_risk: 50.0,
+                trust_score: 50.0,
+                reasons: vec![],
+            },
+            policy_decision,
+        };
+        let decision = ExecutionBroker.decide(request);
+        assert!(!decision.permitted);
+        assert!(decision
+            .reason
+            .contains("CONSTRAINT_NETWORK_DESTINATION_NOT_ALLOWED"));
+    }
 } // end mod tests
 
 // =============================================================================

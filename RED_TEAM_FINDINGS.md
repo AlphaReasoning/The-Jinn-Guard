@@ -152,6 +152,239 @@ risk state.
   `test_out_of_order_sequence_is_denied_by_lineage`,
   `test_outside_scope_fast_path_persists_lineage_state`.
 
+## Batch 6 — MCP gateway remote abuse paths
+
+### JG-RT-008 — MCP clients could self-attest into system-process immunity (HIGH, fixed)
+The MCP gateway ran `system_immunity::mcp_caller_is_immune` before the normal
+protected-resource / policy path. That helper trusted JSON-RPC `method` and
+client-supplied params such as `caller`, `process_name`, and `command`; over TCP
+there is no `SO_PEERCRED`, so a remote client could claim an immune process like
+`bash`, `systemd`, or `cargo` and receive the immunity forwarding path.
+- **Fix:** MCP system-process immunity no longer trusts any client-declared method
+  or params. The Unix socket path keeps kernel-backed peer-credential immunity; the
+  TCP gateway must pass through the normal governance gates unless future trusted
+  transport metadata is added. Test:
+  `mcp_immunity_does_not_trust_client_declared_process_fields`.
+
+### JG-RT-009 — MCP slowloris / unbounded upstream response DoS (MED, fixed)
+The gateway bounded inbound `Content-Length`, but connection handlers had no request
+read deadline and `forward_to_upstream` used `read_to_end` with no maximum response
+size. A slow client could hold handler tasks open cheaply, and a compromised or
+misconfigured upstream MCP server could drive unbounded daemon memory growth on an
+allowed request.
+- **Fix:** added a 5s inbound request read timeout, a 5s upstream connect timeout,
+  a 10s upstream response timeout, and an 8 MiB upstream response cap. Test:
+  `upstream_response_read_is_bounded`.
+
+## Batch 7 — UDS admission availability
+
+### JG-RT-010 — UDS partial-frame slowloris can pin connection tasks (LOW, fixed)
+The Unix-domain-socket verdict loop bounded frame sizes and verified HMAC before
+policy parsing, but `read_exact` on the 5-byte header and body had no deadline. A
+local actor with socket access could open many connections, send a partial header or
+partial body, and hold Tokio tasks/file descriptors indefinitely without completing
+admission.
+- **Fix:** added a 5s read deadline around each UDS header/body read. Test:
+  `uds_frame_read_times_out_on_partial_header`.
+
+## Batch 8 — policy refresh resilience
+
+### JG-RT-011 — Remote policy refresh can hang indefinitely (MED, fixed)
+The standalone signed-bundle fetch helper had a timeout, but the daemon's long-running
+raw policy-server loop and signed fleet-policy loop built async `reqwest` clients
+without request timeouts. A hung or malicious endpoint could stall its refresh task
+forever, leaving the daemon pinned to stale policy until restart. Existing signature
+and rollback checks still prevented tamper/fail-open, but availability of policy
+updates was attacker-controlled by the endpoint.
+- **Fix:** both async refresh clients now use a bounded 10s request timeout. The
+  optional raw policy-client build failure logs and leaves the daemon running; the
+  signed fleet loop keeps its existing fail-safe behavior of preserving the active
+  policy on fetch errors.
+
+## Batch 9 — BPF/userspace verdict mirror consistency
+
+### JG-RT-012 — AF_UNIX userspace verdict mirror drifted from kernel semantics (LOW, fixed)
+The BPF `socket_connect` hook enforces AF_UNIX default-deny with a dedicated
+`unix_default_deny` bit and exact path allowlist matching. The userspace mirror used
+for telemetry/explanations still checked the IPv4 `default_deny` flag and allowed
+prefix matches. Kernel enforcement remained correct, but metrics, explanations, and
+adaptive telemetry could mislabel UNIX socket decisions under mixed policies.
+- **Fix:** the userspace mirror now checks `unix_default_deny` and exact
+  allowlist equality. The daemon also injects its own control socket into the
+  in-memory policy on initial load and reload, matching the BPF map loader's
+  anti-lockout allowlist behavior. Feature-gated tests:
+  `unix_default_deny_uses_exact_allowlist_match`,
+  `unix_connects_follow_unix_default_deny_not_ipv4_default_deny`.
+
+## Batch 10 — deployment unit socket exposure
+
+### JG-RT-013 — systemd unit relied on implicit socket mode defaults (LOW, fixed)
+The production systemd unit created `/run/jinnguard` with mode `0750`, but did not
+pass the daemon's explicit `--socket-mode` flag or set a service `UMask`. That left
+the control socket's final mode dependent on runtime defaults. In practice this
+could drift toward either operator lockout (too restrictive for intended group
+clients) or accidental exposure if deployment umask defaults changed.
+- **Fix:** the unit now sets `UMask=0007` and starts the daemon with
+  `--socket-mode=0770`, making the group-scoped control socket permission explicit.
+
+## Batch 11 — production capability deprivilege
+
+### JG-RT-014 — systemd unit did not enable post-attach capability hardening (MED, fixed)
+The daemon has a kernel-validated hardening path that sets `no_new_privs`, drops
+dangerous bounding-set capabilities, and reduces the effective/permitted capability
+set after BPF attach. That path was still opt-in, and the shipped production unit
+did not set `JINNGUARD_HARDEN_CAPS=1`, so a compromised long-running daemon could
+retain live capability authority that was only needed during startup/attach.
+- **Fix:** the production unit now enables `JINNGUARD_HARDEN_CAPS=1` by default,
+  preserving the already-tested BPF attach flow while reducing post-attach blast
+  radius.
+
+## Batch 12 — Python SDK transport hardening
+
+### JG-RT-015 — Python client trusted unbounded daemon response frames (LOW, fixed)
+The Python SDK connected to the Unix socket with no timeout, ignored the response
+frame version, and trusted the peer's declared response length before reading the
+body. A stale/spoofed development socket or compromised local broker endpoint could
+hang an integrating agent or force large client-side reads. The daemon path remains
+the authoritative policy boundary, but SDK transport hardening prevents integration
+code from turning a local socket problem into an agent-wide availability failure.
+- **Fix:** the SDK now sets a socket timeout, rejects unsupported response frame
+  versions, caps response frames at 4 MiB, detects truncated bodies, and auto-fills
+  monotonically increasing sequence counters instead of reusing `1` for direct
+  calls. Unit tests:
+  `test_auto_sequence_counter_is_monotonic`,
+  `test_oversized_response_frame_is_rejected_before_body_read`.
+
+## Batch 13 — policy hot-reload fail-closed behavior
+
+### JG-RT-016 — malformed hot-reload could replace active policy with permissive default (MED, fixed)
+`load_policy_from_path` returned a compatibility default when the policy file was
+missing or invalid, and the SIGHUP handler installed that result directly. An
+operator typo or attacker-controlled policy-file corruption during hot-reload could
+clear `deny_anonymous_agents`, agent nodes, and governed path scope instead of
+keeping the last known-good policy. The raw remote policy refresh path also parsed
+policy content through a hand-rolled branch that did not synchronize governed scope.
+- **Fix:** added a fallible policy parser/loader for hot-reload paths. SIGHUP and
+  raw remote refresh now install only successfully parsed policies; bad content
+  logs an error and preserves the active policy/scope. Startup fallback remains
+  compatible with existing local-dev behavior. Unit tests:
+  `failed_policy_try_load_keeps_existing_governed_scope`,
+  `successful_policy_try_load_installs_scope_and_anonymous_deny`.
+
+## Batch 14 — lineage persistence migration safety
+
+### JG-RT-017 — failed legacy lineage migration could delete replay/quota state (MED, fixed)
+`LineageRegistry::load_or_create` migrated legacy JSON lineage files into SQLite,
+but ignored per-row insert errors and removed the JSON file afterward. A partial
+SQLite failure during upgrade could erase the only complete copy of lineage state,
+resetting persisted replay monotonicity and sequence-quota accounting on restart.
+- **Fix:** legacy JSON is now removed only after every lineage row is successfully
+  copied into SQLite. Insert failure logs the affected key and keeps the JSON file
+  for retry/recovery. Unit test:
+  `lineage_legacy_json_kept_when_sqlite_migration_insert_fails`.
+
+## Batch 15 — audit mirror failure integrity
+
+### JG-RT-018 — SQLite audit mirror failure could fork the JSONL hash chain (MED, fixed)
+`AuditLogger::log` appended the tamper-evident JSONL record first, then mirrored the
+record into SQLite while ignoring mirror insert errors. The next append derived its
+index/previous hash from SQLite before falling back to JSONL. If the JSONL append
+succeeded but the SQLite mirror failed, the following event could reuse stale DB
+state and write a broken JSONL hash link.
+- **Fix:** the logger now derives the next chain link from JSONL first and treats
+  SQLite as a query mirror/fallback. The two SQLite mirror inserts are transactional
+  and mirror failures are logged without corrupting future JSONL links. Unit test:
+  `audit_chain_continues_when_sqlite_mirror_insert_fails`.
+
+## Batch 16 — broker URL host matching
+
+### JG-RT-019 — broker network checks used substring/case-sensitive URL matching (MED, fixed)
+The broker's network action guard accepted any string beginning with `https://`,
+checked denied localhost/metadata patterns with case-sensitive substring scans, and
+enforced constrained destinations with `url.contains(destination)`. That allowed
+policy confusion such as `https://LOCALHOST/...` bypassing the localhost pattern or
+`https://api.example.com.attacker.invalid/...` satisfying a constrained destination
+of `api.example.com`.
+- **Fix:** broker network requests now parse as HTTPS URLs, normalize the host, deny
+  localhost/link-local hosts by host value, and match constrained destinations only
+  by exact host or subdomain boundary. Unit tests:
+  `broker_blocks_case_insensitive_localhost_url`,
+  `constrained_network_destination_requires_host_match`.
+
+## Batch 17 — MCP HTTP framing strictness
+
+### JG-RT-020 — MCP parser accepted ambiguous HTTP request framing (LOW, fixed)
+The MCP gateway supports fixed-length JSON-RPC requests, but its minimal HTTP parser
+silently accepted duplicate `Content-Length`, invalid `Content-Length`, and
+`Transfer-Encoding`. The proxy does not forward arbitrary inbound headers, so this
+was not a direct upstream smuggling primitive, but ambiguous framing should fail
+closed before governance parsing to avoid desync and parser-confusion edge cases.
+- **Fix:** duplicate `Content-Length`, invalid lengths, and any
+  `Transfer-Encoding` header now reject the request. Unit tests:
+  `rejects_duplicate_content_length`,
+  `rejects_transfer_encoding`.
+
+## Batch 18 — remote policy refresh body limits
+
+### JG-RT-021 — policy/fleet refresh could read unbounded remote response bodies (MED, fixed)
+The raw policy-server refresh loop and signed fleet-policy refresh loop used bounded
+request timeouts, but consumed response bodies with unbounded `text()`/JSON reads.
+A malicious or compromised policy endpoint could stream an oversized body and drive
+daemon memory growth even though signature/rollback checks would later reject bad
+content.
+- **Fix:** raw policy refresh, async fleet refresh, and the standalone blocking
+  fleet client now enforce a 4 MiB response-body ceiling while reading. Unit test:
+  `fetch_policy_bundle_rejects_oversized_response_without_content_length`.
+
+## Batch 19 — BPF path-key truncation guard
+
+### JG-RT-022 — overlong policy paths silently truncated into BPF map keys (MED, fixed)
+Userspace encoded UNIX socket allowlist paths, allowed executable paths, and
+basename deny keys into fixed 128-byte BPF map keys by truncating to 127 bytes.
+Two distinct long paths with the same prefix could therefore collide in the kernel
+maps, making policy behavior depend on a lossy encoding rather than the configured
+path.
+- **Fix:** kernel-map policy loaders now reject overlong paths/basenames instead of
+  truncating them into BPF keys. Feature-gated unit tests:
+  `path_key_checked_rejects_overlong_paths`,
+  `name_key_bytes_checked_rejects_overlong_basenames`.
+
+## Batch 20 — startup socket cleanup hardening
+
+### JG-RT-023 — startup could unlink a non-socket at `--socket-path` (LOW, fixed)
+Before binding the governance Unix socket, startup removed any filesystem node at
+`--socket-path`. A typo or malicious service override pointing this argument at a
+regular file would delete that file under daemon privileges. Symlinks were not
+followed, but regular-file unlink was still an avoidable footgun in a privileged
+service.
+- **Fix:** startup now removes only an existing Unix socket and refuses regular
+  files/symlinks/other node types. Unit tests:
+  `remove_stale_unix_socket_removes_only_socket_nodes`,
+  `remove_stale_unix_socket_refuses_regular_file`.
+
+## Batch 21 — installer secret handling
+
+### JG-RT-024 — installer passed the HMAC secret through process arguments (LOW, fixed)
+The enterprise installer loaded `/etc/jinnguard/secret` into the session keyring
+with `keyctl add ... "$(cat /etc/jinnguard/secret)" ...`. During installation, that
+made the HMAC secret visible in the `keyctl` process arguments to sufficiently
+privileged local process observers. The script also logged key-load success after a
+failed `keyctl add` because the warning branch returned successfully.
+- **Fix:** the installer now uses `keyctl padd` and feeds the secret over stdin,
+  avoiding argv exposure. The success message is emitted only when the keyring load
+  succeeds; otherwise the script logs the file-secret fallback.
+
+## Batch 22 — CI token hardening
+
+### JG-RT-025 — CI workflow inherited repository-default token permissions (LOW, fixed)
+The main CI workflow did not set top-level `permissions`, so `GITHUB_TOKEN`
+authority depended on repository defaults. If those defaults were write-capable,
+ordinary build/test jobs would receive broader token scope than needed for
+checkout and artifact handling.
+- **Fix:** `.github/workflows/ci.yml` now clamps workflow token permissions to
+  `contents: read`. The release workflow already used explicit per-job write/OIDC
+  permissions only where publishing and signing require them.
+
 ## Remaining surfaces (future batches)
 
 - No known open findings in the reviewed UDS/MCP lineage and quota flow. Broader

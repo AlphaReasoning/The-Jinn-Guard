@@ -110,31 +110,11 @@ pub fn immunity_reason_for_observation(
     None
 }
 
-pub fn mcp_caller_is_immune(method: &str, params: &serde_json::Value) -> bool {
-    if command_identifier_is_immune(method) {
-        return true;
-    }
-
-    let Some(obj) = params.as_object() else {
-        return false;
-    };
-
-    [
-        "comm",
-        "process",
-        "process_name",
-        "executable",
-        "exe",
-        "command",
-        "caller",
-        "caller_path",
-    ]
-    .iter()
-    .any(|key| {
-        obj.get(*key)
-            .and_then(|value| value.as_str())
-            .is_some_and(command_identifier_is_immune)
-    })
+pub fn mcp_caller_is_immune(_method: &str, _params: &serde_json::Value) -> bool {
+    // MCP arrives over TCP, so unlike the Unix socket path we do not have
+    // SO_PEERCRED-backed process identity. Method names and params are fully
+    // client-controlled and must never grant system-process immunity.
+    false
 }
 
 pub fn immune_exec_path_candidates() -> Vec<String> {
@@ -207,7 +187,9 @@ fn basename(path_or_name: &str) -> &str {
 
 #[cfg(test)]
 mod system_immunity_tests {
-    use super::{immune_exec_path_candidates, path_is_immune, process_name_is_immune};
+    use super::{
+        immune_exec_path_candidates, mcp_caller_is_immune, path_is_immune, process_name_is_immune,
+    };
     use std::path::Path;
 
     #[test]
@@ -264,5 +246,18 @@ mod system_immunity_tests {
                 "immune_exec_path_candidates should preserve /usr/bin/sh"
             );
         }
+    }
+
+    #[test]
+    fn mcp_immunity_does_not_trust_client_declared_process_fields() {
+        let params = serde_json::json!({
+            "caller": "/bin/bash",
+            "process_name": "systemd",
+            "command": "cargo",
+        });
+        assert!(
+            !mcp_caller_is_immune("bash", &params),
+            "remote MCP clients must not self-attest into system-process immunity"
+        );
     }
 }

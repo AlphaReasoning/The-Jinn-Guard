@@ -11,13 +11,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 use crate::{
     explainability::{
@@ -193,6 +194,10 @@ fn params_contains_protected_resource(value: &Value) -> bool {
 /// refused before any body buffer is allocated, so a hostile header cannot drive an
 /// unbounded allocation (JG-RT-001). Matches the UDS wire protocol's 4 MiB ceiling.
 const MAX_MCP_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MCP_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MCP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MCP_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MCP_UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct HttpRequest {
     method: String,
@@ -235,18 +240,27 @@ async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Resu
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+            let key = k.trim().to_lowercase();
+            if key == "content-length" && headers.contains_key(&key) {
+                anyhow::bail!("duplicate Content-Length header");
+            }
+            headers.insert(key, v.trim().to_string());
         }
+    }
+    if headers.contains_key("transfer-encoding") {
+        anyhow::bail!("Transfer-Encoding is not supported");
     }
 
     // Body. Bound the declared length BEFORE allocating: the gateway listens on
     // 0.0.0.0 and (unless mTLS is enabled) is unauthenticated, so an attacker-set
     // `Content-Length` must never drive an unbounded allocation. Mirrors the UDS
     // wire protocol's MAX_PAYLOAD_LEN cap (JG-RT-001).
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let content_length: usize = match headers.get("content-length") {
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid Content-Length header"))?,
+        None => 0,
+    };
     if content_length > MAX_MCP_BODY_BYTES {
         anyhow::bail!(
             "declared Content-Length {content_length} exceeds limit {MAX_MCP_BODY_BYTES}"
@@ -306,9 +320,9 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     upstream_addr: String,
 ) {
     // Read the incoming HTTP request.
-    let http_req = match read_http_request(&mut stream).await {
-        Ok(r) => r,
-        Err(e) => {
+    let http_req = match timeout(MCP_REQUEST_READ_TIMEOUT, read_http_request(&mut stream)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             eprintln!("[mcp_gateway] failed to read HTTP request from {peer_addr}: {e}");
             let _ = write_http_response(
                 &mut stream,
@@ -316,6 +330,18 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 "Bad Request",
                 "text/plain",
                 b"Bad Request",
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            eprintln!("[mcp_gateway] timed out reading HTTP request from {peer_addr}");
+            let _ = write_http_response(
+                &mut stream,
+                408,
+                "Request Timeout",
+                "text/plain",
+                b"Request Timeout",
             )
             .await;
             return;
@@ -776,9 +802,13 @@ async fn forward_to_upstream(
         }
     }
 
-    let mut upstream = TcpStream::connect(upstream_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("upstream connect failed: {e}"))?;
+    let mut upstream = timeout(
+        MCP_UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(upstream_addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("upstream connect timed out"))?
+    .map_err(|e| anyhow::anyhow!("upstream connect failed: {e}"))?;
 
     // Build minimal HTTP/1.1 request.
     let request = format!(
@@ -794,9 +824,15 @@ async fn forward_to_upstream(
     upstream.write_all(body).await?;
     upstream.flush().await?;
 
-    // Read the full response.
-    let mut raw = Vec::with_capacity(4096);
-    upstream.read_to_end(&mut raw).await?;
+    // Read a bounded response. The upstream is operator-configured, but this
+    // still must not become an unbounded allocation sink if that process is
+    // compromised or misconfigured.
+    let raw = timeout(
+        MCP_UPSTREAM_RESPONSE_TIMEOUT,
+        read_limited_to_end(&mut upstream, MAX_MCP_UPSTREAM_RESPONSE_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("upstream response timed out"))??;
 
     // Parse the status line.
     let header_end = raw
@@ -818,6 +854,24 @@ async fn forward_to_upstream(
     };
 
     Ok((status, status_text, resp_body))
+}
+
+async fn read_limited_to_end<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut raw = Vec::with_capacity(4096);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(raw);
+        }
+        if raw.len().saturating_add(n) > limit {
+            anyhow::bail!("upstream response exceeds limit {limit} bytes");
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1119,28 @@ mod mcp_gateway_tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejects_duplicate_content_length() {
+        let req = "POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
+        let mut input: &[u8] = req.as_bytes();
+        let err = match read_http_request(&mut input).await {
+            Ok(_) => panic!("duplicate Content-Length must be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("duplicate Content-Length"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_transfer_encoding() {
+        let req = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
+        let mut input: &[u8] = req.as_bytes();
+        let err = match read_http_request(&mut input).await {
+            Ok(_) => panic!("Transfer-Encoding must be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("Transfer-Encoding"), "got: {err}");
+    }
+
     // JG-RT-003: a control character in client-derived method/path/Host must be
     // refused before anything is written upstream (the guard runs before connect,
     // so no live upstream is needed to exercise it).
@@ -1101,5 +1177,18 @@ mod mcp_gateway_tests {
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.path, "/rpc");
         assert_eq!(parsed.body, body);
+    }
+
+    #[tokio::test]
+    async fn upstream_response_read_is_bounded() {
+        let mut input: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n0123456789";
+        let err = read_limited_to_end(&mut input, 8)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("upstream response exceeds limit"),
+            "got: {err}"
+        );
     }
 }

@@ -18,7 +18,10 @@
 /// `fleet_policy_url` + `fleet_policy_min_version` fields in `policy.yaml`.
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::time::Duration;
+
+pub const MAX_FLEET_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Bundle types
@@ -169,8 +172,8 @@ pub fn fetch_policy_bundle(config: &FleetPolicyConfig) -> Result<FleetPolicyPull
         ));
     }
 
-    let bundle: PolicyBundle = resp
-        .json()
+    let body = read_blocking_response_limited(resp, MAX_FLEET_BUNDLE_BYTES)?;
+    let bundle: PolicyBundle = serde_json::from_str(&body)
         .map_err(|e| anyhow!("Fleet policy bundle parse failed: {e}"))?;
 
     // Rollback protection: reject bundles older than minimum accepted version.
@@ -202,6 +205,36 @@ pub fn fetch_policy_bundle(config: &FleetPolicyConfig) -> Result<FleetPolicyPull
         bundle,
         policy_yaml,
     })
+}
+
+fn read_blocking_response_limited(
+    mut response: reqwest::blocking::Response,
+    limit: usize,
+) -> Result<String> {
+    if let Some(len) = response.content_length() {
+        if len > limit as u64 {
+            return Err(anyhow!(
+                "Fleet policy response declares {len} bytes; limit is {limit}"
+            ));
+        }
+    }
+
+    let mut body = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = response
+            .read(&mut buf)
+            .map_err(|e| anyhow!("Fleet policy body read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if body.len().saturating_add(n) > limit {
+            return Err(anyhow!("Fleet policy response exceeds limit {limit} bytes"));
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
+
+    String::from_utf8(body).map_err(|e| anyhow!("Fleet policy response is not UTF-8: {e}"))
 }
 
 /// Persist a bundle to a local cache file for offline operation.
@@ -358,6 +391,38 @@ mod tests {
         bundle.signature = "deadbeef".to_string(); // also invalid
         let d = evaluate_bundle(&bundle, /*min*/ 5, /*applied*/ 0, TEST_SECRET);
         assert_eq!(d, BundleDecision::RejectRollback);
+    }
+
+    #[test]
+    fn fetch_policy_bundle_rejects_oversized_response_without_content_length() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_buf = [0u8; 512];
+            let _ = stream.read(&mut request_buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let body = vec![b'a'; MAX_FLEET_BUNDLE_BYTES + 1];
+            let _ = stream.write_all(&body);
+        });
+
+        let cfg = FleetPolicyConfig {
+            url: format!("http://{addr}/bundle"),
+            min_version: 0,
+            hmac_secret: TEST_SECRET.to_vec(),
+            fetch_timeout_secs: 5,
+        };
+        let err = match fetch_policy_bundle(&cfg) {
+            Ok(_) => panic!("oversized fleet response must be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("exceeds limit"), "got: {err}");
+        handle.join().unwrap();
     }
 
     #[test]

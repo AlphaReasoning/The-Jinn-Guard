@@ -1247,10 +1247,9 @@ pub mod aya_backend {
         object_path: &str,
     ) -> Result<()> {
         for path in ORCHESTRATOR_CONTROL_SOCKETS {
-            let key = path_key(path);
-            if key.path[0] == 0 {
+            let Some(key) = path_key_checked(path, "builtin unix denylist")? else {
                 continue;
-            }
+            };
             map.insert(key, 1, 0).map_err(|e| {
                 anyhow!(
                     "Failed to populate unix_denylist entry '{}' in {}: {}",
@@ -1281,10 +1280,9 @@ pub mod aya_backend {
                 .map(String::as_str),
         );
         for path in entries {
-            let key = path_key(path);
-            if key.path[0] == 0 {
+            let Some(key) = path_key_checked(path, "unix socket allowlist")? else {
                 continue;
-            }
+            };
             map.insert(key, 1, 0).map_err(|e| {
                 anyhow!(
                     "Failed to populate unix_allowlist entry '{}' in {}: {}",
@@ -1321,10 +1319,9 @@ pub mod aya_backend {
         path: &str,
         object_path: &str,
     ) -> Result<()> {
-        let key = path_key(path);
-        if key.path[0] == 0 {
+        let Some(key) = path_key_checked(path, "allowed executable")? else {
             return Ok(());
-        }
+        };
         map.insert(key, 1, 0).map_err(|e| {
             anyhow!(
                 "Failed to populate allowed_exec_paths entry '{}' in {}: {}",
@@ -1381,10 +1378,10 @@ pub mod aya_backend {
             if denied_file_parent_key(path)?.is_some() {
                 continue;
             }
-            let key = path_key(filesystem_policy_leaf(path));
-            if key.path[0] == 0 {
+            let Some(key) = name_key_checked(filesystem_policy_leaf(path), "denied basename")?
+            else {
                 continue;
-            }
+            };
             map.insert(key, 1, 0).map_err(|e| {
                 anyhow!(
                     "Failed to populate denied_basenames entry '{}' in {}: {}",
@@ -1451,16 +1448,34 @@ pub mod aya_backend {
         Ok(Some(DirFileKey {
             dev: kernel_dev_from_stat(metadata.dev()),
             ino: metadata.ino(),
-            name: name_to_key_bytes(leaf),
+            name: name_key_bytes_checked(leaf, "denied file basename")?,
         }))
     }
 
-    fn name_to_key_bytes(name: &str) -> [u8; JG_MAX_RESOURCE_LEN] {
+    fn name_key_bytes_checked(name: &str, label: &str) -> Result<[u8; JG_MAX_RESOURCE_LEN]> {
+        let trimmed = name.trim();
+        if trimmed.as_bytes().len() >= JG_MAX_RESOURCE_LEN {
+            return Err(anyhow!(
+                "{label} {trimmed:?} is {} bytes; BPF path keys support at most {} bytes",
+                trimmed.as_bytes().len(),
+                JG_MAX_RESOURCE_LEN - 1
+            ));
+        }
         let mut out = [0u8; JG_MAX_RESOURCE_LEN];
-        let bytes = name.as_bytes();
-        let len = bytes.len().min(JG_MAX_RESOURCE_LEN.saturating_sub(1));
+        let bytes = trimmed.as_bytes();
+        let len = bytes.len();
         out[..len].copy_from_slice(&bytes[..len]);
-        out
+        Ok(out)
+    }
+
+    fn name_key_checked(name: &str, label: &str) -> Result<Option<PathKey>> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PathKey {
+            path: name_key_bytes_checked(trimmed, label)?,
+        }))
     }
 
     fn denied_paths_for_object<'a>(policy: &'a PolicyConfig, object_path: &str) -> Vec<&'a String> {
@@ -1557,5 +1572,44 @@ pub mod aya_backend {
         let len = bytes.len().min(JG_MAX_RESOURCE_LEN.saturating_sub(1));
         key.path[..len].copy_from_slice(&bytes[..len]);
         key
+    }
+
+    fn path_key_checked(path: &str, label: &str) -> Result<Option<PathKey>> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if trimmed.as_bytes().len() >= JG_MAX_RESOURCE_LEN {
+            return Err(anyhow!(
+                "{label} path {trimmed:?} is {} bytes; BPF path keys support at most {} bytes",
+                trimmed.as_bytes().len(),
+                JG_MAX_RESOURCE_LEN - 1
+            ));
+        }
+        Ok(Some(path_key(trimmed)))
+    }
+
+    #[cfg(test)]
+    mod map_key_tests {
+        use super::{name_key_bytes_checked, path_key_checked, JG_MAX_RESOURCE_LEN};
+
+        #[test]
+        fn path_key_checked_rejects_overlong_paths() {
+            let path = format!("/{}", "a".repeat(JG_MAX_RESOURCE_LEN));
+            let err = match path_key_checked(&path, "test") {
+                Ok(_) => panic!("overlong path must not be truncated into BPF map key"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("BPF path keys"), "got: {err}");
+        }
+
+        #[test]
+        fn name_key_bytes_checked_rejects_overlong_basenames() {
+            let name = "a".repeat(JG_MAX_RESOURCE_LEN);
+            let err = name_key_bytes_checked(&name, "test")
+                .expect_err("overlong basename must not be truncated into BPF map key")
+                .to_string();
+            assert!(err.contains("BPF path keys"), "got: {err}");
+        }
     }
 }

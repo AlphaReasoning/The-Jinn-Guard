@@ -10,12 +10,15 @@ User=jinnguard
 Group=jinnguard
 Environment=JINNGUARD_ENTERPRISE=1
 Environment=JINNGUARD_SECRET_FILE=/etc/jinnguard/secret
+Environment=JINNGUARD_HARDEN_CAPS=1
 
 RuntimeDirectory=jinnguard
 RuntimeDirectoryMode=0750
+UMask=0007
 
 ExecStart=/usr/sbin/jinnguard \
     --socket-path=/run/jinnguard/jinnguard.sock \
+    --socket-mode=0770 \
     --lineage-file=/var/lib/jinnguard/lineage.json \
     --audit-log=/var/log/jinnguard/audit.log \
     --policy-file=/etc/jinnguard/policy.yaml

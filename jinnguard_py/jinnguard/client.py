@@ -6,6 +6,9 @@ import hashlib
 import struct
 import time
 
+DEFAULT_SOCKET_TIMEOUT_SECS = 5.0
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
 
 def default_socket_path():
     """Return the runtime socket path, honoring both historical env names."""
@@ -43,19 +46,26 @@ def default_agent_id():
 
 
 class JinnGuardClient:
-    def __init__(self, socket_path=None):
+    def __init__(self, socket_path=None, timeout=DEFAULT_SOCKET_TIMEOUT_SECS, max_response_bytes=MAX_RESPONSE_BYTES):
         self.socket_path = socket_path or default_socket_path()
         self.sock = None
         self._secret = load_guard_secret()
+        self.timeout = float(timeout)
+        self.max_response_bytes = int(max_response_bytes)
+        self._sequence = int(time.time_ns() % 9_000_000_000_000_000_000)
+
+    def _next_sequence(self):
+        self._sequence += 1
+        return self._sequence
 
     def _read_n(self, n):
-        data = b''
+        data = bytearray()
         while len(data) < n:
             packet = self.sock.recv(n - len(data))
             if not packet:
                 break
-            data += packet
-        return data
+            data.extend(packet)
+        return bytes(data)
 
     def send_proposal(
         self,
@@ -89,6 +99,7 @@ class JinnGuardClient:
 
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(self.timeout)
             self.sock.connect(self.socket_path)
 
             serialized = json.dumps(envelope, separators=(",", ":"))
@@ -101,8 +112,19 @@ class JinnGuardClient:
             if len(resp_header) < 5:
                 return "TRANSPORT_ERROR: Truncated response header"
             resp_len, resp_ver = struct.unpack(">IB", resp_header)
+            if resp_ver != 1:
+                return f"TRANSPORT_ERROR: Unsupported response frame version {resp_ver}"
+            if resp_len > self.max_response_bytes:
+                return (
+                    "TRANSPORT_ERROR: Response frame too large "
+                    f"({resp_len} > {self.max_response_bytes})"
+                )
             resp_data = self._read_n(resp_len)
+            if len(resp_data) < resp_len:
+                return "TRANSPORT_ERROR: Truncated response body"
             return resp_data.decode("utf-8")
+        except socket.timeout:
+            return "TRANSPORT_ERROR: Socket timeout"
         except Exception as e:
             return f"TRANSPORT_ERROR: {str(e)}"
         finally:
@@ -124,11 +146,12 @@ class JinnGuardClient:
         if isinstance(proposal, dict):
             payload = dict(proposal)
         else:
+            seq = int(sequence_counter) if sequence_counter is not None else self._next_sequence()
             payload = {
                 "intent_name": str(proposal),
                 "session_privilege_bit": float(privilege),
                 "action_risk_score": float(risk_score if risk_score is not None else 0.0),
-                "sequence_counter": int(sequence_counter if sequence_counter is not None else 1),
+                "sequence_counter": seq,
             }
 
         if prompt is not None:
@@ -142,7 +165,10 @@ class JinnGuardClient:
         if execute:
             payload["execute"] = True
 
-        payload.setdefault("sequence_counter", int(sequence_counter if sequence_counter is not None else 1))
+        if "sequence_counter" not in payload:
+            payload["sequence_counter"] = (
+                int(sequence_counter) if sequence_counter is not None else self._next_sequence()
+            )
         payload.setdefault("session_privilege_bit", float(privilege))
         if risk_score is not None:
             payload.setdefault("action_risk_score", float(risk_score))
