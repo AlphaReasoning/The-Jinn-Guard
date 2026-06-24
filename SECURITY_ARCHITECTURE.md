@@ -264,9 +264,9 @@ Consistent with the threat model's honesty bar:
   is gated on every push/PR by `cargo deny check` (advisories, licenses, bans,
   sources); CI publishes a CycloneDX SBOM per build; and a tag-triggered
   [`release.yml`](.github/workflows/release.yml) produces **SLSA v3 provenance** and
-  **cosign keyless signatures** per release artifact (see
-  [`RELEASE_INTEGRITY.md`](RELEASE_INTEGRITY.md)). **The one open sub-item is
-  independently-verified reproducible builds** (JG #46).
+  **cosign keyless signatures** per release artifact. The release binary is also
+  rebuilt twice from clean git archives and byte-compared before publication (see
+  [`RELEASE_INTEGRITY.md`](RELEASE_INTEGRITY.md)).
 
 ---
 

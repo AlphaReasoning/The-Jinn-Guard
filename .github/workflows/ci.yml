@@ -58,6 +58,36 @@ jobs:
           path: target/release/ts_cli
 
   # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1b: Reproducible release build
+  # Builds ts_cli from two clean git-archive checkouts in distinct temp paths and
+  # byte-compares the resulting stripped release binaries. This catches timestamp,
+  # path, and toolchain drift before a release tag is cut.
+  # ─────────────────────────────────────────────────────────────────────────────
+  reproducible-build:
+    name: Reproducible release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libz3-dev keyutils
+
+      - name: Cache Cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Rebuild and compare release binary
+        run: scripts/rebuild_and_compare_release.sh
+
+  # ─────────────────────────────────────────────────────────────────────────────
   # Job 2: Test suite (unit + integration)
   # ─────────────────────────────────────────────────────────────────────────────
   test:
