@@ -566,6 +566,8 @@ cargo check
 
 This is **not** independently audited or enterprise-GA. It is a strong,
 test-backed prototype demonstrating OS-level AI-agent enforcement.
+See [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md) for the current residual-risk
+register and release claim boundary.
 
 ### ✅ Shippable components
 
