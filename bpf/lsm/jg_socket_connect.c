@@ -31,6 +31,20 @@ struct {
     __type(value, __u8);
 } ipv4_allowlist SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct jg_ipv6_key);
+    __type(value, __u8);
+} ipv6_denylist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct jg_ipv6_key);
+    __type(value, __u8);
+} ipv6_allowlist SEC(".maps");
+
 // #55: AF_UNIX deputy-socket denylist. Keyed by the full connect path so a
 // governed agent cannot reach an orchestrator/init control socket (docker.sock,
 // containerd.sock, the systemd/D-Bus private sockets, libvirt, podman, crio)
@@ -110,6 +124,7 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
 
     req->cookie = cookie;
     req->pid = pid;
+    req->ppid = jg_get_ppid();
     req->type = REQ_CONNECT;
     req->source_program = JG_SRC_SOCKET_CONNECT;
     req->family = family;
@@ -137,11 +152,17 @@ int BPF_PROG(jg_socket_connect, struct socket *sock, struct sockaddr *address, i
         struct sockaddr_in6 *sa = (struct sockaddr_in6 *)address;
         bpf_core_read(&req->dest.v6.addr, sizeof(req->dest.v6.addr), &sa->sin6_addr);
         bpf_core_read(&req->dest.v6.port, sizeof(req->dest.v6.port), &sa->sin6_port);
-        // #54: there is no IPv6 allowlist yet, so under default-deny IPv6 egress
-        // fails closed rather than offering an un-allowlisted bypass of the v4
-        // lockdown. (IPv6 allowlisting is tracked for a follow-up.)
-        if (default_deny) {
+        
+        struct jg_ipv6_key key;
+        __builtin_memcpy(key.addr, req->dest.v6.addr, sizeof(key.addr));
+        __u8 *entry = bpf_map_lookup_elem(&ipv6_denylist, &key);
+        if (entry && *entry) {
             denied = 1;
+        } else if (default_deny && !jg_ipv6_is_loopback(req->dest.v6.addr)) {
+            __u8 *allow = bpf_map_lookup_elem(&ipv6_allowlist, &key);
+            if (!(allow && *allow)) {
+                denied = 1;
+            }
         }
         break;
     }

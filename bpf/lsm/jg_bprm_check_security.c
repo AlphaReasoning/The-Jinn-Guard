@@ -58,6 +58,7 @@ int BPF_PROG(jg_bprm_check_security, struct linux_binprm *bprm) {
 
     req->cookie = cookie;
     req->pid = pid;
+    req->ppid = jg_get_ppid();
     req->type = REQ_EXECVE;
     req->source_program = JG_SRC_BPRM_CHECK_SECURITY;
     const char *filename = 0;

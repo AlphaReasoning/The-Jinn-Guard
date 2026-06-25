@@ -95,6 +95,18 @@ static __always_inline int jg_ipv4_is_loopback(__u32 addr)
     return (addr & 0xFF) == 127;
 }
 
+struct jg_ipv6_key {
+    __u8 addr[16];
+};
+
+static __always_inline int jg_ipv6_is_loopback(const __u8 *addr)
+{
+    for (int i = 0; i < 15; i++) {
+        if (addr[i] != 0) return 0;
+    }
+    return addr[15] == 1;
+}
+
 // Cgroup-scoped enforcement (the structural anti-lockout guarantee).
 //
 // The `governed_scope` array holds a single u64 at key 0:
@@ -233,6 +245,7 @@ struct jg_request {
 
     // Stable route back to the object-local verdict map.
     __u32 source_program;
+    __u32 ppid;
 };
 
 // Verdict from user-space to BPF, sent via a hash map.
@@ -240,6 +253,11 @@ struct jg_verdict_payload {
     __u64 cookie;
     enum jg_verdict verdict;
 };
+
+static __always_inline __u32 jg_get_ppid(void) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    return BPF_CORE_READ(task, real_parent, tgid);
+}
 
 static __always_inline int jg_path_equals(const char *left, const char *right)
 {

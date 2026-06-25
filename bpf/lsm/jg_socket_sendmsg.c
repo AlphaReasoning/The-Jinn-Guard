@@ -24,6 +24,13 @@ struct {
 } ipv4_denylist SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct jg_ipv6_key);
+    __type(value, __u8);
+} ipv6_denylist SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
@@ -77,6 +84,7 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
 
     req->cookie = cookie;
     req->pid = pid;
+    req->ppid = jg_get_ppid();
     req->type = REQ_SENDMSG;
     req->source_program = JG_SRC_SOCKET_SENDMSG;
     req->family = family;
@@ -97,6 +105,13 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
         struct sockaddr_in6 *sa = (struct sockaddr_in6 *)address;
         bpf_core_read(&req->dest.v6.addr, sizeof(req->dest.v6.addr), &sa->sin6_addr);
         bpf_core_read(&req->dest.v6.port, sizeof(req->dest.v6.port), &sa->sin6_port);
+        
+        struct jg_ipv6_key key;
+        __builtin_memcpy(key.addr, req->dest.v6.addr, sizeof(key.addr));
+        __u8 *entry = bpf_map_lookup_elem(&ipv6_denylist, &key);
+        if (entry && *entry) {
+            denied = 1;
+        }
         break;
     }
     default:

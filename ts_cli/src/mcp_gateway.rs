@@ -589,7 +589,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // Snapshot eBPF telemetry for PID 0 (none expected for MCP connections).
     let peer_telemetry: Vec<KernelTelemetryEvent> = {
         let mut store = telemetry_store.lock().unwrap();
-        store.remove(&0).unwrap_or_default()
+        store.events.remove(&0).unwrap_or_default()
     };
 
     // ── deny_anonymous check ─────────────────────────────────────────────

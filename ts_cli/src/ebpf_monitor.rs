@@ -27,6 +27,7 @@ pub enum LsmRequestType {
 pub struct LsmRequest {
     pub cookie: u64,
     pub pid: u32,
+    pub ppid: u32,
     pub req_type: LsmRequestType,
     pub source_program: u32,
     pub family: u16,
@@ -399,13 +400,20 @@ pub mod aya_backend {
     const JG_SRC_FILE_OPEN: u32 = 11;
     /// Policy path key used by BPF maps.
     /// Must match `struct jg_path_key` in `bpf/lsm/jg_common.h`.
-    #[repr(C)]
     #[derive(Clone, Copy)]
     struct PathKey {
         path: [u8; JG_MAX_RESOURCE_LEN],
     }
 
     unsafe impl aya::Pod for PathKey {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Ipv6Key {
+        addr: [u8; 16],
+    }
+
+    unsafe impl aya::Pod for Ipv6Key {}
 
     /// Collision-free directory identity used by the `denied_dir_inodes` map.
     /// Must match `struct jg_inode_key` in `bpf/lsm/jg_common.h`: (dev, ino),
@@ -486,6 +494,7 @@ pub mod aya_backend {
             let mut req = LsmRequest {
                 cookie: raw.cookie,
                 pid: raw.pid,
+                ppid: raw.ppid,
                 req_type,
                 source_program: raw.source_program,
                 family: raw.family,
@@ -551,8 +560,10 @@ pub mod aya_backend {
         #[allow(dead_code)]
         governed_scope: Option<AyaArray<MapData, u64>>,
         ipv4_denylist: Option<AyaHashMap<MapData, u32, u8>>,
+        ipv6_denylist: Option<AyaHashMap<MapData, Ipv6Key, u8>>,
         // #54: IPv4 egress allowlist, consulted by socket_connect under default-deny.
         ipv4_allowlist: Option<AyaHashMap<MapData, u32, u8>>,
+        ipv6_allowlist: Option<AyaHashMap<MapData, Ipv6Key, u8>>,
         // #55: AF_UNIX orchestrator/control-socket denylist for socket_connect.
         unix_denylist: Option<AyaHashMap<MapData, PathKey, u8>>,
         // #56: AF_UNIX egress allowlist, consulted under UNIX default-deny.
@@ -758,8 +769,14 @@ pub mod aya_backend {
                 if let Some(map) = object.ipv4_denylist.as_mut() {
                     configure_ipv4_denylist(map, policy, object.object_path)?;
                 }
+                if let Some(map) = object.ipv6_denylist.as_mut() {
+                    configure_ipv6_denylist(map, policy, object.object_path)?;
+                }
                 if let Some(map) = object.ipv4_allowlist.as_mut() {
                     configure_ipv4_allowlist(map, policy, object.object_path)?;
+                }
+                if let Some(map) = object.ipv6_allowlist.as_mut() {
+                    configure_ipv6_allowlist(map, policy, object.object_path)?;
                 }
                 if let Some(map) = object.unix_denylist.as_mut() {
                     configure_unix_denylist(map, policy, object.object_path)?;
@@ -1021,7 +1038,9 @@ pub mod aya_backend {
         )?;
 
         let ipv4_denylist = optional_hash_map(&mut bpf, "ipv4_denylist", object_path)?;
+        let ipv6_denylist = optional_hash_map(&mut bpf, "ipv6_denylist", object_path)?;
         let ipv4_allowlist = optional_hash_map(&mut bpf, "ipv4_allowlist", object_path)?;
+        let ipv6_allowlist = optional_hash_map(&mut bpf, "ipv6_allowlist", object_path)?;
         let unix_denylist = optional_hash_map(&mut bpf, "unix_denylist", object_path)?;
         let unix_allowlist = optional_hash_map(&mut bpf, "unix_allowlist", object_path)?;
         let allowed_exec_paths = optional_hash_map(&mut bpf, "allowed_exec_paths", object_path)?;
@@ -1040,7 +1059,9 @@ pub mod aya_backend {
                 runtime_controls,
                 governed_scope,
                 ipv4_denylist,
+                ipv6_denylist,
                 ipv4_allowlist,
+                ipv6_allowlist,
                 unix_denylist,
                 unix_allowlist,
                 allowed_exec_paths,
@@ -1196,15 +1217,53 @@ pub mod aya_backend {
     ) -> Result<()> {
         for entry in &policy.network_policy.allowed_ips {
             let Some(key) = ipv4_policy_key(entry) else {
-                eprintln!(
-                    "[eBPF LSM] skipping unsupported IPv4 allowlist entry '{}' for {}",
-                    entry, object_path
-                );
                 continue;
             };
             map.insert(key, 1, 0).map_err(|e| {
                 anyhow!(
                     "Failed to populate ipv4_allowlist entry '{}' in {}: {}",
+                    entry,
+                    object_path,
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn configure_ipv6_denylist(
+        map: &mut AyaHashMap<MapData, Ipv6Key, u8>,
+        policy: &PolicyConfig,
+        object_path: &str,
+    ) -> Result<()> {
+        for entry in &policy.network_policy.denied_ips {
+            let Some(key) = ipv6_policy_key(entry) else {
+                continue;
+            };
+            map.insert(key, 1, 0).map_err(|e| {
+                anyhow!(
+                    "Failed to populate ipv6_denylist entry '{}' in {}: {}",
+                    entry,
+                    object_path,
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn configure_ipv6_allowlist(
+        map: &mut AyaHashMap<MapData, Ipv6Key, u8>,
+        policy: &PolicyConfig,
+        object_path: &str,
+    ) -> Result<()> {
+        for entry in &policy.network_policy.allowed_ips {
+            let Some(key) = ipv6_policy_key(entry) else {
+                continue;
+            };
+            map.insert(key, 1, 0).map_err(|e| {
+                anyhow!(
+                    "Failed to populate ipv6_allowlist entry '{}' in {}: {}",
                     entry,
                     object_path,
                     e
@@ -1555,9 +1614,25 @@ pub mod aya_backend {
             .split_once(':')
             .map(|(host, _)| host)
             .unwrap_or(trimmed);
-        host.parse::<Ipv4Addr>()
+        host.parse::<std::net::Ipv4Addr>()
             .ok()
             .map(|addr| u32::from_ne_bytes(addr.octets()))
+    }
+
+    fn ipv6_policy_key(entry: &str) -> Option<Ipv6Key> {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let host = if trimmed.starts_with('[') {
+            trimmed[1..].split_once(']').map(|(h, _)| h).unwrap_or(trimmed)
+        } else {
+            trimmed
+        };
+        
+        host.parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|addr| Ipv6Key { addr: addr.octets() })
     }
 
     fn empty_path_key() -> PathKey {

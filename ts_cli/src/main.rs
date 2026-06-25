@@ -50,9 +50,25 @@ use ebpf_monitor::{LsmRequest, LsmRequestType, Verdict};
 #[cfg(feature = "kernel_telemetry")]
 use ebpf_monitor::LsmPathResolutionCache;
 
-// TelemetryStore maps kernel PID → list of kernel telemetry events
-// Feature-gated: in non-kernel-telemetry builds this is a stub.
-pub(crate) type TelemetryStore = Arc<Mutex<HashMap<u32, Vec<KernelTelemetryEvent>>>>;
+#[derive(Default)]
+pub(crate) struct TelemetryStoreData {
+    pub events: HashMap<u32, Vec<KernelTelemetryEvent>>,
+    pub ppid_map: HashMap<u32, u32>,
+}
+
+impl TelemetryStoreData {
+    pub fn root_pid(&self, mut pid: u32) -> u32 {
+        let mut depth = 0;
+        while let Some(&ppid) = self.ppid_map.get(&pid) {
+            if ppid == 0 || depth > 32 { break; }
+            pid = ppid;
+            depth += 1;
+        }
+        pid
+    }
+}
+
+pub(crate) type TelemetryStore = Arc<Mutex<TelemetryStoreData>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct KernelTelemetryEvent {
@@ -61,6 +77,7 @@ pub(crate) struct KernelTelemetryEvent {
     #[allow(dead_code)]
     pub resource: String,
     pub denied: bool,
+    pub ppid: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1665,7 +1682,7 @@ async fn handle_client_connection(
     // Drain eBPF events accumulated for this kernel PID.
     let peer_telemetry_events: Vec<KernelTelemetryEvent> = {
         let mut store = telemetry_store.lock().unwrap();
-        store.remove(&peer.pid).unwrap_or_default()
+        store.events.remove(&peer.pid).unwrap_or_default()
     };
 
     // Prune dead process lineages.
@@ -2827,13 +2844,19 @@ fn run_lsm_verdict_loop(
 
             {
                 let mut store = telemetry_store.lock().unwrap();
+                if request.ppid != 0 {
+                    store.ppid_map.insert(request.pid, request.ppid);
+                }
+                let root_pid = store.root_pid(request.pid);
                 store
-                    .entry(request.pid)
+                    .events
+                    .entry(root_pid)
                     .or_default()
                     .push(KernelTelemetryEvent {
                         event_type: format!("{:?}", request.req_type),
                         resource: request.effective_path().to_string(),
                         denied,
+                        ppid: request.ppid,
                     });
             }
 
@@ -3066,6 +3089,7 @@ mod deputy_detection_tests {
 
     fn unix_connect(resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 7,
             pid: 4242,
             req_type: LsmRequestType::Connect,
@@ -3636,7 +3660,7 @@ mod agent_identity_binding_tests {
     use super::{
         agent_uid_binding_allows, handle_client_connection, parse_policy_content, AgentNodePolicy,
         ClientConnectionContext, KernelTelemetryEvent, NetworkPolicy, PolicyConfig, ReplayGuard,
-        RuntimePolicy, TelemetryStore, MAX_REPLAY_ENTRIES,
+        RuntimePolicy, TelemetryStore, TelemetryStoreData, MAX_REPLAY_ENTRIES,
     };
     use crate::governance::{AuditLogger, CombinedSemanticService, LineageRegistry};
     use std::collections::HashMap;
@@ -3758,7 +3782,7 @@ agent_nodes:
             secret,
         );
         let telemetry_store: TelemetryStore =
-            Arc::new(Mutex::new(HashMap::<u32, Vec<KernelTelemetryEvent>>::new()));
+            Arc::new(Mutex::new(TelemetryStoreData::default()));
         let ctx = ClientConnectionContext {
             current_policy: policy_with_node(node(vec![wrong_uid])),
             registry_store: Arc::new(Mutex::new(LineageRegistry::load_or_create(
@@ -3808,7 +3832,7 @@ agent_nodes:
             shared_secret,
         );
         let telemetry_store: TelemetryStore =
-            Arc::new(Mutex::new(HashMap::<u32, Vec<KernelTelemetryEvent>>::new()));
+            Arc::new(Mutex::new(TelemetryStoreData::default()));
         let ctx = ClientConnectionContext {
             current_policy: policy_with_node(node(vec![unsafe { libc::geteuid() as u32 }])),
             registry_store: Arc::new(Mutex::new(LineageRegistry::load_or_create(
@@ -3977,6 +4001,7 @@ mod enforcement_scope_tests {
 
     fn test_lsm_request(req_type: LsmRequestType, resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid: std::process::id(),
             req_type,
@@ -4126,6 +4151,7 @@ mod origin_enforcement_tests {
 
     fn test_lsm_request(resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid: std::process::id(),
             req_type: LsmRequestType::Execve,
@@ -4306,6 +4332,7 @@ mod operator_safety_invariants {
 
     fn execve_request(process_path: &str, resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid: std::process::id(),
             req_type: LsmRequestType::Execve,
@@ -4412,6 +4439,7 @@ mod safe_mode_invariants {
 
     fn execve_request(process_path: &str, resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid: std::process::id(),
             req_type: LsmRequestType::Execve,
@@ -4455,6 +4483,7 @@ mod intent_enforcement_tests {
 
     fn test_lsm_request(pid: u32, req_type: LsmRequestType, resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid,
             req_type,
@@ -4556,6 +4585,7 @@ mod escalation_tests {
 
     fn test_lsm_request(pid: u32, req_type: LsmRequestType, resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid,
             req_type,
@@ -4701,6 +4731,7 @@ mod kernel_network_policy_mirror_tests {
 
     fn unix_connect(path: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid: std::process::id(),
             req_type: LsmRequestType::Connect,
@@ -4765,6 +4796,7 @@ mod identity_tracking_tests {
         process_path: &str,
     ) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 1,
             pid,
             req_type,
@@ -5156,7 +5188,7 @@ async fn run() -> Result<()> {
     if let Err(err) = audit_logger.log_boot_marker() {
         eprintln!("[audit] boot marker skipped: {err:#}");
     }
-    let telemetry_store: TelemetryStore = Arc::new(Mutex::new(HashMap::new()));
+    let telemetry_store: TelemetryStore = Arc::new(Mutex::new(TelemetryStoreData::default()));
     let nonce_store: Arc<Mutex<ReplayGuard>> =
         Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES)));
     let rootai_remote = match (

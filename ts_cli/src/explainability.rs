@@ -836,6 +836,7 @@ mod explainability_tests {
 
     fn mock_request(resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 42,
             pid: 1234,
             req_type: LsmRequestType::Execve,
@@ -973,6 +974,7 @@ mod persistence_tests {
 
     fn mock_request(pid: u32, req_type: LsmRequestType, process_path: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 42,
             pid,
             req_type,
@@ -1080,6 +1082,7 @@ mod intent_tracking_tests {
 
     fn mock_request(pid: u32, req_type: LsmRequestType, resource: &str) -> LsmRequest {
         LsmRequest {
+            ppid: 0,
             cookie: 42,
             pid,
             req_type,

@@ -141,6 +141,7 @@ int BPF_PROG(jg_inode_create, struct inode *dir, struct dentry *dentry, umode_t 
 
     req->cookie = cookie;
     req->pid = pid;
+    req->ppid = jg_get_ppid();
     req->type = REQ_INODE_CREATE;
     req->source_program = JG_SRC_INODE_CREATE;
     __builtin_memcpy(req->resource_path, resource_path, sizeof(req->resource_path));
