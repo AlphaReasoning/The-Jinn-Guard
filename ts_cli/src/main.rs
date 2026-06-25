@@ -79,6 +79,7 @@ pub(crate) struct KernelTelemetryEvent {
     #[allow(dead_code)]
     pub resource: String,
     pub denied: bool,
+    #[allow(dead_code)]
     pub ppid: u32,
 }
 

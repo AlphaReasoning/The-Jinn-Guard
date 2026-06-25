@@ -1626,8 +1626,8 @@ pub mod aya_backend {
         if trimmed.is_empty() {
             return None;
         }
-        let host = if trimmed.starts_with('[') {
-            trimmed[1..]
+        let host = if let Some(stripped) = trimmed.strip_prefix('[') {
+            stripped
                 .split_once(']')
                 .map(|(h, _)| h)
                 .unwrap_or(trimmed)

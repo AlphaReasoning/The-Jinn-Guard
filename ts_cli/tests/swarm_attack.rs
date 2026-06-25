@@ -752,7 +752,11 @@ fn print_attack_summary() {
     for i in 0..11 {
         let sent = RESULTS[i].0.load(Ordering::Relaxed);
         let denied = RESULTS[i].1.load(Ordering::Relaxed);
-        let rate = if sent > 0 { denied * 100 / sent } else { 100 };
+        let rate = if sent > 0 {
+            (denied * 100).checked_div(sent).unwrap_or(100)
+        } else {
+            100
+        };
         let rate_str = if i == 3 {
             format!("{:>3}%*", rate)
         } else if i == 10 {

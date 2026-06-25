@@ -219,7 +219,7 @@ impl DaemonGuard {
 
         // The daemon itself is spawned while we are still in the root cgroup, so
         // the daemon is never governed by its own hooks.
-        let child = command
+        let mut child = command
             .spawn()
             .unwrap_or_else(|err| panic!("spawn enterprise daemon: {err}"));
 
@@ -242,6 +242,8 @@ impl DaemonGuard {
             thread::sleep(Duration::from_millis(50));
         }
 
+        let _ = child.kill();
+        let _ = child.wait();
         panic!(
             "enterprise daemon did not create its socket; verify BPF LSM privileges and /usr/lib/jinnguard/jinnguard_lsm.o"
         );
