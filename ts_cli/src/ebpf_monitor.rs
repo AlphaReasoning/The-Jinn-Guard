@@ -455,6 +455,7 @@ pub mod aya_backend {
         pub dest: [u8; 108],
         pub payload_preview: [u8; 64],
         pub source_program: u32,
+        pub ppid: u32,
     }
 
     const _: [(); 328] = [(); std::mem::size_of::<RawLsmRequest>()];
@@ -467,6 +468,7 @@ pub mod aya_backend {
     const _: [(); 148] = [(); std::mem::offset_of!(RawLsmRequest, dest)];
     const _: [(); 256] = [(); std::mem::offset_of!(RawLsmRequest, payload_preview)];
     const _: [(); 320] = [(); std::mem::offset_of!(RawLsmRequest, source_program)];
+    const _: [(); 324] = [(); std::mem::offset_of!(RawLsmRequest, ppid)];
     const _: [(); 16] = [(); std::mem::size_of::<VerdictPayload>()];
 
     impl TryFrom<RawLsmRequest> for LsmRequest {
@@ -1625,14 +1627,17 @@ pub mod aya_backend {
             return None;
         }
         let host = if trimmed.starts_with('[') {
-            trimmed[1..].split_once(']').map(|(h, _)| h).unwrap_or(trimmed)
+            trimmed[1..]
+                .split_once(']')
+                .map(|(h, _)| h)
+                .unwrap_or(trimmed)
         } else {
             trimmed
         };
-        
-        host.parse::<std::net::Ipv6Addr>()
-            .ok()
-            .map(|addr| Ipv6Key { addr: addr.octets() })
+
+        host.parse::<std::net::Ipv6Addr>().ok().map(|addr| Ipv6Key {
+            addr: addr.octets(),
+        })
     }
 
     fn empty_path_key() -> PathKey {
