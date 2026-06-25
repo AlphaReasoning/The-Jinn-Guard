@@ -580,7 +580,7 @@ fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
     load_required_secret(path).unwrap_or_else(|_| {
         exit_codes::fatal(
             exit_codes::EX_CONFIG,
-            "SECRET_MISSING",
+            exit_codes::KIND_SECRET_MISSING,
             "No HMAC secret. Use --secret-file or configure the kernel keyring.",
         )
     })
@@ -630,7 +630,7 @@ fn load_admission_keyset(
     if let Err(err) = validate_previous_secret_config(previous_path, previous_valid_until) {
         exit_codes::fatal(
             exit_codes::EX_CONFIG,
-            "SECRET_ROTATION_CONFIG",
+            exit_codes::KIND_SECRET_ROTATION_CONFIG,
             &format!("{err:#}"),
         );
     }
@@ -638,7 +638,7 @@ fn load_admission_keyset(
     let current = load_required_secret(current_path).unwrap_or_else(|_| {
         exit_codes::fatal(
             exit_codes::EX_CONFIG,
-            "SECRET_MISSING",
+            exit_codes::KIND_SECRET_MISSING,
             "No HMAC secret. Use --secret-file or configure the kernel keyring.",
         )
     });
@@ -647,7 +647,7 @@ fn load_admission_keyset(
             let secret = read_secret_file(path).unwrap_or_else(|err| {
                 exit_codes::fatal(
                     exit_codes::EX_CONFIG,
-                    "SECRET_ROTATION_CONFIG",
+                    exit_codes::KIND_SECRET_ROTATION_CONFIG,
                     &format!("{err:#}"),
                 )
             });
@@ -662,7 +662,7 @@ fn load_admission_keyset(
     AdmissionKeyset::new(current, previous).unwrap_or_else(|err| {
         exit_codes::fatal(
             exit_codes::EX_CONFIG,
-            "SECRET_ROTATION_CONFIG",
+            exit_codes::KIND_SECRET_ROTATION_CONFIG,
             &format!("{err:#}"),
         )
     })
@@ -3402,13 +3402,13 @@ mod exit_code_tests {
     fn fatal_line_is_machine_parseable() {
         let line = exit_codes::format_fatal(
             exit_codes::EX_CONFIG,
-            "SECRET_MISSING",
+            exit_codes::KIND_SECRET_MISSING,
             "No HMAC secret. Use --secret-file",
         );
         // Stable, greppable shape: `code=<n> kind=<KIND> msg="..."`.
         assert!(line.starts_with("jinnguard: fatal "));
         assert!(line.contains("code=78"));
-        assert!(line.contains("kind=SECRET_MISSING"));
+        assert!(line.contains(&format!("kind={}", exit_codes::KIND_SECRET_MISSING)));
         // Message is quoted (Debug) so embedded spaces don't break parsing.
         assert!(line.contains(r#"msg="No HMAC secret. Use --secret-file""#));
     }
@@ -3462,6 +3462,29 @@ mod exit_code_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), codes.len(), "exit codes must be distinct");
+    }
+
+    #[test]
+    fn startup_kind_strings_are_distinct() {
+        let kinds = [
+            exit_codes::KIND_SECRET_MISSING,
+            exit_codes::KIND_SECRET_ROTATION_CONFIG,
+            exit_codes::KIND_AGENT_SECRET_PERM,
+            exit_codes::KIND_KERNEL_LSM_UNAVAILABLE,
+            exit_codes::KIND_STARTUP_FAILED,
+            exit_codes::KIND_ROOTAI_TLS_CONFIG,
+            exit_codes::KIND_ROOTAI_CONFIG,
+            exit_codes::KIND_MCP_TLS_CONFIG,
+            exit_codes::KIND_POLICY_LOAD,
+        ];
+        let mut sorted = kinds.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            kinds.len(),
+            "exit kind strings must be distinct"
+        );
     }
 }
 
@@ -5052,6 +5075,18 @@ pub mod exit_codes {
     pub const EX_SOFTWARE: i32 = 70; // internal/unclassified startup error
     pub const EX_CONFIG: i32 = 78; // missing/invalid configuration (e.g. HMAC secret)
 
+    // Machine-readable `kind=` tokens emitted on fatal startup errors.
+    // Keep these in sync with OPERATOR_RUNBOOK.md § "Exit codes".
+    pub const KIND_SECRET_MISSING: &str = "SECRET_MISSING";
+    pub const KIND_SECRET_ROTATION_CONFIG: &str = "SECRET_ROTATION_CONFIG";
+    pub const KIND_AGENT_SECRET_PERM: &str = "AGENT_SECRET_PERM";
+    pub const KIND_KERNEL_LSM_UNAVAILABLE: &str = "KERNEL_LSM_UNAVAILABLE";
+    pub const KIND_STARTUP_FAILED: &str = "STARTUP_FAILED";
+    pub const KIND_ROOTAI_TLS_CONFIG: &str = "ROOTAI_TLS_CONFIG";
+    pub const KIND_ROOTAI_CONFIG: &str = "ROOTAI_CONFIG";
+    pub const KIND_MCP_TLS_CONFIG: &str = "MCP_TLS_CONFIG";
+    pub const KIND_POLICY_LOAD: &str = "POLICY_LOAD";
+
     /// The single machine-parseable fatal line:
     /// `jinnguard: fatal code=<n> kind=<KIND> msg="<message>"`
     pub fn format_fatal(code: i32, kind: &str, msg: &str) -> String {
@@ -5072,7 +5107,7 @@ async fn main() {
         // machine-parseable exit instead of a bare Debug print + exit 1.
         exit_codes::fatal(
             exit_codes::EX_SOFTWARE,
-            "STARTUP_FAILED",
+            exit_codes::KIND_STARTUP_FAILED,
             &format!("{err:#}"),
         );
     }
@@ -5129,7 +5164,7 @@ async fn run() -> Result<()> {
         AgentSecretStore::load_from_dir(args.agent_secret_dir.as_deref()).unwrap_or_else(|err| {
             exit_codes::fatal(
                 exit_codes::EX_CONFIG,
-                "AGENT_SECRET_CONFIG",
+                exit_codes::KIND_AGENT_SECRET_PERM,
                 &format!("{err:#}"),
             )
         }),
@@ -5174,21 +5209,21 @@ async fn run() -> Result<()> {
                 }
                 Err(err) => exit_codes::fatal(
                     exit_codes::EX_CONFIG,
-                    "ROOTAI_TLS_CONFIG",
+                    exit_codes::KIND_ROOTAI_TLS_CONFIG,
                     &format!("{err:#}"),
                 ),
             }
         }
         _ => exit_codes::fatal(
             exit_codes::EX_CONFIG,
-            "ROOTAI_TLS_CONFIG",
+            exit_codes::KIND_ROOTAI_TLS_CONFIG,
             "RootAI remote requires --rootai-url, --rootai-tls-cert, --rootai-tls-key and --rootai-tls-ca together",
         ),
     };
     if args.rootai_socket.is_some() && rootai_remote.is_some() {
         exit_codes::fatal(
             exit_codes::EX_CONFIG,
-            "ROOTAI_CONFIG",
+            exit_codes::KIND_ROOTAI_CONFIG,
             "--rootai-socket and --rootai-url are mutually exclusive",
         );
     }
@@ -5224,7 +5259,7 @@ async fn run() -> Result<()> {
         // can distinguish "kernel LSM unavailable" from a generic crash.
         exit_codes::fatal(
             exit_codes::EX_UNAVAILABLE,
-            "KERNEL_LSM_UNAVAILABLE",
+            exit_codes::KIND_KERNEL_LSM_UNAVAILABLE,
             &format!("{err:#}"),
         );
     }
@@ -5506,14 +5541,14 @@ async fn run() -> Result<()> {
                     }
                     Err(e) => exit_codes::fatal(
                         exit_codes::EX_CONFIG,
-                        "MCP_TLS_CONFIG",
+                        exit_codes::KIND_MCP_TLS_CONFIG,
                         &format!("{e:#}"),
                     ),
                 }
             }
             _ => exit_codes::fatal(
                 exit_codes::EX_CONFIG,
-                "MCP_TLS_CONFIG",
+                exit_codes::KIND_MCP_TLS_CONFIG,
                 "MCP mTLS requires --mcp-tls-cert, --mcp-tls-key and --mcp-tls-ca together",
             ),
         };
