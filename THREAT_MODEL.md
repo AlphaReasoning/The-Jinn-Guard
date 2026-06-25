@@ -202,8 +202,10 @@ wraps armed runs in a hard 10-minute watchdog.
    interpreters for governed agents; not eliminated.
 5. **Root-equivalent adversary is out of scope** by assumption (§3).
 6. **HMAC secret distribution.** Security reduces to protecting the shared key
-   (kernel keyring / root-owned secret file). Key rotation is not yet automated
-   (tracked for productionization).
+   (kernel keyring / root-owned secret file). Supervised rotation supports a
+   current key plus a previous key accepted only until an operator-configured
+   Unix-epoch grace deadline; partial or malformed rotation state is a fatal
+   startup config error.
 7. **DNS mediation is heuristic.** `sendmsg`-to-:53 payload inspection is
    best-effort, not a full resolver-level policy.
 8. **Multi-user yes; multi-tenant isolation partial.** The daemon authenticates
@@ -501,7 +503,6 @@ the same observation history always yields the same decision.
 | Daemon-authoritative risk scoring (replace keyword heuristic; cf. §8) | Engineering |
 | eBPF-traced interpreter child-process attribution (close JG-ADV-2026-001 chains) | Engineering |
 | Multi-distribution / multi-kernel validation matrix | Engineering |
-| Automated HMAC key rotation | Engineering |
 | Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |
 
 **Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup

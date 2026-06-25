@@ -111,7 +111,7 @@ escape"](THREAT_MODEL.md).
 | # | Boundary | Trusted side | Untrusted side | Control |
 |---|---|---|---|---|
 | B1 | Unix-domain socket | Daemon + HMAC secret | Connecting agent/broker | Bounded framed reads, version tag, length cap (`ts_wire`, STEP 1–2) |
-| B2 | Proposal authenticity | Keyring/secret-file key | Proposal bytes | Constant-time HMAC-SHA256 verify (STEP 3–4) |
+| B2 | Proposal authenticity | Current keyring/secret-file key plus optional previous key during bounded grace | Proposal bytes | Constant-time HMAC-SHA256 verify (STEP 3–4); previous key expires at operator-configured Unix epoch |
 | B3 | Caller identity | `SO_PEERCRED` peer creds + lineage | Self-declared `agent_id` | Unknown/anonymous gates (STEP 7–8); identity is **observed**, not asserted |
 | B4 | LSM hooks | Kernel + installed policy maps | Every governed user-space process | Synchronous in-kernel allow/deny, scoped to the governed cgroup |
 | B5 | cgroup scope | Operator session + system services | Governed agent cgroup subtree | Subtree match (`bpf_get_current_ancestor_cgroup_id`); unsheddable (#49) |
@@ -227,7 +227,7 @@ path keeps the current policy (fail-safe).
 
 | Key | Storage | Boundary |
 |---|---|---|
-| Admission HMAC secret | Kernel keyring or root-owned `--secret-file` | B2/B6 |
+| Admission HMAC secret | Kernel keyring or root-owned `--secret-file`; optional root-owned `--previous-secret-file` for bounded rotation grace | B2/B6 |
 | Fleet bundle-signing key (verify side) | Root-owned `--fleet-secret-file` (defaults to admission secret) | B6/B8 |
 | Audit pseudonym salt | Per-install, generated once, in the audit DB `audit_meta` | B7 |
 | Per-record commitment salts | In the erasable `audit_pii` rows (destroyed on erasure) | B7 |
