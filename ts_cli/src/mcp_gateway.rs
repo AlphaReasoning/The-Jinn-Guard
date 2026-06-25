@@ -69,6 +69,27 @@ struct JsonRpcErrorObj {
 // Synthetic agent_id derivation
 // ---------------------------------------------------------------------------
 
+fn extract_cert_identity(cert: &openssl::x509::X509) -> Option<String> {
+    if let Some(sans) = cert.subject_alt_names() {
+        for san in sans {
+            if let Some(uri) = san.uri() {
+                return Some(uri.to_string());
+            }
+            if let Some(dns) = san.dnsname() {
+                return Some(dns.to_string());
+            }
+        }
+    }
+    for entry in cert.subject_name().entries() {
+        if entry.object().nid() == openssl::nid::Nid::COMMONNAME {
+            if let Ok(cn) = entry.data().as_utf8() {
+                return Some(cn.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Derive a deterministic synthetic agent_id from the client IP address using
 /// an HMAC-SHA256 over the IP string.  This allows the governance pipeline to
 /// track per-IP behavioral lineage without requiring the caller to register.
@@ -318,6 +339,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     telemetry_store: TelemetryStore,
     secret: Arc<Vec<u8>>,
     upstream_addr: String,
+    peer_cert_identity: Option<String>,
 ) {
     // Read the incoming HTTP request.
     let http_req = match timeout(MCP_REQUEST_READ_TIMEOUT, read_http_request(&mut stream)).await {
@@ -369,9 +391,9 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    // Derive synthetic agent_id from client IP + HMAC secret.
+    // Derive synthetic agent_id from client IP + HMAC secret, unless cert identity provided.
     let peer_ip = peer_addr.ip().to_string();
-    let agent_id = synthetic_agent_id(&peer_ip, secret.as_slice());
+    let agent_id = peer_cert_identity.unwrap_or_else(|| synthetic_agent_id(&peer_ip, secret.as_slice()));
 
     // Map JSON-RPC params to context_vars.
     let mut context_vars: HashMap<String, f64> = HashMap::new();
@@ -971,6 +993,7 @@ pub(crate) async fn run_mcp_gateway(
                         match tls_clone {
                             Some(acceptor) => match accept_tls(&acceptor, stream).await {
                                 Ok(tls_stream) => {
+                                    let cert_identity = tls_stream.ssl().peer_certificate().and_then(|cert| extract_cert_identity(&cert));
                                     handle_mcp_connection(
                                         tls_stream,
                                         peer_addr,
@@ -980,6 +1003,7 @@ pub(crate) async fn run_mcp_gateway(
                                         telemetry_clone,
                                         secret_clone,
                                         upstream_clone,
+                                        cert_identity,
                                     )
                                     .await;
                                 }
@@ -997,6 +1021,7 @@ pub(crate) async fn run_mcp_gateway(
                                     telemetry_clone,
                                     secret_clone,
                                     upstream_clone,
+                                    None,
                                 )
                                 .await;
                             }

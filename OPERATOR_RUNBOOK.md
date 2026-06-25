@@ -85,9 +85,13 @@ CLI flags (set by the unit): `--socket-path --policy-file --secret-file
 **MCP gateway mTLS (optional).** Pass `--mcp-tls-cert <pem>`, `--mcp-tls-key <pem>`
 and `--mcp-tls-ca <pem>` *together* to require mutual TLS on the MCP gateway: the
 gateway presents its certificate and only admits clients presenting a certificate
-that chains to the CA bundle. Omit all three for plaintext (default). Supplying a
-*partial* set is a fatal config error (`code=78 kind=MCP_TLS_CONFIG`) — the daemon
-refuses to start rather than silently fall back to plaintext.
+that chains to the CA bundle. When mTLS is enabled, the client's identity is
+automatically extracted from their certificate's Subject Alternative Name
+(SAN URI/DNS) or Common Name (CN). This identity overrides the default IP-based
+synthetic identity, allowing you to use SPIFFE SVIDs for mutually distrusting
+tenants. Omit all three for plaintext (default). Supplying a *partial* set is a
+fatal config error (`code=78 kind=MCP_TLS_CONFIG`) — the daemon refuses to start
+rather than silently fall back to plaintext.
 
 **RootAI remote semantic scorer mTLS (optional).** Pass `--rootai-url <https-url>`,
 `--rootai-tls-cert <pem>`, `--rootai-tls-key <pem>` and `--rootai-tls-ca <pem>`

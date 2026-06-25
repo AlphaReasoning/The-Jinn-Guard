@@ -53,6 +53,19 @@ Operability and review-driven hardening (moving toward pilot-ready).
   with `rpm-ostree kargs` without touching grub, prints the computed change
   before applying it, and prints the exact revert command. The installer invokes
   it only on `/run/ostree-booted` hosts before the existing BPF-LSM active check.
+- **Certificate-bound MCP gateway identities.** When `--mcp-tls-cert`,
+  `--mcp-tls-key`, and `--mcp-tls-ca` are provided, the MCP gateway now extracts
+  the peer's Subject Alternative Name (SAN URI/DNS) or Common Name (CN) from
+  their verified X.509 certificate. This extracted identity replaces the IP-based
+  synthetic agent ID, fully supporting fleet-distributed, mutually distrusting
+  tenants using SPIFFE SVIDs or standard certs without shared secrets.
+- **Heuristic scorer conservative mode.** Replaced the local keyword heuristic's
+  unconditional trust with a daemon-authoritative conservative mode via
+  `--heuristic-fallback-mode conservative`. In this mode, if the RootAI remote
+  and socket are unavailable, the heuristic's confidence is clamped to 0.50 and
+  its risk score floored at 55.0. This ensures downstream policy risk gates and
+  Z3 ceilings treat unconfigured-scorer results as medium-risk, requiring an
+  explicit policy allow. The existing behavior remains the default (`trusted`).
 
 ### Security / hardening
 - **Internal red-team batch 5 — lineage/quota integration fixes (JG-RT-007, MED).**
