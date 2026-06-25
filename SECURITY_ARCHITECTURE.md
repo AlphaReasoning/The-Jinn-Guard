@@ -111,7 +111,7 @@ escape"](THREAT_MODEL.md).
 | # | Boundary | Trusted side | Untrusted side | Control |
 |---|---|---|---|---|
 | B1 | Unix-domain socket | Daemon + HMAC secret | Connecting agent/broker | Bounded framed reads, version tag, length cap (`ts_wire`, STEP 1–2) |
-| B2 | Proposal authenticity | Current keyring/secret-file key plus optional previous key during bounded grace | Proposal bytes | Constant-time HMAC-SHA256 verify (STEP 3–4); previous key expires at operator-configured Unix epoch |
+| B2 | Proposal authenticity | Current keyring/secret-file key plus optional previous key during bounded grace; optional per-agent key files override the shared key for matching `agent_id` values | Proposal bytes | Constant-time HMAC-SHA256 verify (STEP 3–4); previous key expires at operator-configured Unix epoch; per-agent keys are loaded once at startup |
 | B3 | Caller identity | `SO_PEERCRED` peer creds + lineage | Self-declared `agent_id` | Unknown/anonymous gates (STEP 7–8); identity is **observed**, not asserted |
 | B4 | LSM hooks | Kernel + installed policy maps | Every governed user-space process | Synchronous in-kernel allow/deny, scoped to the governed cgroup |
 | B5 | cgroup scope | Operator session + system services | Governed agent cgroup subtree | Subtree match (`bpf_get_current_ancestor_cgroup_id`); unsheddable (#49) |
@@ -180,6 +180,9 @@ loudest signal of an uncovered escape path.
   local Unix-domain socket. The shipped system uses a **symmetric MAC**, not
   mTLS/PKI (the historical [`red-team-report.md`](red-team-report.md) describes an
   aspirational mTLS model — the accurate, shipped design is HMAC-over-UDS).
+  Operators can optionally configure a per-agent secret directory; if a key file
+  exists for a signed `agent_id`, the shared admission key is no longer accepted
+  for that id. Agents without a configured file keep the shared key path.
   Optional RootAI remote scoring uses outbound HTTPS/mTLS only for scorer
   transport and never replaces proposal authentication or enforcement gates.
 - **Identity (B3):** the daemon does not trust the self-declared `agent_id`. It
@@ -231,6 +234,7 @@ path keeps the current policy (fail-safe).
 | Key | Storage | Boundary |
 |---|---|---|
 | Admission HMAC secret | Kernel keyring or root-owned `--secret-file`; optional root-owned `--previous-secret-file` for bounded rotation grace | B2/B6 |
+| Per-agent HMAC secrets | Optional root-owned `--agent-secret-dir`; each regular file name is an `agent_id` and its contents are that agent's signing key | B2/B6 |
 | Fleet bundle-signing key (verify side) | Root-owned `--fleet-secret-file` (defaults to admission secret) | B6/B8 |
 | Audit pseudonym salt | Per-install, generated once, in the audit DB `audit_meta` | B7 |
 | Per-record commitment salts | In the erasable `audit_pii` rows (destroyed on erasure) | B7 |
