@@ -291,11 +291,43 @@ impl SemanticAnalysisService for LocalHeuristicSemanticService {
     }
 }
 
+/// Controls how the local keyword-heuristic result is treated when it fires as
+/// the last resort (both RootAI socket and remote scorers unavailable).
+///
+/// * `Trusted`      — existing behavior; confidence = 0.65, score unchanged.
+///   Use when the heuristic is a known-good calibration for your workload.
+/// * `Conservative` — confidence clamped to 0.50, risk_score floored to 55.0,
+///   and a `heuristic_conservative` signal added. Z3 ceilings and policy
+///   risk gates therefore treat unconfigured-scorer results as medium-risk,
+///   requiring an explicit policy allow for anything below the floor.
+///   No existing allow path is created; the floor only restricts.
+///   Use when deploying without a configured RootAI scorer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeuristicFallbackMode {
+    /// Existing behavior — heuristic result is trusted as-is (default).
+    #[default]
+    Trusted,
+    /// Conservative — heuristic confidence and minimum score are clamped
+    /// so gating logic treats the result as medium-risk.
+    Conservative,
+}
+
+impl std::fmt::Display for HeuristicFallbackMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeuristicFallbackMode::Trusted => write!(f, "trusted"),
+            HeuristicFallbackMode::Conservative => write!(f, "conservative"),
+        }
+    }
+}
+
 pub struct CombinedSemanticService {
     pub rootai_socket_path: Option<String>,
     pub rootai_remote: Option<RootAiRemote>,
     /// Counts fallback-to-heuristic events since daemon start (for telemetry).
     pub fallback_count: Arc<std::sync::atomic::AtomicU64>,
+    /// How to treat the local heuristic when it fires as last resort.
+    pub heuristic_mode: HeuristicFallbackMode,
 }
 
 #[derive(Clone)]
@@ -427,7 +459,23 @@ impl SemanticAnalysisService for CombinedSemanticService {
                 }
             }
         }
-        LocalHeuristicSemanticService.classify(proposal)
+        // Both remote paths missed — use local heuristic as last resort.
+        let mut intent = LocalHeuristicSemanticService.classify(proposal);
+        if self.heuristic_mode == HeuristicFallbackMode::Conservative {
+            // Conservative mode: treat heuristic-only results as untrusted.
+            // Clamp confidence below the RootAI trust threshold (0.7) so
+            // downstream gates that inspect confidence know the score came
+            // from the keyword heuristic, not a validated scorer.
+            intent.confidence = intent.confidence.min(0.50);
+            // Floor the risk score so Z3 ceilings and policy risk gates
+            // require an explicit allow for anything the heuristic rated low.
+            // This does not create a new allow path — it only restricts.
+            if intent.risk_score < 55.0 {
+                intent.risk_score = 55.0;
+            }
+            intent.signals.push("heuristic_conservative".to_string());
+        }
+        intent
     }
 }
 
@@ -2174,6 +2222,7 @@ mod tests {
             rootai_socket_path: None,
             rootai_remote: Some(RootAiRemote::insecure_http_for_test(endpoint)),
             fallback_count: Arc::clone(&fallback_count),
+            heuristic_mode: HeuristicFallbackMode::Trusted,
         };
 
         let intent = semantic_service.classify(&proposal_with_text("read only"));
@@ -2195,6 +2244,7 @@ mod tests {
             rootai_socket_path: None,
             rootai_remote: Some(RootAiRemote::insecure_http_for_test(endpoint)),
             fallback_count: Arc::clone(&fallback_count),
+            heuristic_mode: HeuristicFallbackMode::Trusted,
         };
 
         let intent = semantic_service.classify(&proposal_with_text("read list"));
@@ -2202,6 +2252,48 @@ mod tests {
         assert_eq!(intent.class, IntentClass::ReadOnly);
         assert!(intent.signals.contains(&"read_only".to_string()));
         assert_eq!(fallback_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn heuristic_conservative_mode_clamps_confidence_and_floors_risk() {
+        let fallback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let semantic_service = CombinedSemanticService {
+            rootai_socket_path: None,
+            rootai_remote: None,
+            fallback_count: Arc::clone(&fallback_count),
+            heuristic_mode: HeuristicFallbackMode::Conservative,
+        };
+
+        // Heuristic natively rates "read list" as 20.0 and confidence 0.65
+        let intent = semantic_service.classify(&proposal_with_text("read list"));
+
+        assert_eq!(intent.class, IntentClass::ReadOnly);
+        assert_eq!(intent.risk_score, 55.0); // Floored to 55.0
+        assert_eq!(intent.confidence, 0.50); // Clamped to 0.50
+        assert!(intent
+            .signals
+            .contains(&"heuristic_conservative".to_string()));
+    }
+
+    #[test]
+    fn heuristic_trusted_mode_preserves_score() {
+        let fallback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let semantic_service = CombinedSemanticService {
+            rootai_socket_path: None,
+            rootai_remote: None,
+            fallback_count: Arc::clone(&fallback_count),
+            heuristic_mode: HeuristicFallbackMode::Trusted,
+        };
+
+        // Heuristic natively rates "read list" as 20.0 and confidence 0.65
+        let intent = semantic_service.classify(&proposal_with_text("read list"));
+
+        assert_eq!(intent.class, IntentClass::ReadOnly);
+        assert_eq!(intent.risk_score, 20.0); // Kept as 20.0
+        assert_eq!(intent.confidence, 0.65); // Kept as 0.65
+        assert!(!intent
+            .signals
+            .contains(&"heuristic_conservative".to_string()));
     }
 
     #[test]

@@ -28,8 +28,8 @@ use crate::{
     explicit_protected_resource_attack,
     governance::{
         AgentLineage, AuditLogger, CapabilityProfile, ClientProposal, CombinedSemanticService,
-        ExecutionBroker, ExecutionRequest, IntentClass, LineageRegistry, ObservationRecord,
-        PolicyDecision, RiskAssessment, SemanticAnalysisService, SemanticIntent,
+        ExecutionBroker, ExecutionRequest, HeuristicFallbackMode, IntentClass, LineageRegistry,
+        ObservationRecord, PolicyDecision, RiskAssessment, SemanticAnalysisService, SemanticIntent,
     },
     intent_is_dangerous, is_enforcement_target, observed_risk_penalty, policy_decision,
     protected_resource_reference, system_immunity, KernelTelemetryEvent, PolicyConfig,
@@ -604,6 +604,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
         rootai_socket_path: None,
         rootai_remote: None,
         fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        heuristic_mode: HeuristicFallbackMode::Trusted,
     };
     let semantic_intent = semantic_service.classify(&proposal);
     let capability_profile =

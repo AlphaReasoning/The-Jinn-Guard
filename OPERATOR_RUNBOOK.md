@@ -98,6 +98,10 @@ mutually exclusive with `--rootai-socket`. Runtime scorer failures,
 low-confidence responses, oversized responses, parse failures, or TLS errors fall
 back to the local heuristic and do not change enforcement availability.
 
+**Heuristic fallback mode.** When both RootAI socket and remote scorer are unavailable (or fail), the daemon falls back to a local keyword heuristic. Control how these results are treated with `--heuristic-fallback-mode <trusted|conservative>` (or `JINNGUARD_HEURISTIC_FALLBACK_MODE`):
+- `trusted` (default): existing behavior; heuristic results are trusted as-is.
+- `conservative`: heuristic confidence is clamped to 0.50 and risk score floored to 55.0, forcing downstream policy gates to treat the result as medium-risk and requiring explicit allow. Adds the `heuristic_conservative` signal to the audit log.
+
 ### Policy
 
 `/etc/jinnguard/policy.yaml` defines agents, allowlists, denylists, quotas,

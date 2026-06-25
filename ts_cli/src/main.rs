@@ -21,9 +21,9 @@ use anyhow::{Context as AnyhowContext, Result};
 use clap::Parser;
 use governance::{
     AgentLineage, AuditLogger, CapabilityProfile, ClientProposal, CombinedSemanticService,
-    ConstraintSet, ExecutionBroker, ExecutionRequest, IntentClass, LineageRegistry,
-    ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment, RootAiRemote,
-    SemanticAnalysisService, SemanticIntent,
+    ConstraintSet, ExecutionBroker, ExecutionRequest, HeuristicFallbackMode, IntentClass,
+    LineageRegistry, ObservationRecord, PolicyDecision, ProposedAction, RiskAssessment,
+    RootAiRemote, SemanticAnalysisService, SemanticIntent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -142,6 +142,22 @@ struct CliArgs {
     /// RootAI remote mTLS CA bundle PEM used to verify the scorer endpoint.
     #[arg(long)]
     rootai_tls_ca: Option<String>,
+    /// How to treat the local heuristic when it fires as last resort (both
+    /// RootAI socket and remote scorer unavailable).
+    ///
+    /// `trusted`      — existing behavior; confidence = 0.65, score unchanged.
+    /// `conservative` — confidence clamped to 0.50, risk_score floored to 55.0;
+    ///                   adds `heuristic_conservative` signal to audit log.
+    ///
+    /// Default: `trusted`. Switch to `conservative` when operating without a
+    /// configured RootAI scorer and you want fail-toward-deny semantics.
+    #[arg(
+        long,
+        env = "JINNGUARD_HEURISTIC_FALLBACK_MODE",
+        default_value = "trusted",
+        value_parser = parse_heuristic_mode
+    )]
+    heuristic_fallback_mode: HeuristicFallbackMode,
     /// Policy refresh interval in seconds
     #[arg(long, default_value_t = 60)]
     policy_refresh_secs: u64,
@@ -815,6 +831,16 @@ fn parse_socket_mode(raw: &str) -> Result<u32> {
     let without_prefix = trimmed.strip_prefix("0o").unwrap_or(trimmed);
     u32::from_str_radix(without_prefix, 8)
         .map_err(|err| anyhow::anyhow!("invalid --socket-mode {raw:?}: {err}"))
+}
+
+fn parse_heuristic_mode(raw: &str) -> Result<HeuristicFallbackMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "trusted" => Ok(HeuristicFallbackMode::Trusted),
+        "conservative" => Ok(HeuristicFallbackMode::Conservative),
+        other => Err(anyhow::anyhow!(
+            "invalid --heuristic-fallback-mode {other:?}: expected \"trusted\" or \"conservative\""
+        )),
+    }
 }
 
 fn remove_stale_unix_socket(socket_path: &str) -> Result<()> {
@@ -3638,7 +3664,9 @@ mod agent_identity_binding_tests {
         ClientConnectionContext, KernelTelemetryEvent, NetworkPolicy, PolicyConfig, ReplayGuard,
         RuntimePolicy, TelemetryStore, MAX_REPLAY_ENTRIES,
     };
-    use crate::governance::{AuditLogger, CombinedSemanticService, LineageRegistry};
+    use crate::governance::{
+        AuditLogger, CombinedSemanticService, HeuristicFallbackMode, LineageRegistry,
+    };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3773,6 +3801,7 @@ agent_nodes:
                 rootai_socket_path: None,
                 rootai_remote: None,
                 fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                heuristic_mode: HeuristicFallbackMode::Trusted,
             }),
         };
 
@@ -3828,6 +3857,7 @@ agent_nodes:
                 rootai_socket_path: None,
                 rootai_remote: None,
                 fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                heuristic_mode: HeuristicFallbackMode::Trusted,
             }),
         };
 
@@ -5192,10 +5222,13 @@ async fn run() -> Result<()> {
             "--rootai-socket and --rootai-url are mutually exclusive",
         );
     }
+    let heuristic_mode = args.heuristic_fallback_mode;
+    eprintln!("[startup] heuristic_fallback_mode={heuristic_mode}");
     let semantic_service = Arc::new(CombinedSemanticService {
         rootai_socket_path: args.rootai_socket.clone(),
         rootai_remote,
         fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        heuristic_mode,
     });
 
     // Metrics: opt-in Prometheus endpoint on loopback (JINNGUARD_METRICS_PORT).

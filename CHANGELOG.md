@@ -55,6 +55,13 @@ Operability and review-driven hardening (moving toward pilot-ready).
   it only on `/run/ostree-booted` hosts before the existing BPF-LSM active check.
 
 ### Security / hardening
+- **Heuristic scorer conservative mode.** Replaced the local keyword heuristic's
+  unconditional trust with a daemon-authoritative conservative mode via
+  `--heuristic-fallback-mode conservative`. In this mode, if the RootAI remote
+  and socket are unavailable, the heuristic's confidence is clamped to 0.50 and
+  its risk score floored at 55.0. This ensures downstream policy risk gates and
+  Z3 ceilings treat unconfigured-scorer results as medium-risk, requiring an
+  explicit policy allow. The existing behavior remains the default (`trusted`).
 - **Internal red-team batch 5 — lineage/quota integration fixes (JG-RT-007, MED).**
   The UDS verdict path rejected exact duplicate nonces but did not enforce the
   persisted lineage monotonic sequence invariant, so a valid signer could send a
