@@ -8,6 +8,16 @@ validated research prototype / controlled-pilot MVP; see
 
 Operability and review-driven hardening (moving toward pilot-ready).
 
+### Security / hardening
+- **Per-agent secret permission hardening.** `--agent-secret-dir` and each
+  secret file within it are now validated at startup for safe ownership and
+  mode. The daemon fails closed (`code=78 kind=AGENT_SECRET_PERM`) if the
+  directory is group- or world-writable, or if any secret file is
+  world-readable, world-writable, or group-writable. Each secret file must
+  also be owned by the daemon's effective UID (the check is bypassed when
+  running as root to support container deployments). Five new unit tests cover
+  the rejection paths and the accepted `0600`/`0700` baseline.
+
 ### Added
 - **Residual risk register.** Added [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md)
   as the concise operator-facing inventory of open, partially mitigated, and

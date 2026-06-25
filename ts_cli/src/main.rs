@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
@@ -467,6 +467,8 @@ impl AgentSecretStore {
         let Some(dir) = dir else {
             return Ok(Self::empty());
         };
+        // Fail closed: the directory itself must not be world- or group-writable.
+        check_secret_dir_permissions(Path::new(dir))?;
         let mut secrets = HashMap::new();
         for entry in fs::read_dir(dir)
             .with_context(|| format!("failed to read per-agent secret dir {dir}"))?
@@ -491,6 +493,8 @@ impl AgentSecretStore {
             if !valid_agent_secret_id(&agent_id) {
                 anyhow::bail!("invalid per-agent secret file name {agent_id:?}");
             }
+            // Fail closed: each secret file must have safe ownership and mode.
+            check_secret_file_permissions(&entry.path())?;
             let secret = read_secret_path(&entry.path())?;
             if secret.is_empty() {
                 anyhow::bail!("per-agent HMAC secret for {agent_id:?} is empty");
@@ -532,6 +536,89 @@ fn valid_agent_secret_id(agent_id: &str) -> bool {
         && !agent_id.contains('/')
         && !agent_id.contains('\0')
         && !agent_id.chars().any(char::is_control)
+}
+
+/// Verify that the per-agent secret **directory** is not writable by group or
+/// world. A writable directory allows an attacker with group membership to
+/// replace secret files, undermining HMAC isolation.
+fn check_secret_dir_permissions(path: &Path) -> Result<()> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("cannot stat agent secret dir {}", path.display()))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o020 != 0 {
+        anyhow::bail!(
+            "agent secret dir {} is group-writable (mode {:04o}); \
+             tighten permissions to at most 0750",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    if mode & 0o002 != 0 {
+        anyhow::bail!(
+            "agent secret dir {} is world-writable (mode {:04o}); \
+             tighten permissions to at most 0750",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// Verify that an individual per-agent secret **file** satisfies minimum
+/// security requirements:
+///
+/// * Owned by the current process's effective UID (or the check is skipped if
+///   the process is running as root so that containerised deployments where the
+///   daemon runs as root still load operator-owned files).
+/// * Not world-readable  (`o+r` = 0o004) — would expose the key to any local
+///   user.
+/// * Not world-writable  (`o+w` = 0o002) — would let any local user replace
+///   the key.
+/// * Not group-writable  (`g+w` = 0o020) — group members could silently
+///   replace the key.
+fn check_secret_file_permissions(path: &Path) -> Result<()> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("cannot stat agent secret file {}", path.display()))?;
+    let mode = meta.permissions().mode();
+    // SAFETY: getuid() is always safe — no preconditions.
+    let euid = unsafe { libc::getuid() };
+    let file_uid = meta.uid();
+    // Skip ownership check when running as root; root can legitimately own
+    // files written by an operator with a different UID during setup.
+    if euid != 0 && file_uid != euid {
+        anyhow::bail!(
+            "agent secret file {} is owned by uid {} but daemon runs as uid {}; \
+             the file must be owned by the daemon user",
+            path.display(),
+            file_uid,
+            euid
+        );
+    }
+    if mode & 0o004 != 0 {
+        anyhow::bail!(
+            "agent secret file {} is world-readable (mode {:04o}); \
+             tighten permissions to at most 0640",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    if mode & 0o002 != 0 {
+        anyhow::bail!(
+            "agent secret file {} is world-writable (mode {:04o}); \
+             tighten permissions to at most 0640",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    if mode & 0o020 != 0 {
+        anyhow::bail!(
+            "agent secret file {} is group-writable (mode {:04o}); \
+             tighten permissions to at most 0640",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn get_runtime_secret() -> Result<Vec<u8>> {
@@ -3567,8 +3654,14 @@ mod admission_key_tests {
 
     #[test]
     fn agent_secret_store_loads_files_by_agent_id() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("loads_files");
-        fs::write(dir.join("alpha-agent"), b"alpha-secret\n").expect("write agent secret");
+        // Tight dir mode so the permission check passes regardless of umask.
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir");
+        let secret_path = dir.join("alpha-agent");
+        fs::write(&secret_path, b"alpha-secret\n").expect("write agent secret");
+        fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod secret file");
         fs::create_dir(dir.join("ignored-subdir")).expect("create ignored subdir");
 
         let store =
@@ -3628,6 +3721,94 @@ mod admission_key_tests {
             agent_secrets.verify_envelope(Some("legacy-agent"), &envelope, &admission_keys),
             Some(EnvelopeKeyMatch::Admission(AdmissionKeyMatch::Current))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-agent secret permission-hardening tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a secret file and explicitly chmod it.
+    fn write_secret_with_mode(dir: &std::path::Path, name: &str, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, b"test-secret").expect("write secret file");
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("set permissions");
+        path
+    }
+
+    #[test]
+    fn secret_dir_world_writable_is_rejected() {
+        let dir = temp_dir("dir_world_writable");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o757)).expect("chmod dir");
+        let err = super::AgentSecretStore::load_from_dir(Some(dir.to_str().unwrap()))
+            .err()
+            .expect("world-writable dir must be rejected");
+        assert!(
+            err.to_string().contains("world-writable"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_dir_group_writable_is_rejected() {
+        let dir = temp_dir("dir_group_writable");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).expect("chmod dir");
+        let err = super::AgentSecretStore::load_from_dir(Some(dir.to_str().unwrap()))
+            .err()
+            .expect("group-writable dir must be rejected");
+        assert!(
+            err.to_string().contains("group-writable"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_file_world_readable_is_rejected() {
+        let dir = temp_dir("file_world_readable");
+        use std::os::unix::fs::PermissionsExt;
+        // Safe dir mode; only the file is over-permissioned.
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir");
+        write_secret_with_mode(&dir, "bad-agent", 0o644);
+        let err = super::AgentSecretStore::load_from_dir(Some(dir.to_str().unwrap()))
+            .err()
+            .expect("world-readable secret file must be rejected");
+        assert!(
+            err.to_string().contains("world-readable"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_file_group_writable_is_rejected() {
+        let dir = temp_dir("file_group_writable");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir");
+        write_secret_with_mode(&dir, "bad-agent", 0o660);
+        let err = super::AgentSecretStore::load_from_dir(Some(dir.to_str().unwrap()))
+            .err()
+            .expect("group-writable secret file must be rejected");
+        assert!(
+            err.to_string().contains("group-writable"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_file_mode_600_is_accepted() {
+        let dir = temp_dir("file_mode_600");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir");
+        write_secret_with_mode(&dir, "good-agent", 0o600);
+        let store = super::AgentSecretStore::load_from_dir(Some(dir.to_str().unwrap()))
+            .expect("mode-600 secret file must be accepted");
+        assert_eq!(store.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -3799,8 +3980,19 @@ agent_nodes:
         let agent_secret_dir = temp_path("agent-secrets");
         let _ = std::fs::remove_dir_all(&agent_secret_dir);
         std::fs::create_dir_all(&agent_secret_dir).expect("create agent secret dir");
-        std::fs::write(agent_secret_dir.join("bound-agent"), agent_secret)
-            .expect("write agent secret");
+        // Tight permissions required by the new permission-hardening check.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent_secret_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod agent secret dir");
+        }
+        let secret_path = agent_secret_dir.join("bound-agent");
+        std::fs::write(&secret_path, agent_secret).expect("write agent secret");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod agent secret file");
+        }
 
         let (server, mut client) = tokio::net::UnixStream::pair().expect("unix pair");
         let packet = ts_wire::frame_signed_packet(

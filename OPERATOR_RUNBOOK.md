@@ -144,6 +144,21 @@ daemon loads these files once at startup. If a file exists for an `agent_id`,
 the shared admission key is no longer accepted for that agent; agents without a
 file keep the shared current/previous key behavior.
 
+**Permission enforcement (fail-closed).** The daemon validates ownership and
+mode at startup and exits with code `78` (`AGENT_SECRET_PERM`) if any of the
+following are true:
+
+| Object | Rejected condition |
+|---|---|
+| Secret **directory** | group-writable (`g+w`) or world-writable (`o+w`) |
+| Secret **file** | world-readable (`o+r`), world-writable (`o+w`), or group-writable (`g+w`) |
+| Secret **file** | owned by a UID other than the daemon's effective UID (skipped when running as root) |
+
+The example above uses `0750` for the directory and `0440` for each file, which
+passes both checks. A daemon running as the `jinnguard` user must own the files
+(or run as root in containers where the files are owned by a different UID).
+
+
 ---
 
 ## 5. Operating modes
@@ -327,6 +342,7 @@ msg="..."` and exits:
 |---|---|---|
 | 78 | `SECRET_MISSING` | No HMAC secret. Provide `--secret-file` or load the keyring key. |
 | 78 | `SECRET_ROTATION_CONFIG` | Invalid HMAC rotation state: set previous secret path + expiry together, ensure both keys are non-empty and different. |
+| 78 | `AGENT_SECRET_PERM` | `--agent-secret-dir` or a secret file has unsafe ownership or mode. Tighten directory to at most `0750` and each file to at most `0640`; ensure files are owned by the daemon UID. |
 | 69 | `KERNEL_LSM_UNAVAILABLE` | Enterprise startup required kernel telemetry but the LSM load failed (no BPF-LSM, missing `/usr/lib/jinnguard/lsm/*.o`, or insufficient caps). |
 | 70 | `STARTUP_FAILED` | Other startup error; see the message + `journalctl`. |
 
