@@ -73,10 +73,13 @@ clang + bpftool) and install to `/usr/lib/jinnguard/lsm/`.
 | `JINNGUARD_OTLP_HEADERS=k=v,...` | Optional OTLP HTTP headers; values are never logged. | unset |
 | `JINNGUARD_AUDIT_SALT_MAX_AGE_SECS=<n>` | Auto-rotate the audit pseudonym salt at startup once it is older than `n` seconds (limits long-horizon pseudonym correlation). Erasure/access still cover prior epochs. | off (no rotation) |
 | `JINNGUARD_SECRET_FILE=<path>` | HMAC secret file location. | `/etc/jinnguard/secret` |
+| `JINNGUARD_PREVIOUS_SECRET_FILE=<path>` | Previous HMAC secret accepted during a bounded rotation grace window. Requires `JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL`. | unset |
+| `JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL=<epoch>` | Unix epoch seconds when the previous HMAC secret stops verifying. Requires `JINNGUARD_PREVIOUS_SECRET_FILE`. | unset |
 | `ENABLE_EXPLAINABILITY=1` | Verbose per-decision explanations in the log. | off |
 
 CLI flags (set by the unit): `--socket-path --policy-file --secret-file
---lineage-file --audit-log --mcp-port`.
+--previous-secret-file --previous-secret-valid-until --lineage-file --audit-log
+--mcp-port`.
 
 **MCP gateway mTLS (optional).** Pass `--mcp-tls-cert <pem>`, `--mcp-tls-key <pem>`
 and `--mcp-tls-ca <pem>` *together* to require mutual TLS on the MCP gateway: the
@@ -259,9 +262,24 @@ Notes:
 
 ### Suspected key compromise
 
-Rotate the HMAC secret: write a new value to `/etc/jinnguard/secret`, update the
-keyring (`keyctl padd user jinnguard_hmac_key @s < /etc/jinnguard/secret`),
-restart. All in-flight proposals signed with the old key are then rejected.
+Rotate the HMAC secret with a bounded grace window:
+
+```bash
+sudo install -o root -g jinnguard -m 0440 /etc/jinnguard/secret /etc/jinnguard/secret.previous
+sudo install -o root -g jinnguard -m 0440 /dev/null /etc/jinnguard/secret.next
+sudo sh -c 'openssl rand -hex 32 > /etc/jinnguard/secret.next'
+sudo mv /etc/jinnguard/secret.next /etc/jinnguard/secret
+sudo keyctl padd user jinnguard_hmac_key @s < /etc/jinnguard/secret
+```
+
+Set `JINNGUARD_PREVIOUS_SECRET_FILE=/etc/jinnguard/secret.previous` and
+`JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL=<unix-epoch-seconds>` in the service
+environment, update clients to sign with the new current key, then restart. The
+daemon accepts the previous key only until that epoch and logs
+`accepted previous HMAC key during rotation grace` for old-key proposals. After
+the grace window, remove the previous-key environment and
+`/etc/jinnguard/secret.previous`, then restart again. Partial rotation config,
+empty keys, or identical current/previous keys are fatal startup config errors.
 
 ---
 
@@ -275,6 +293,7 @@ msg="..."` and exits:
 | Code | Kind | Cause / fix |
 |---|---|---|
 | 78 | `SECRET_MISSING` | No HMAC secret. Provide `--secret-file` or load the keyring key. |
+| 78 | `SECRET_ROTATION_CONFIG` | Invalid HMAC rotation state: set previous secret path + expiry together, ensure both keys are non-empty and different. |
 | 69 | `KERNEL_LSM_UNAVAILABLE` | Enterprise startup required kernel telemetry but the LSM load failed (no BPF-LSM, missing `/usr/lib/jinnguard/lsm/*.o`, or insufficient caps). |
 | 70 | `STARTUP_FAILED` | Other startup error; see the message + `journalctl`. |
 
@@ -286,7 +305,7 @@ msg="..."` and exits:
 | Hooks load but **no** telemetry events | Stale pinned ring buffer | Already auto-cleared on startup; if persistent, `rm /sys/fs/bpf/requests` and restart. |
 | `verifier` error on load | Kernel/BTF mismatch | Regenerate `vmlinux.h` from the host BTF and rebuild the objects. |
 | Everything denied unexpectedly | Global enforcement with a tight allowlist | Set `JINNGUARD_GOVERN_CGROUP`, or `JINNGUARD_SAFE_MODE=1` to confirm, then fix policy. |
-| Proposals rejected after a secret change | Key mismatch | Ensure file + keyring hold the same secret; restart. |
+| Proposals rejected after a secret change | Key mismatch or expired previous-key grace | Ensure clients sign with the current key, or set previous key + valid-until during a planned rotation. |
 
 ---
 

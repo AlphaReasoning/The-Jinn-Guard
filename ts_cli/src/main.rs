@@ -36,7 +36,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "kernel_telemetry")]
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -92,6 +92,12 @@ struct CliArgs {
     /// HMAC secret file (raw bytes)
     #[arg(long, env = "JINNGUARD_SECRET_FILE")]
     secret_file: Option<String>,
+    /// Previous HMAC secret file accepted only during a rotation grace window.
+    #[arg(long, env = "JINNGUARD_PREVIOUS_SECRET_FILE")]
+    previous_secret_file: Option<String>,
+    /// Unix epoch seconds when --previous-secret-file stops verifying.
+    #[arg(long, env = "JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL")]
+    previous_secret_valid_until: Option<u64>,
     /// Allow anonymous agents regardless of policy setting
     #[arg(long, default_value_t = false)]
     allow_anonymous: bool,
@@ -362,30 +368,200 @@ fn ensure_control_socket_allowlist(policy: &mut PolicyConfig, socket_path: &str)
 // Runtime secret
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionKeyMatch {
+    Current,
+    Previous,
+}
+
+#[derive(Debug, Clone)]
+struct PreviousAdmissionKey {
+    secret: Vec<u8>,
+    valid_until_epoch_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionKeyset {
+    current: Vec<u8>,
+    previous: Option<PreviousAdmissionKey>,
+}
+
+impl AdmissionKeyset {
+    fn new(current: Vec<u8>, previous: Option<PreviousAdmissionKey>) -> Result<Self> {
+        if current.is_empty() {
+            return Err(anyhow::anyhow!("current HMAC secret is empty"));
+        }
+        if let Some(previous_key) = previous.as_ref() {
+            if previous_key.secret.is_empty() {
+                return Err(anyhow::anyhow!("previous HMAC secret is empty"));
+            }
+            if previous_key.secret == current {
+                return Err(anyhow::anyhow!(
+                    "previous HMAC secret must differ from current secret"
+                ));
+            }
+        }
+        Ok(Self { current, previous })
+    }
+
+    fn current_secret(&self) -> &[u8] {
+        &self.current
+    }
+
+    fn previous_valid_until(&self) -> Option<u64> {
+        self.previous
+            .as_ref()
+            .map(|previous| previous.valid_until_epoch_secs)
+    }
+
+    fn verify_envelope(&self, envelope: &SignedEnvelope) -> Option<AdmissionKeyMatch> {
+        self.verify_envelope_at(envelope, current_unix_epoch_secs())
+    }
+
+    fn verify_envelope_at(
+        &self,
+        envelope: &SignedEnvelope,
+        now_epoch_secs: u64,
+    ) -> Option<AdmissionKeyMatch> {
+        if ts_wire::verify_envelope(envelope, &self.current) {
+            return Some(AdmissionKeyMatch::Current);
+        }
+        let previous = self.previous.as_ref()?;
+        if now_epoch_secs <= previous.valid_until_epoch_secs
+            && ts_wire::verify_envelope(envelope, &previous.secret)
+        {
+            return Some(AdmissionKeyMatch::Previous);
+        }
+        None
+    }
+}
+
 pub(crate) fn get_runtime_secret() -> Result<Vec<u8>> {
     std::env::var("JINN_GUARD_SECRET")
         .map(|s| s.into_bytes())
         .map_err(|_| anyhow::anyhow!("CRITICAL: JINN_GUARD_SECRET register is uninitialized."))
 }
 
-fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
+fn current_unix_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn trim_secret_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .rposition(|&b| b != b'\n' && b != b'\r' && b != b' ')
+        .map(|i| bytes[..=i].to_vec())
+        .unwrap_or_else(|| bytes.to_vec())
+}
+
+fn read_secret_file(path: &str) -> Result<Vec<u8>> {
+    fs::read(path)
+        .map(|bytes| trim_secret_bytes(&bytes))
+        .with_context(|| format!("failed to read HMAC secret file {path}"))
+}
+
+fn load_required_secret(path: Option<&str>) -> Result<Vec<u8>> {
     if let Some(path) = path {
-        if let Ok(bytes) = fs::read(path) {
-            // Strip trailing whitespace (newlines from text editors)
-            let trimmed = bytes
-                .iter()
-                .rposition(|&b| b != b'\n' && b != b'\r' && b != b' ')
-                .map(|i| &bytes[..=i])
-                .unwrap_or(&bytes);
-            return trimmed.to_vec();
+        if let Ok(secret) = read_secret_file(path) {
+            return Ok(secret);
         }
     }
     // Fall back to env var / kernel keyring-backed runtime secret.
-    get_runtime_secret().unwrap_or_else(|_| {
+    get_runtime_secret()
+}
+
+#[cfg(feature = "fleet")]
+fn load_secret_from_file(path: Option<&str>) -> Vec<u8> {
+    load_required_secret(path).unwrap_or_else(|_| {
         exit_codes::fatal(
             exit_codes::EX_CONFIG,
             "SECRET_MISSING",
             "No HMAC secret. Use --secret-file or configure the kernel keyring.",
+        )
+    })
+}
+
+fn validate_previous_secret_config(
+    previous_path: Option<&str>,
+    previous_valid_until: Option<u64>,
+) -> Result<()> {
+    match (previous_path, previous_valid_until) {
+        (None, None) | (Some(_), Some(_)) => Ok(()),
+        _ => {
+            Err(anyhow::anyhow!(
+                "HMAC rotation requires --previous-secret-file and --previous-secret-valid-until together"
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+fn try_load_admission_keyset(
+    current_path: Option<&str>,
+    previous_path: Option<&str>,
+    previous_valid_until: Option<u64>,
+) -> Result<AdmissionKeyset> {
+    validate_previous_secret_config(previous_path, previous_valid_until)?;
+
+    let current = load_required_secret(current_path).map_err(|_| {
+        anyhow::anyhow!("No HMAC secret. Use --secret-file or configure the kernel keyring.")
+    })?;
+    let previous = match (previous_path, previous_valid_until) {
+        (Some(path), Some(valid_until_epoch_secs)) => Some(PreviousAdmissionKey {
+            secret: read_secret_file(path)?,
+            valid_until_epoch_secs,
+        }),
+        _ => None,
+    };
+
+    AdmissionKeyset::new(current, previous)
+}
+
+fn load_admission_keyset(
+    current_path: Option<&str>,
+    previous_path: Option<&str>,
+    previous_valid_until: Option<u64>,
+) -> AdmissionKeyset {
+    if let Err(err) = validate_previous_secret_config(previous_path, previous_valid_until) {
+        exit_codes::fatal(
+            exit_codes::EX_CONFIG,
+            "SECRET_ROTATION_CONFIG",
+            &format!("{err:#}"),
+        );
+    }
+
+    let current = load_required_secret(current_path).unwrap_or_else(|_| {
+        exit_codes::fatal(
+            exit_codes::EX_CONFIG,
+            "SECRET_MISSING",
+            "No HMAC secret. Use --secret-file or configure the kernel keyring.",
+        )
+    });
+    let previous = match (previous_path, previous_valid_until) {
+        (Some(path), Some(valid_until_epoch_secs)) => {
+            let secret = read_secret_file(path).unwrap_or_else(|err| {
+                exit_codes::fatal(
+                    exit_codes::EX_CONFIG,
+                    "SECRET_ROTATION_CONFIG",
+                    &format!("{err:#}"),
+                )
+            });
+            Some(PreviousAdmissionKey {
+                secret,
+                valid_until_epoch_secs,
+            })
+        }
+        _ => None,
+    };
+
+    AdmissionKeyset::new(current, previous).unwrap_or_else(|err| {
+        exit_codes::fatal(
+            exit_codes::EX_CONFIG,
+            "SECRET_ROTATION_CONFIG",
+            &format!("{err:#}"),
         )
     })
 }
@@ -1348,7 +1524,7 @@ struct ClientConnectionContext {
     registry_store: Arc<Mutex<LineageRegistry>>,
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
-    secret: Arc<Vec<u8>>,
+    admission_keys: Arc<AdmissionKeyset>,
     nonce_store: Arc<Mutex<ReplayGuard>>,
     semantic_service: Arc<CombinedSemanticService>,
 }
@@ -1362,7 +1538,7 @@ async fn handle_client_connection(
         registry_store,
         audit_logger,
         telemetry_store,
-        secret,
+        admission_keys,
         nonce_store,
         semantic_service,
     } = ctx;
@@ -1484,7 +1660,8 @@ async fn handle_client_connection(
         };
 
         // STEP 4: Verify HMAC signature against the inner payload string.
-        if !ts_wire::verify_envelope(&envelope, secret.as_slice()) {
+        let key_match = admission_keys.verify_envelope(&envelope);
+        if key_match.is_none() {
             println!("[deny] pid={} HMAC verification failed", observation.pid);
             emit_daemon_decision_explanation(
                 "DENY",
@@ -1497,6 +1674,12 @@ async fn handle_client_connection(
             );
             deny(&mut stream, b"SIGNAL: DENY_TAMPERED_TOKEN\n").await;
             return;
+        }
+        if key_match == Some(AdmissionKeyMatch::Previous) {
+            println!(
+                "[auth] pid={} accepted previous HMAC key during rotation grace",
+                observation.pid
+            );
         }
 
         // STEP 5: Parse the inner proposal and extract agent_id from the raw JSON.
@@ -3129,6 +3312,93 @@ mod exit_code_tests {
 }
 
 #[cfg(test)]
+mod admission_key_tests {
+    use super::{
+        try_load_admission_keyset, AdmissionKeyMatch, AdmissionKeyset, PreviousAdmissionKey,
+    };
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use ts_wire::SignedEnvelope;
+
+    fn signed_envelope(payload: &str, secret: &[u8]) -> SignedEnvelope {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(payload.as_bytes());
+        SignedEnvelope {
+            payload: payload.to_string(),
+            signature: hex::encode(mac.finalize().into_bytes()),
+        }
+    }
+
+    #[test]
+    fn current_hmac_key_is_accepted() {
+        let keys = AdmissionKeyset::new(b"current-secret".to_vec(), None).unwrap();
+        let envelope = signed_envelope(r#"{"sequence_counter":1}"#, b"current-secret");
+
+        assert_eq!(
+            keys.verify_envelope_at(&envelope, 100),
+            Some(AdmissionKeyMatch::Current)
+        );
+    }
+
+    #[test]
+    fn previous_hmac_key_is_accepted_during_grace() {
+        let keys = AdmissionKeyset::new(
+            b"current-secret".to_vec(),
+            Some(PreviousAdmissionKey {
+                secret: b"previous-secret".to_vec(),
+                valid_until_epoch_secs: 200,
+            }),
+        )
+        .unwrap();
+        let envelope = signed_envelope(r#"{"sequence_counter":1}"#, b"previous-secret");
+
+        assert_eq!(
+            keys.verify_envelope_at(&envelope, 199),
+            Some(AdmissionKeyMatch::Previous)
+        );
+    }
+
+    #[test]
+    fn previous_hmac_key_is_rejected_after_grace() {
+        let keys = AdmissionKeyset::new(
+            b"current-secret".to_vec(),
+            Some(PreviousAdmissionKey {
+                secret: b"previous-secret".to_vec(),
+                valid_until_epoch_secs: 200,
+            }),
+        )
+        .unwrap();
+        let envelope = signed_envelope(r#"{"sequence_counter":1}"#, b"previous-secret");
+
+        assert_eq!(keys.verify_envelope_at(&envelope, 201), None);
+    }
+
+    #[test]
+    fn partial_rotation_config_is_rejected_before_secret_loading() {
+        let err = try_load_admission_keyset(None, Some("/missing/previous"), None)
+            .err()
+            .expect("partial rotation config should be rejected");
+
+        assert!(err.to_string().contains("--previous-secret-file"));
+    }
+
+    #[test]
+    fn previous_hmac_key_must_differ_from_current() {
+        let err = AdmissionKeyset::new(
+            b"same-secret".to_vec(),
+            Some(PreviousAdmissionKey {
+                secret: b"same-secret".to_vec(),
+                valid_until_epoch_secs: 200,
+            }),
+        )
+        .err()
+        .expect("identical keys should be rejected");
+
+        assert!(err.to_string().contains("must differ"));
+    }
+}
+
+#[cfg(test)]
 mod enforcement_scope_tests {
     use super::{
         explicit_protected_resource_attack, intent_is_dangerous, is_enforcement_target,
@@ -4391,10 +4661,20 @@ async fn run() -> Result<()> {
     // misconfigured --socket-path can never become an arbitrary unlink.
     remove_stale_unix_socket(&args.socket_path)?;
 
-    // Load the admission secret once at startup. Runtime rotation is a supervised
-    // restart operation; per-frame file re-reads let a missing secret file crash
-    // an already-running daemon mid-connection (JG-RT-006).
-    let secret = Arc::new(load_secret_from_file(args.secret_file.as_deref()));
+    // Load the admission keyset once at startup. Current-key replacement remains
+    // a supervised restart operation, while an optional previous key supports a
+    // bounded rotation grace window without per-frame file re-reads (JG-RT-006).
+    let admission_keys = Arc::new(load_admission_keyset(
+        args.secret_file.as_deref(),
+        args.previous_secret_file.as_deref(),
+        args.previous_secret_valid_until,
+    ));
+    if let Some(valid_until) = admission_keys.previous_valid_until() {
+        eprintln!(
+            "[startup] previous HMAC admission key accepted until unix_epoch_secs={valid_until}"
+        );
+    }
+    let secret = Arc::new(admission_keys.current_secret().to_vec());
 
     // Load initial policy.
     let mut initial_policy = load_policy_from_path(&args.policy_file);
@@ -4810,7 +5090,7 @@ async fn run() -> Result<()> {
                 let registry_clone = Arc::clone(&registry_store);
                 let logger_clone = Arc::clone(&audit_logger);
                 let telemetry_clone = Arc::clone(&telemetry_store);
-                let secret_clone = Arc::clone(&secret);
+                let admission_keys_clone = Arc::clone(&admission_keys);
                 let nonce_clone = Arc::clone(&nonce_store);
                 let semantic_clone = Arc::clone(&semantic_service);
                 tokio::spawn(async move {
@@ -4819,7 +5099,7 @@ async fn run() -> Result<()> {
                         registry_store: registry_clone,
                         audit_logger: logger_clone,
                         telemetry_store: telemetry_clone,
-                        secret: secret_clone,
+                        admission_keys: admission_keys_clone,
                         nonce_store: nonce_clone,
                         semantic_service: semantic_clone,
                     };

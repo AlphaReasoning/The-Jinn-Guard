@@ -9,6 +9,14 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Bounded HMAC admission-key rotation.** The daemon now supports a supervised
+  current/previous admission keyset: `--secret-file` remains the current signing
+  key, while `--previous-secret-file` plus
+  `--previous-secret-valid-until <unix-epoch-seconds>` allows proposals signed
+  with the old key only during a bounded grace window. Partial rotation config,
+  empty keys, or identical current/previous keys fail closed at startup
+  (`code=78 kind=SECRET_ROTATION_CONFIG`). MCP synthetic identities and fleet
+  bundle verification continue to use the current key only.
 - **Optional RootAI remote semantic scorer over mTLS.** The daemon can now use a
   remote RootAI semantic scorer with `--rootai-url <https-url>` plus
   `--rootai-tls-cert`, `--rootai-tls-key` and `--rootai-tls-ca` supplied
@@ -345,7 +353,7 @@ Linux 6.12 host across all four validation tiers.
   root; the enforcement decision keys on the directory's `(s_dev, i_ino)` identity
   (JG #52), so a mount/bind/`pivot_root` remap cannot fool it (THREAT_MODEL §7.1).
 - Interpreter chains mitigated, not eliminated.
-- HMAC key rotation not yet automated.
+- Per-agent secrets / `agent_id`↔UID binding remain future multi-tenant work.
 
 See [`THREAT_MODEL.md`](THREAT_MODEL.md) §7 and §9 for the full list and the path
 to audited GA.

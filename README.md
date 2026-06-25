@@ -228,7 +228,7 @@ repo — happy to talk.
 
 | Control | Implementation |
 |---|---|
-| **Secret management** | HMAC-SHA256 key loaded into Linux kernel keyring (`jinnguard_hmac_key` in `@s`); daemon reads via `SYS_request_key` + `SYS_keyctl`. Fallback: `/etc/jinnguard/secret` (mode `0400`, owner `root`). Env vars never used. |
+| **Secret management** | HMAC-SHA256 key loaded into Linux kernel keyring (`jinnguard_hmac_key` in `@s`) or `/etc/jinnguard/secret` (mode `0400`, owner `root`). A bounded current/previous keyset supports supervised rotation grace windows. |
 | **Process identity** | `SO_PEERCRED` on every UDS connection — kernel-verified PID, UID, GID. No client-declared identity is trusted. |
 | **Agent identity** | `agent_id` from proposal is matched against `agent_nodes` map in `policy.yaml`. Unknown IDs are hard-denied (`DENY_UNKNOWN_AGENT_ID`). |
 | **Intent enforcement** | Per-agent `allowed_intents` allowlist checked before semantic classification (`DENY_INTENT_NOT_ALLOWED`). |
@@ -571,6 +571,7 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | UDS IPC transport (framed, version-tagged) | ✅ Production |
 | HMAC-SHA256 authentication | ✅ Production |
 | Kernel keyring secret management | ✅ Production |
+| Bounded HMAC key rotation grace | ✅ Production |
 | `SO_PEERCRED` process identity | ✅ Production |
 | Z3 totality audit | ✅ Production |
 | Z3 per-agent invariant verification (G2) | ✅ Production |
@@ -605,4 +606,3 @@ test-backed prototype demonstrating OS-level AI-agent enforcement.
 | Gap | Effort |
 |---|---|
 | Multi-distribution / multi-kernel validation matrix (Debian 13/6.12 + Ubuntu 24.04/6.17 + AlmaLinux 9/5.14 done; broaden coverage over time) | Medium |
-| Automated HMAC key rotation | Medium |
