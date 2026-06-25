@@ -388,7 +388,7 @@ fn reputation_db_path() -> PathBuf {
 
     #[cfg(test)]
     {
-        return std::env::temp_dir().join("jinnguard-reputation-test.json");
+        std::env::temp_dir().join("jinnguard-reputation-test.json")
     }
 
     #[cfg(not(test))]

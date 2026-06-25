@@ -107,7 +107,7 @@ fn build_packet(seq: u64, intent: &str, agent_id: Option<&str>, risk: f64, versi
 
 fn read_response(stream: &mut UnixStream) -> String {
     let mut header = [0u8; 5];
-    if let Err(_) = stream.read_exact(&mut header) {
+    if stream.read_exact(&mut header).is_err() {
         return "ERROR: Connection closed".to_string();
     }
     let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
@@ -115,7 +115,7 @@ fn read_response(stream: &mut UnixStream) -> String {
         return "ERROR: Response too large".to_string();
     }
     let mut body = vec![0u8; len];
-    if let Err(_) = stream.read_exact(&mut body) {
+    if stream.read_exact(&mut body).is_err() {
         return "ERROR: Body read failed".to_string();
     }
     String::from_utf8_lossy(&body).to_string()
@@ -168,10 +168,10 @@ impl DaemonGuard {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if std::path::Path::new(&socket_path).exists() {
-                if UnixStream::connect(&socket_path).is_ok() {
-                    break;
-                }
+            if std::path::Path::new(&socket_path).exists()
+                && UnixStream::connect(&socket_path).is_ok()
+            {
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }

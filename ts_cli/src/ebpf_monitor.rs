@@ -365,7 +365,7 @@ pub mod aya_backend {
     };
     use std::collections::HashMap as StdHashMap;
     use std::convert::TryFrom;
-    use std::net::Ipv4Addr;
+
     use std::os::unix::fs::MetadataExt;
 
     unsafe impl aya::Pod for VerdictPayload {}
@@ -1515,10 +1515,10 @@ pub mod aya_backend {
 
     fn name_key_bytes_checked(name: &str, label: &str) -> Result<[u8; JG_MAX_RESOURCE_LEN]> {
         let trimmed = name.trim();
-        if trimmed.as_bytes().len() >= JG_MAX_RESOURCE_LEN {
+        if trimmed.len() >= JG_MAX_RESOURCE_LEN {
             return Err(anyhow!(
                 "{label} {trimmed:?} is {} bytes; BPF path keys support at most {} bytes",
-                trimmed.as_bytes().len(),
+                trimmed.len(),
                 JG_MAX_RESOURCE_LEN - 1
             ));
         }
@@ -1659,10 +1659,10 @@ pub mod aya_backend {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        if trimmed.as_bytes().len() >= JG_MAX_RESOURCE_LEN {
+        if trimmed.len() >= JG_MAX_RESOURCE_LEN {
             return Err(anyhow!(
                 "{label} path {trimmed:?} is {} bytes; BPF path keys support at most {} bytes",
-                trimmed.as_bytes().len(),
+                trimmed.len(),
                 JG_MAX_RESOURCE_LEN - 1
             ));
         }

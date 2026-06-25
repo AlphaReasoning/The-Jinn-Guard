@@ -60,7 +60,9 @@ impl TelemetryStoreData {
     pub fn root_pid(&self, mut pid: u32) -> u32 {
         let mut depth = 0;
         while let Some(&ppid) = self.ppid_map.get(&pid) {
-            if ppid == 0 || depth > 32 { break; }
+            if ppid == 0 || depth > 32 {
+                break;
+            }
             pid = ppid;
             depth += 1;
         }
@@ -3568,8 +3570,7 @@ mod admission_key_tests {
     #[test]
     fn partial_rotation_config_is_rejected_before_secret_loading() {
         let err = try_load_admission_keyset(None, Some("/missing/previous"), None)
-            .err()
-            .expect("partial rotation config should be rejected");
+            .expect_err("partial rotation config should be rejected");
 
         assert!(err.to_string().contains("--previous-secret-file"));
     }
@@ -3583,8 +3584,7 @@ mod admission_key_tests {
                 valid_until_epoch_secs: 200,
             }),
         )
-        .err()
-        .expect("identical keys should be rejected");
+        .expect_err("identical keys should be rejected");
 
         assert!(err.to_string().contains("must differ"));
     }
@@ -3659,8 +3659,8 @@ mod admission_key_tests {
 mod agent_identity_binding_tests {
     use super::{
         agent_uid_binding_allows, handle_client_connection, parse_policy_content, AgentNodePolicy,
-        ClientConnectionContext, KernelTelemetryEvent, NetworkPolicy, PolicyConfig, ReplayGuard,
-        RuntimePolicy, TelemetryStore, TelemetryStoreData, MAX_REPLAY_ENTRIES,
+        ClientConnectionContext, NetworkPolicy, PolicyConfig, ReplayGuard, RuntimePolicy,
+        TelemetryStore, TelemetryStoreData, MAX_REPLAY_ENTRIES,
     };
     use crate::governance::{AuditLogger, CombinedSemanticService, LineageRegistry};
     use std::collections::HashMap;
@@ -3781,8 +3781,7 @@ agent_nodes:
             r#"{"agent_id":"bound-agent","sequence_counter":1,"intent_name":"read_file"}"#,
             secret,
         );
-        let telemetry_store: TelemetryStore =
-            Arc::new(Mutex::new(TelemetryStoreData::default()));
+        let telemetry_store: TelemetryStore = Arc::new(Mutex::new(TelemetryStoreData::default()));
         let ctx = ClientConnectionContext {
             current_policy: policy_with_node(node(vec![wrong_uid])),
             registry_store: Arc::new(Mutex::new(LineageRegistry::load_or_create(
@@ -3831,8 +3830,7 @@ agent_nodes:
             r#"{"agent_id":"bound-agent","sequence_counter":1,"intent_name":"read_file"}"#,
             shared_secret,
         );
-        let telemetry_store: TelemetryStore =
-            Arc::new(Mutex::new(TelemetryStoreData::default()));
+        let telemetry_store: TelemetryStore = Arc::new(Mutex::new(TelemetryStoreData::default()));
         let ctx = ClientConnectionContext {
             current_policy: policy_with_node(node(vec![unsafe { libc::geteuid() as u32 }])),
             registry_store: Arc::new(Mutex::new(LineageRegistry::load_or_create(
@@ -4527,7 +4525,7 @@ mod intent_enforcement_tests {
         let (request, risk) = drive_high_risk_sequence(800_001, "/tmp/jinnguard-test/exfil");
 
         assert_eq!(risk, IntentRiskLevel::High);
-        assert!(matches!(lsm_intent_response_verdict(&request, &risk), None));
+        assert!(lsm_intent_response_verdict(&request, &risk).is_none());
         assert!(matches!(
             final_gate_verdict(&request, &risk),
             Verdict::Allow
