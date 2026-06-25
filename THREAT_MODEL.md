@@ -132,7 +132,7 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 |---|---|---|---|
 | **JG-ADV-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual (telemetry only since #52): sub-mount path *strings* are mount-relative, but the decision keys on `(s_dev, i_ino)` identity, not the string (§7.1). |
 | **JG-ADV-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
-| **JG-ADV-2026-003** — agent impersonation via UID spoofing | Critical | **Mitigated** | Identity is authenticated as the OS user via `SO_PEERCRED` (unforgeable) **and** the application `agent_id` via HMAC-SHA256 — not a spoofable UID, closing the placeholder identity model from [`red-team-report.md`](red-team-report.md). Residual: a single shared HMAC key is not bound per-agent/UID, so any principal able to read the key can sign as any `agent_id`; per-agent secrets / `agent_id`↔UID binding tracked in §7.8 and §10. |
+| **JG-ADV-2026-003** — agent impersonation via UID spoofing | Critical | **Mitigated** | Identity is authenticated as the OS user via `SO_PEERCRED` (unforgeable) **and** the application `agent_id` via HMAC-SHA256 — not a spoofable UID, closing the placeholder identity model from [`red-team-report.md`](red-team-report.md). Per-agent `allowed_peer_uids` can now bind a signed `agent_id` to specific local Unix users, denying mismatches with `DENY_AGENT_IDENTITY_BINDING`. Residual: installs that leave per-agent bindings empty still rely on one shared trust domain; per-agent cryptographic keys remain a future hardening path. |
 | **JG-ADV-2026-004** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (re-validated on AlmaLinux 9 / 5.14, Run 04)** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
 
 ---
@@ -215,14 +215,14 @@ wraps armed runs in a hard 10-minute watchdog.
    (`deny_root_peers`, `allowed_peer_uids`) and recorded in the audit log, so on
    a shared host every decision is attributable to a real user, and an
    unprivileged user who cannot read the secret cannot forge any agent.
-   **However**, `agent_id` is **not** cryptographically bound to a UID: a single
-   shared HMAC key signs all agents, so any principal able to read that key
-   (root or the `jinnguard` group) can sign as *any* `agent_id`. This is
-   sufficient for one trust domain with ordinary users, but **not** for mutually
-   distrusting tenants. Strong multi-tenant isolation requires per-agent secrets
-   or an `agent_id`↔UID binding (tracked in §10). The UDS also carries no
-   restrictive mode unless `--socket-mode 0660` is set; connecting is gated by
-   HMAC + peer-UID regardless, but operators on shared hosts should set it.
+   Operators can also set `agent_nodes[].allowed_peer_uids` to bind each signed
+   `agent_id` to one or more local UIDs; a mismatched signer is denied before
+   lineage, quota, or policy evaluation. **However**, this is an authorization
+   binding, not per-agent cryptography: installs that omit the binding still use
+   one shared HMAC trust domain, and root-equivalent principals remain out of
+   scope. Mutually distrusting tenants should pair per-agent UID bindings with
+   OS-level isolation, restrictive `--socket-mode 0660`, and eventually
+   per-agent secrets/certificates.
 
 ### 7.1 Mount-boundary and TOCTOU properties (precise)
 

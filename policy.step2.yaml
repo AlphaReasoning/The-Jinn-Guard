@@ -20,6 +20,10 @@ agent_nodes:
   - id: "locked_agent_dev_01"
     privilege_tier: 1
     max_sequence_quota: 100
+    # Per-agent binding: even a valid HMAC signer cannot claim this agent_id
+    # unless the local Unix peer UID matches.
+    allowed_peer_uids:
+      - 10001
     allowed_intents:
       - "execute_shell"
       - "write_file"

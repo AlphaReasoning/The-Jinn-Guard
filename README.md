@@ -230,7 +230,7 @@ repo — happy to talk.
 |---|---|
 | **Secret management** | HMAC-SHA256 key loaded into Linux kernel keyring (`jinnguard_hmac_key` in `@s`) or `/etc/jinnguard/secret` (mode `0400`, owner `root`). A bounded current/previous keyset supports supervised rotation grace windows. |
 | **Process identity** | `SO_PEERCRED` on every UDS connection — kernel-verified PID, UID, GID. No client-declared identity is trusted. |
-| **Agent identity** | `agent_id` from proposal is matched against `agent_nodes` map in `policy.yaml`. Unknown IDs are hard-denied (`DENY_UNKNOWN_AGENT_ID`). |
+| **Agent identity** | `agent_id` from proposal is matched against `agent_nodes` in `policy.yaml`. Unknown IDs are hard-denied (`DENY_UNKNOWN_AGENT_ID`); optional per-agent `allowed_peer_uids` binds a signed `agent_id` to the local Unix UID observed via `SO_PEERCRED` (`DENY_AGENT_IDENTITY_BINDING`). |
 | **Intent enforcement** | Per-agent `allowed_intents` allowlist checked before semantic classification (`DENY_INTENT_NOT_ALLOWED`). |
 | **Sequence quota** | Per-agent `max_sequence_quota` hard cap on decisions per lineage session (`DENY_QUOTA_EXHAUSTED`). |
 | **Replay protection** | Monotonic `sequence_counter` validated per `(pid, start_time)` lineage key (`DENY_REPLAY_ATTACK`). |
@@ -408,12 +408,15 @@ else:
 ## ⚙️ Configuration — `policy.yaml`
 
 ```yaml
-upper_safety_boundary: 75.0   # fused_risk must be below this
-minimum_trust_score: 20.0     # trust_score must be above this
+global_safety_ceiling: 75.0   # fused_risk must be below this
 
 agent_nodes:
-  fabric_swarm_production_01:
+  - id: fabric_swarm_production_01
     privilege_tier: 1
+    # Optional: bind this signed agent_id to local Unix users observed through
+    # SO_PEERCRED. Empty/omitted preserves the shared-key legacy behavior.
+    allowed_peer_uids:
+      - 10001
     allowed_intents:
       - read_file
       - model_inference
@@ -424,7 +427,7 @@ agent_nodes:
       - "privilege_escalation_depth < 3"
       - "fused_risk <= 74.0"
 
-  admin_agent_00:
+  - id: admin_agent_00
     privilege_tier: 3
     allowed_intents: []        # empty = all intents allowed
     max_sequence_quota: 0      # 0 = unlimited

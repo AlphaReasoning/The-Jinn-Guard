@@ -174,6 +174,11 @@ pub struct AgentNodePolicy {
     pub privilege_tier: u32,
     #[serde(default)]
     pub max_sequence_quota: u64,
+    /// Optional UID allowlist for this signed `agent_id`. Empty preserves the
+    /// legacy shared-secret behavior; non-empty binds the agent id to local
+    /// Unix peer identities observed via SO_PEERCRED.
+    #[serde(default)]
+    pub allowed_peer_uids: Vec<u32>,
     #[serde(default)]
     pub allowed_intents: Vec<String>,
     #[serde(default)]
@@ -665,6 +670,10 @@ fn runtime_policy_denial(
     }
 
     None
+}
+
+fn agent_uid_binding_allows(agent: &AgentNodePolicy, peer_uid: u32) -> bool {
+    agent.allowed_peer_uids.is_empty() || agent.allowed_peer_uids.contains(&peer_uid)
 }
 
 fn execute_broker_action(action: &ProposedAction) -> serde_json::Value {
@@ -1844,6 +1853,35 @@ async fn handle_client_connection(
                     "DENY_UNKNOWN_AGENT_ID",
                 );
                 deny(&mut stream, b"SIGNAL: DENY_UNKNOWN_AGENT_ID\n").await;
+                return;
+            }
+        }
+
+        // STEP 8.1: Optional per-agent UID binding. HMAC proves that the caller
+        // knows an admission key; this check proves that the local Unix peer is
+        // allowed to speak as the signed agent_id.
+        if let (Some(agent_id), Some(node)) = (agent_id_opt.as_deref(), matched_agent_node) {
+            if !agent_uid_binding_allows(node, observation.uid) {
+                println!(
+                    "[deny] pid={} uid={} agent_id={:?} rejected by per-agent UID binding",
+                    observation.pid, observation.uid, agent_id
+                );
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_AGENT_IDENTITY_BINDING",
+                    "runtime_governance",
+                    &peer_source,
+                    Some(&proposal),
+                    Some(agent_id),
+                    None,
+                );
+                audit_denied(
+                    &audit_logger,
+                    &observation,
+                    &proposal,
+                    "DENY_AGENT_IDENTITY_BINDING",
+                );
+                deny(&mut stream, b"SIGNAL: DENY_AGENT_IDENTITY_BINDING\n").await;
                 return;
             }
         }
@@ -3399,6 +3437,163 @@ mod admission_key_tests {
 }
 
 #[cfg(test)]
+mod agent_identity_binding_tests {
+    use super::{
+        agent_uid_binding_allows, handle_client_connection, parse_policy_content, AgentNodePolicy,
+        ClientConnectionContext, KernelTelemetryEvent, NetworkPolicy, PolicyConfig, ReplayGuard,
+        RuntimePolicy, TelemetryStore, MAX_REPLAY_ENTRIES,
+    };
+    use crate::governance::{AuditLogger, CombinedSemanticService, LineageRegistry};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn node(allowed_peer_uids: Vec<u32>) -> AgentNodePolicy {
+        AgentNodePolicy {
+            id: "bound-agent".to_string(),
+            privilege_tier: 1,
+            max_sequence_quota: 0,
+            allowed_peer_uids,
+            allowed_intents: vec![],
+            allowed_executables: vec![],
+            denied_write_paths: vec![],
+            denied_unlink_paths: vec![],
+            denied_dns_domains: vec![],
+            invariants: vec![],
+        }
+    }
+
+    fn policy_with_node(node: AgentNodePolicy) -> PolicyConfig {
+        let mut agent_nodes = HashMap::new();
+        agent_nodes.insert(node.id.clone(), node);
+        PolicyConfig {
+            upper_safety_boundary: 95.0,
+            minimum_trust_score: 0.0,
+            agent_nodes,
+            deny_anonymous_agents: true,
+            allow_anonymous_override: false,
+            network_policy: NetworkPolicy::default(),
+            runtime_policy: RuntimePolicy::default(),
+            fleet_policy_min_version: 0,
+            accept_cross_machine_lineage: false,
+            canary_resources: Vec::new(),
+        }
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "jinnguard_agent_uid_binding_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    async fn read_signal(stream: &mut tokio::net::UnixStream) -> String {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.expect("read length");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut version = [0u8; 1];
+        stream.read_exact(&mut version).await.expect("read version");
+        assert_eq!(version[0], 1);
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.expect("read body");
+        String::from_utf8(body).expect("signal is utf8")
+    }
+
+    #[test]
+    fn empty_agent_uid_binding_preserves_legacy_behavior() {
+        assert!(agent_uid_binding_allows(&node(vec![]), 1000));
+        assert!(agent_uid_binding_allows(&node(vec![]), 4242));
+    }
+
+    #[test]
+    fn configured_agent_uid_binding_allows_only_listed_peer_uids() {
+        let agent = node(vec![10001, 10002]);
+
+        assert!(agent_uid_binding_allows(&agent, 10001));
+        assert!(agent_uid_binding_allows(&agent, 10002));
+        assert!(!agent_uid_binding_allows(&agent, 1000));
+    }
+
+    #[test]
+    fn policy_yaml_loads_per_agent_uid_bindings() {
+        let policy = parse_policy_content(
+            r#"
+global_safety_ceiling: 95.0
+agent_nodes:
+  - id: "bound-agent"
+    privilege_tier: 1
+    allowed_peer_uids:
+      - 10001
+      - 10002
+  - id: "legacy-agent"
+    privilege_tier: 1
+"#,
+            false,
+        )
+        .expect("policy should parse");
+
+        assert_eq!(
+            policy.agent_nodes["bound-agent"].allowed_peer_uids,
+            vec![10001, 10002]
+        );
+        assert!(
+            policy.agent_nodes["legacy-agent"]
+                .allowed_peer_uids
+                .is_empty(),
+            "omitted per-agent bindings must preserve legacy behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn uds_valid_hmac_wrong_peer_uid_denies_agent_identity_binding() {
+        let secret = b"agent-binding-secret";
+        let current_uid = unsafe { libc::geteuid() as u32 };
+        let wrong_uid = current_uid.saturating_add(1);
+        assert_ne!(current_uid, wrong_uid, "test needs a non-matching uid");
+
+        let lineage_path = temp_path("lineage.json");
+        let audit_path = temp_path("audit.log");
+        let audit_db_path = std::path::PathBuf::from(format!("{}.db", audit_path.display()));
+        let (server, mut client) = tokio::net::UnixStream::pair().expect("unix pair");
+        let packet = ts_wire::frame_signed_packet(
+            r#"{"agent_id":"bound-agent","sequence_counter":1,"intent_name":"read_file"}"#,
+            secret,
+        );
+        let telemetry_store: TelemetryStore =
+            Arc::new(Mutex::new(HashMap::<u32, Vec<KernelTelemetryEvent>>::new()));
+        let ctx = ClientConnectionContext {
+            current_policy: policy_with_node(node(vec![wrong_uid])),
+            registry_store: Arc::new(Mutex::new(LineageRegistry::load_or_create(
+                lineage_path.to_str().unwrap(),
+            ))),
+            audit_logger: Arc::new(AuditLogger::new(audit_path.to_str().unwrap())),
+            telemetry_store,
+            admission_keys: Arc::new(super::AdmissionKeyset::new(secret.to_vec(), None).unwrap()),
+            nonce_store: Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES))),
+            semantic_service: Arc::new(CombinedSemanticService {
+                rootai_socket_path: None,
+                rootai_remote: None,
+                fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }),
+        };
+
+        let task = tokio::spawn(handle_client_connection(server, ctx));
+        client.write_all(&packet).await.expect("write packet");
+
+        let signal = read_signal(&mut client).await;
+        assert_eq!(signal, "SIGNAL: DENY_AGENT_IDENTITY_BINDING\n");
+
+        task.await.expect("handler task");
+        let _ = std::fs::remove_file(lineage_path);
+        let _ = std::fs::remove_file(audit_path);
+        let _ = std::fs::remove_file(audit_db_path);
+    }
+}
+
+#[cfg(test)]
 mod enforcement_scope_tests {
     use super::{
         explicit_protected_resource_attack, intent_is_dangerous, is_enforcement_target,
@@ -3549,6 +3744,7 @@ mod enforcement_scope_tests {
             id: "scope-test-agent".to_string(),
             privilege_tier: 1,
             max_sequence_quota: 0,
+            allowed_peer_uids: vec![],
             allowed_intents: vec![],
             allowed_executables: allowed_executables
                 .into_iter()
@@ -3697,6 +3893,7 @@ mod origin_enforcement_tests {
             id: "origin-test-agent".to_string(),
             privilege_tier: 1,
             max_sequence_quota: 0,
+            allowed_peer_uids: vec![],
             allowed_intents: vec![],
             allowed_executables: allowed_executables
                 .into_iter()
@@ -3829,6 +4026,7 @@ mod operator_safety_invariants {
             id: "agent".to_string(),
             privilege_tier: 1,
             max_sequence_quota: 0,
+            allowed_peer_uids: vec![],
             allowed_intents: vec![],
             // Non-empty allowlist makes lsm_exec_verdict enforce: anything not
             // listed and inside governed scope is denied.
@@ -3936,6 +4134,7 @@ mod safe_mode_invariants {
             id: "agent".to_string(),
             privilege_tier: 1,
             max_sequence_quota: 0,
+            allowed_peer_uids: vec![],
             allowed_intents: vec![],
             allowed_executables: vec!["/tmp/jinnguard-test/allowed".to_string()],
             denied_write_paths: vec!["/".to_string()],
@@ -5213,6 +5412,7 @@ mod interpreter_bypass_tests {
             id: "agent".to_string(),
             privilege_tier: 1,
             max_sequence_quota: 0,
+            allowed_peer_uids: vec![],
             allowed_intents: vec![],
             allowed_executables: allowed_executables
                 .into_iter()
