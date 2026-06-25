@@ -228,7 +228,7 @@ repo — happy to talk.
 
 | Control | Implementation |
 |---|---|
-| **Secret management** | HMAC-SHA256 key loaded into Linux kernel keyring (`jinnguard_hmac_key` in `@s`) or `/etc/jinnguard/secret` (mode `0400`, owner `root`). A bounded current/previous keyset supports supervised rotation grace windows. |
+| **Secret management** | HMAC-SHA256 key loaded into Linux kernel keyring (`jinnguard_hmac_key` in `@s`) or `/etc/jinnguard/secret` (mode `0400`, owner `root`). A bounded current/previous keyset supports supervised rotation grace windows; optional per-agent secret files can override the shared key for selected `agent_id` values. |
 | **Process identity** | `SO_PEERCRED` on every UDS connection — kernel-verified PID, UID, GID. No client-declared identity is trusted. |
 | **Agent identity** | `agent_id` from proposal is matched against `agent_nodes` in `policy.yaml`. Unknown IDs are hard-denied (`DENY_UNKNOWN_AGENT_ID`); optional per-agent `allowed_peer_uids` binds a signed `agent_id` to the local Unix UID observed via `SO_PEERCRED` (`DENY_AGENT_IDENTITY_BINDING`). |
 | **Intent enforcement** | Per-agent `allowed_intents` allowlist checked before semantic classification (`DENY_INTENT_NOT_ALLOWED`). |
@@ -371,6 +371,13 @@ keyctl padd user jinnguard_hmac_key @s < /etc/jinnguard/secret
 keyctl show @s
 ```
 
+Optional per-agent HMAC keys can be supplied with
+`JINNGUARD_AGENT_SECRET_DIR=/etc/jinnguard/agent-secrets` or
+`--agent-secret-dir /etc/jinnguard/agent-secrets`. Each regular file name is an
+`agent_id`; its contents are the HMAC key for that agent. If a file exists for an
+agent, that agent must sign with the per-agent key. Agents without a file keep
+the shared admission key path.
+
 ### Service management
 
 ```bash
@@ -415,6 +422,8 @@ agent_nodes:
     privilege_tier: 1
     # Optional: bind this signed agent_id to local Unix users observed through
     # SO_PEERCRED. Empty/omitted preserves the shared-key legacy behavior.
+    # Pair with a file named /etc/jinnguard/agent-secrets/fabric_swarm_production_01
+    # to require a per-agent HMAC key for this id.
     allowed_peer_uids:
       - 10001
     allowed_intents:
@@ -577,6 +586,7 @@ register and release claim boundary.
 | HMAC-SHA256 authentication | ✅ Production |
 | Kernel keyring secret management | ✅ Production |
 | Bounded HMAC key rotation grace | ✅ Production |
+| Optional per-agent HMAC key files | ✅ Production |
 | `SO_PEERCRED` process identity | ✅ Production |
 | Z3 totality audit | ✅ Production |
 | Z3 per-agent invariant verification (G2) | ✅ Production |

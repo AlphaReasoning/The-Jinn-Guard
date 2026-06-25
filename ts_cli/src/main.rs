@@ -98,6 +98,10 @@ struct CliArgs {
     /// Unix epoch seconds when --previous-secret-file stops verifying.
     #[arg(long, env = "JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL")]
     previous_secret_valid_until: Option<u64>,
+    /// Directory of per-agent HMAC secret files. Each regular file name is an
+    /// agent_id; its contents are the key required to sign as that agent.
+    #[arg(long, env = "JINNGUARD_AGENT_SECRET_DIR")]
+    agent_secret_dir: Option<String>,
     /// Allow anonymous agents regardless of policy setting
     #[arg(long, default_value_t = false)]
     allow_anonymous: bool,
@@ -379,6 +383,12 @@ enum AdmissionKeyMatch {
     Previous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeKeyMatch {
+    Admission(AdmissionKeyMatch),
+    AgentSpecific,
+}
+
 #[derive(Debug, Clone)]
 struct PreviousAdmissionKey {
     secret: Vec<u8>,
@@ -441,6 +451,89 @@ impl AdmissionKeyset {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentSecretStore {
+    secrets: HashMap<String, Vec<u8>>,
+}
+
+impl AgentSecretStore {
+    fn empty() -> Self {
+        Self {
+            secrets: HashMap::new(),
+        }
+    }
+
+    fn load_from_dir(dir: Option<&str>) -> Result<Self> {
+        let Some(dir) = dir else {
+            return Ok(Self::empty());
+        };
+        let mut secrets = HashMap::new();
+        for entry in fs::read_dir(dir)
+            .with_context(|| format!("failed to read per-agent secret dir {dir}"))?
+        {
+            let entry =
+                entry.with_context(|| format!("failed to scan per-agent secret dir {dir}"))?;
+            let file_type = entry.file_type().with_context(|| {
+                format!(
+                    "failed to stat per-agent secret file {}",
+                    entry.path().display()
+                )
+            })?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let agent_id = entry.file_name().into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "per-agent secret file name is not UTF-8: {}",
+                    entry.path().display()
+                )
+            })?;
+            if !valid_agent_secret_id(&agent_id) {
+                anyhow::bail!("invalid per-agent secret file name {agent_id:?}");
+            }
+            let secret = read_secret_path(&entry.path())?;
+            if secret.is_empty() {
+                anyhow::bail!("per-agent HMAC secret for {agent_id:?} is empty");
+            }
+            secrets.insert(agent_id, secret);
+        }
+        Ok(Self { secrets })
+    }
+
+    fn secret_for(&self, agent_id: Option<&str>) -> Option<&[u8]> {
+        self.secrets.get(agent_id?).map(Vec::as_slice)
+    }
+
+    fn verify_envelope(
+        &self,
+        agent_id: Option<&str>,
+        envelope: &SignedEnvelope,
+        admission_keys: &AdmissionKeyset,
+    ) -> Option<EnvelopeKeyMatch> {
+        if let Some(agent_secret) = self.secret_for(agent_id) {
+            return ts_wire::verify_envelope(envelope, agent_secret)
+                .then_some(EnvelopeKeyMatch::AgentSpecific);
+        }
+        admission_keys
+            .verify_envelope(envelope)
+            .map(EnvelopeKeyMatch::Admission)
+    }
+
+    fn len(&self) -> usize {
+        self.secrets.len()
+    }
+}
+
+fn valid_agent_secret_id(agent_id: &str) -> bool {
+    !agent_id.is_empty()
+        && agent_id == agent_id.trim()
+        && agent_id != "."
+        && agent_id != ".."
+        && !agent_id.contains('/')
+        && !agent_id.contains('\0')
+        && !agent_id.chars().any(char::is_control)
+}
+
 pub(crate) fn get_runtime_secret() -> Result<Vec<u8>> {
     std::env::var("JINN_GUARD_SECRET")
         .map(|s| s.into_bytes())
@@ -462,10 +555,14 @@ fn trim_secret_bytes(bytes: &[u8]) -> Vec<u8> {
         .unwrap_or_else(|| bytes.to_vec())
 }
 
-fn read_secret_file(path: &str) -> Result<Vec<u8>> {
+fn read_secret_path(path: &Path) -> Result<Vec<u8>> {
     fs::read(path)
         .map(|bytes| trim_secret_bytes(&bytes))
-        .with_context(|| format!("failed to read HMAC secret file {path}"))
+        .with_context(|| format!("failed to read HMAC secret file {}", path.display()))
+}
+
+fn read_secret_file(path: &str) -> Result<Vec<u8>> {
+    read_secret_path(Path::new(path))
 }
 
 fn load_required_secret(path: Option<&str>) -> Result<Vec<u8>> {
@@ -1534,6 +1631,7 @@ struct ClientConnectionContext {
     audit_logger: Arc<AuditLogger>,
     telemetry_store: TelemetryStore,
     admission_keys: Arc<AdmissionKeyset>,
+    agent_secrets: Arc<AgentSecretStore>,
     nonce_store: Arc<Mutex<ReplayGuard>>,
     semantic_service: Arc<CombinedSemanticService>,
 }
@@ -1548,6 +1646,7 @@ async fn handle_client_connection(
         audit_logger,
         telemetry_store,
         admission_keys,
+        agent_secrets,
         nonce_store,
         semantic_service,
     } = ctx;
@@ -1668,8 +1767,38 @@ async fn handle_client_connection(
             }
         };
 
-        // STEP 4: Verify HMAC signature against the inner payload string.
-        let key_match = admission_keys.verify_envelope(&envelope);
+        // STEP 4a: Parse the inner payload as JSON so the self-declared
+        // agent_id can select an optional per-agent HMAC key. The agent_id is
+        // still untrusted here; it only chooses the candidate key, and the
+        // signature must verify before any governance decision uses it.
+        let raw_payload_value: Value = match serde_json::from_str(&envelope.payload) {
+            Ok(v) => v,
+            Err(_) => {
+                emit_daemon_decision_explanation(
+                    "DENY",
+                    "DENY_MALFORMED_PAYLOAD",
+                    "runtime_governance",
+                    &peer_source,
+                    None,
+                    None,
+                    None,
+                );
+                deny(&mut stream, b"SIGNAL: DENY_MALFORMED_PAYLOAD\n").await;
+                return;
+            }
+        };
+        let agent_id_opt: Option<String> = raw_payload_value
+            .get("agent_id")
+            .and_then(|a| a.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // STEP 4b: Verify HMAC signature against the inner payload string. A
+        // configured per-agent key overrides the shared admission key for that
+        // agent_id; otherwise the legacy shared current/previous keyset applies.
+        let key_match =
+            agent_secrets.verify_envelope(agent_id_opt.as_deref(), &envelope, &admission_keys);
         if key_match.is_none() {
             println!("[deny] pid={} HMAC verification failed", observation.pid);
             emit_daemon_decision_explanation(
@@ -1684,15 +1813,24 @@ async fn handle_client_connection(
             deny(&mut stream, b"SIGNAL: DENY_TAMPERED_TOKEN\n").await;
             return;
         }
-        if key_match == Some(AdmissionKeyMatch::Previous) {
-            println!(
-                "[auth] pid={} accepted previous HMAC key during rotation grace",
-                observation.pid
-            );
+        match key_match {
+            Some(EnvelopeKeyMatch::Admission(AdmissionKeyMatch::Previous)) => {
+                println!(
+                    "[auth] pid={} accepted previous HMAC key during rotation grace",
+                    observation.pid
+                );
+            }
+            Some(EnvelopeKeyMatch::AgentSpecific) => {
+                println!(
+                    "[auth] pid={} accepted per-agent HMAC key agent_id={:?}",
+                    observation.pid, agent_id_opt
+                );
+            }
+            _ => {}
         }
 
-        // STEP 5: Parse the inner proposal and extract agent_id from the raw JSON.
-        let proposal: ClientProposal = match serde_json::from_str(&envelope.payload) {
+        // STEP 5: Parse the authenticated inner proposal.
+        let proposal: ClientProposal = match serde_json::from_value(raw_payload_value.clone()) {
             Ok(p) => p,
             Err(_) => {
                 emit_daemon_decision_explanation(
@@ -1709,28 +1847,6 @@ async fn handle_client_connection(
             }
         };
 
-        let raw_payload_value: Value = match serde_json::from_str(&envelope.payload) {
-            Ok(v) => v,
-            Err(_) => {
-                emit_daemon_decision_explanation(
-                    "DENY",
-                    "DENY_MALFORMED_PAYLOAD",
-                    "runtime_governance",
-                    &peer_source,
-                    Some(&proposal),
-                    None,
-                    None,
-                );
-                deny(&mut stream, b"SIGNAL: DENY_MALFORMED_PAYLOAD\n").await;
-                return;
-            }
-        };
-        let agent_id_opt: Option<String> = raw_payload_value
-            .get("agent_id")
-            .and_then(|a| a.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
         let execute_requested = raw_payload_value
             .get("execute")
             .and_then(|value| value.as_bool())
@@ -3352,10 +3468,13 @@ mod exit_code_tests {
 #[cfg(test)]
 mod admission_key_tests {
     use super::{
-        try_load_admission_keyset, AdmissionKeyMatch, AdmissionKeyset, PreviousAdmissionKey,
+        try_load_admission_keyset, valid_agent_secret_id, AdmissionKeyMatch, AdmissionKeyset,
+        AgentSecretStore, EnvelopeKeyMatch, PreviousAdmissionKey,
     };
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
+    use std::collections::HashMap;
+    use std::fs;
     use ts_wire::SignedEnvelope;
 
     fn signed_envelope(payload: &str, secret: &[u8]) -> SignedEnvelope {
@@ -3365,6 +3484,17 @@ mod admission_key_tests {
             payload: payload.to_string(),
             signature: hex::encode(mac.finalize().into_bytes()),
         }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "jinnguard_agent_hmac_{name}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     #[test]
@@ -3433,6 +3563,71 @@ mod admission_key_tests {
         .expect("identical keys should be rejected");
 
         assert!(err.to_string().contains("must differ"));
+    }
+
+    #[test]
+    fn agent_secret_store_loads_files_by_agent_id() {
+        let dir = temp_dir("loads_files");
+        fs::write(dir.join("alpha-agent"), b"alpha-secret\n").expect("write agent secret");
+        fs::create_dir(dir.join("ignored-subdir")).expect("create ignored subdir");
+
+        let store =
+            AgentSecretStore::load_from_dir(Some(dir.to_str().unwrap())).expect("load secrets");
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.secret_for(Some("alpha-agent")),
+            Some(&b"alpha-secret"[..])
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_agent_secret_names_are_rejected() {
+        for bad in ["", ".", "..", " nested", "nested ", "agent/id", "agent\nid"] {
+            assert!(
+                !valid_agent_secret_id(bad),
+                "invalid file name should be rejected: {bad:?}"
+            );
+        }
+        assert!(valid_agent_secret_id("alpha-agent_01"));
+    }
+
+    #[test]
+    fn per_agent_secret_overrides_shared_admission_key() {
+        let mut secrets = HashMap::new();
+        secrets.insert("bound-agent".to_string(), b"agent-secret".to_vec());
+        let agent_secrets = AgentSecretStore { secrets };
+        let admission_keys = AdmissionKeyset::new(b"shared-secret".to_vec(), None).unwrap();
+        let payload = r#"{"agent_id":"bound-agent","sequence_counter":1}"#;
+
+        let shared_signed = signed_envelope(payload, b"shared-secret");
+        let agent_signed = signed_envelope(payload, b"agent-secret");
+
+        assert_eq!(
+            agent_secrets.verify_envelope(Some("bound-agent"), &shared_signed, &admission_keys),
+            None,
+            "configured agent_id must require its own HMAC key"
+        );
+        assert_eq!(
+            agent_secrets.verify_envelope(Some("bound-agent"), &agent_signed, &admission_keys),
+            Some(EnvelopeKeyMatch::AgentSpecific)
+        );
+    }
+
+    #[test]
+    fn missing_agent_secret_preserves_shared_admission_fallback() {
+        let agent_secrets = AgentSecretStore::empty();
+        let admission_keys = AdmissionKeyset::new(b"shared-secret".to_vec(), None).unwrap();
+        let envelope = signed_envelope(
+            r#"{"agent_id":"legacy-agent","sequence_counter":1}"#,
+            b"shared-secret",
+        );
+
+        assert_eq!(
+            agent_secrets.verify_envelope(Some("legacy-agent"), &envelope, &admission_keys),
+            Some(EnvelopeKeyMatch::Admission(AdmissionKeyMatch::Current))
+        );
     }
 }
 
@@ -3572,6 +3767,7 @@ agent_nodes:
             audit_logger: Arc::new(AuditLogger::new(audit_path.to_str().unwrap())),
             telemetry_store,
             admission_keys: Arc::new(super::AdmissionKeyset::new(secret.to_vec(), None).unwrap()),
+            agent_secrets: Arc::new(super::AgentSecretStore::empty()),
             nonce_store: Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES))),
             semantic_service: Arc::new(CombinedSemanticService {
                 rootai_socket_path: None,
@@ -3590,6 +3786,62 @@ agent_nodes:
         let _ = std::fs::remove_file(lineage_path);
         let _ = std::fs::remove_file(audit_path);
         let _ = std::fs::remove_file(audit_db_path);
+    }
+
+    #[tokio::test]
+    async fn uds_agent_specific_hmac_rejects_shared_key_for_configured_agent() {
+        let shared_secret = b"shared-admission-secret";
+        let agent_secret = b"agent-specific-secret";
+
+        let lineage_path = temp_path("per_agent_lineage.json");
+        let audit_path = temp_path("per_agent_audit.log");
+        let audit_db_path = std::path::PathBuf::from(format!("{}.db", audit_path.display()));
+        let agent_secret_dir = temp_path("agent-secrets");
+        let _ = std::fs::remove_dir_all(&agent_secret_dir);
+        std::fs::create_dir_all(&agent_secret_dir).expect("create agent secret dir");
+        std::fs::write(agent_secret_dir.join("bound-agent"), agent_secret)
+            .expect("write agent secret");
+
+        let (server, mut client) = tokio::net::UnixStream::pair().expect("unix pair");
+        let packet = ts_wire::frame_signed_packet(
+            r#"{"agent_id":"bound-agent","sequence_counter":1,"intent_name":"read_file"}"#,
+            shared_secret,
+        );
+        let telemetry_store: TelemetryStore =
+            Arc::new(Mutex::new(HashMap::<u32, Vec<KernelTelemetryEvent>>::new()));
+        let ctx = ClientConnectionContext {
+            current_policy: policy_with_node(node(vec![unsafe { libc::geteuid() as u32 }])),
+            registry_store: Arc::new(Mutex::new(LineageRegistry::load_or_create(
+                lineage_path.to_str().unwrap(),
+            ))),
+            audit_logger: Arc::new(AuditLogger::new(audit_path.to_str().unwrap())),
+            telemetry_store,
+            admission_keys: Arc::new(
+                super::AdmissionKeyset::new(shared_secret.to_vec(), None).unwrap(),
+            ),
+            agent_secrets: Arc::new(
+                super::AgentSecretStore::load_from_dir(Some(agent_secret_dir.to_str().unwrap()))
+                    .unwrap(),
+            ),
+            nonce_store: Arc::new(Mutex::new(ReplayGuard::with_capacity(MAX_REPLAY_ENTRIES))),
+            semantic_service: Arc::new(CombinedSemanticService {
+                rootai_socket_path: None,
+                rootai_remote: None,
+                fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }),
+        };
+
+        let task = tokio::spawn(handle_client_connection(server, ctx));
+        client.write_all(&packet).await.expect("write packet");
+
+        let signal = read_signal(&mut client).await;
+        assert_eq!(signal, "SIGNAL: DENY_TAMPERED_TOKEN\n");
+
+        task.await.expect("handler task");
+        let _ = std::fs::remove_file(lineage_path);
+        let _ = std::fs::remove_file(audit_path);
+        let _ = std::fs::remove_file(audit_db_path);
+        let _ = std::fs::remove_dir_all(agent_secret_dir);
     }
 }
 
@@ -4873,6 +5125,21 @@ async fn run() -> Result<()> {
             "[startup] previous HMAC admission key accepted until unix_epoch_secs={valid_until}"
         );
     }
+    let agent_secrets = Arc::new(
+        AgentSecretStore::load_from_dir(args.agent_secret_dir.as_deref()).unwrap_or_else(|err| {
+            exit_codes::fatal(
+                exit_codes::EX_CONFIG,
+                "AGENT_SECRET_CONFIG",
+                &format!("{err:#}"),
+            )
+        }),
+    );
+    if agent_secrets.len() > 0 {
+        eprintln!(
+            "[startup] loaded {} per-agent HMAC admission key(s)",
+            agent_secrets.len()
+        );
+    }
     let secret = Arc::new(admission_keys.current_secret().to_vec());
 
     // Load initial policy.
@@ -5290,6 +5557,7 @@ async fn run() -> Result<()> {
                 let logger_clone = Arc::clone(&audit_logger);
                 let telemetry_clone = Arc::clone(&telemetry_store);
                 let admission_keys_clone = Arc::clone(&admission_keys);
+                let agent_secrets_clone = Arc::clone(&agent_secrets);
                 let nonce_clone = Arc::clone(&nonce_store);
                 let semantic_clone = Arc::clone(&semantic_service);
                 tokio::spawn(async move {
@@ -5299,6 +5567,7 @@ async fn run() -> Result<()> {
                         audit_logger: logger_clone,
                         telemetry_store: telemetry_clone,
                         admission_keys: admission_keys_clone,
+                        agent_secrets: agent_secrets_clone,
                         nonce_store: nonce_clone,
                         semantic_service: semantic_clone,
                     };

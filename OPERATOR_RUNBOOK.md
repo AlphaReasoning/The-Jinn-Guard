@@ -75,11 +75,12 @@ clang + bpftool) and install to `/usr/lib/jinnguard/lsm/`.
 | `JINNGUARD_SECRET_FILE=<path>` | HMAC secret file location. | `/etc/jinnguard/secret` |
 | `JINNGUARD_PREVIOUS_SECRET_FILE=<path>` | Previous HMAC secret accepted during a bounded rotation grace window. Requires `JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL`. | unset |
 | `JINNGUARD_PREVIOUS_SECRET_VALID_UNTIL=<epoch>` | Unix epoch seconds when the previous HMAC secret stops verifying. Requires `JINNGUARD_PREVIOUS_SECRET_FILE`. | unset |
+| `JINNGUARD_AGENT_SECRET_DIR=<dir>` | Optional directory of per-agent HMAC keys. Each regular file name is an `agent_id`; if present, that key is required for the matching agent. | unset |
 | `ENABLE_EXPLAINABILITY=1` | Verbose per-decision explanations in the log. | off |
 
 CLI flags (set by the unit): `--socket-path --policy-file --secret-file
---previous-secret-file --previous-secret-valid-until --lineage-file --audit-log
---mcp-port`.
+--previous-secret-file --previous-secret-valid-until --agent-secret-dir
+--lineage-file --audit-log --mcp-port`.
 
 **MCP gateway mTLS (optional).** Pass `--mcp-tls-cert <pem>`, `--mcp-tls-key <pem>`
 and `--mcp-tls-ca <pem>` *together* to require mutual TLS on the MCP gateway: the
@@ -126,6 +127,22 @@ agent_nodes:
 If the field is empty or omitted, legacy shared-key behavior is preserved. If a
 caller signs as that `agent_id` from any other UID, the daemon returns
 `DENY_AGENT_IDENTITY_BINDING`.
+
+Per-agent HMAC keys are optional and complement UID binding. Create a root-owned
+directory such as `/etc/jinnguard/agent-secrets`, put one key per file, and name
+each file after the exact `agent_id`:
+
+```bash
+sudo install -d -o root -g jinnguard -m 0750 /etc/jinnguard/agent-secrets
+sudo sh -c 'openssl rand -hex 32 > /etc/jinnguard/agent-secrets/locked_agent_dev_01'
+sudo chown root:jinnguard /etc/jinnguard/agent-secrets/locked_agent_dev_01
+sudo chmod 0440 /etc/jinnguard/agent-secrets/locked_agent_dev_01
+```
+
+Set `JINNGUARD_AGENT_SECRET_DIR=/etc/jinnguard/agent-secrets` and restart. The
+daemon loads these files once at startup. If a file exists for an `agent_id`,
+the shared admission key is no longer accepted for that agent; agents without a
+file keep the shared current/previous key behavior.
 
 ---
 

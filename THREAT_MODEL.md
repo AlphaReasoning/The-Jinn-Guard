@@ -93,7 +93,7 @@ design, never subject to kernel denial (see §6).
 | Surface | Entry point | Primary control |
 |---|---|---|
 | IPC framing | 5-byte header + length-prefixed payload (`main.rs` STEP 1–2) | Bounded reads, version tag, explicit length cap |
-| Proposal authenticity | `SignedEnvelope` HMAC-SHA256 (STEP 3–4) | Constant-time MAC verify against keyring/secret-file key |
+| Proposal authenticity | `SignedEnvelope` HMAC-SHA256 (STEP 3–4) | Constant-time MAC verify against keyring/secret-file key or configured per-agent key |
 | Identity | `agent_id` from inner JSON + `SO_PEERCRED` peer creds | Unknown/anonymous gates (STEP 7–8) |
 | Ordering | Per-`(pid, start_time)` lineage sequence counter (STEP 6) | Monotonic replay gate |
 | Authorization | Intent allowlist, runtime policy, quota (STEP 9–11) | Per-agent policy, fail-closed |
@@ -134,7 +134,7 @@ suite, **K** = live kernel validation (Tier 4), **D** = Docker mandatory-mediati
 |---|---|---|---|
 | **JG-ADV-2026-002** — filesystem policy bypass via relative paths | Critical | **Fixed** | Kernel-side full-path resolution (`jg_read_dentry_path`, depth-12 dentry walk). Live-verified audit-only (Tier 3) and armed (Tier 4). Residual (telemetry only since #52): sub-mount path *strings* are mount-relative, but the decision keys on `(s_dev, i_ino)` identity, not the string (§7.1). |
 | **JG-ADV-2026-001** — execve bypass via interpreter chains | High | **Mitigated** | Governed agents with an allowlist are denied known interpreters (`/bin/sh`, `/bin/bash`, `python`, …). Per-binary limits remain only as strong as the allowlist (§7). |
-| **JG-ADV-2026-003** — agent impersonation via UID spoofing | Critical | **Mitigated** | Identity is authenticated as the OS user via `SO_PEERCRED` (unforgeable) **and** the application `agent_id` via HMAC-SHA256 — not a spoofable UID, closing the placeholder identity model from [`red-team-report.md`](red-team-report.md). Per-agent `allowed_peer_uids` can now bind a signed `agent_id` to specific local Unix users, denying mismatches with `DENY_AGENT_IDENTITY_BINDING`. Residual: installs that leave per-agent bindings empty still rely on one shared trust domain; per-agent cryptographic keys remain a future hardening path. |
+| **JG-ADV-2026-003** — agent impersonation via UID spoofing | Critical | **Mitigated** | Identity is authenticated as the OS user via `SO_PEERCRED` (unforgeable) **and** the application `agent_id` via HMAC-SHA256 — not a spoofable UID, closing the placeholder identity model from [`red-team-report.md`](red-team-report.md). Per-agent `allowed_peer_uids` can bind a signed `agent_id` to specific local Unix users, denying mismatches with `DENY_AGENT_IDENTITY_BINDING`; optional per-agent HMAC key files can require a distinct key for selected ids. Residual: installs that leave per-agent bindings and key files empty still rely on one shared trust domain; certificate-bound/fleet-distributed identities remain future hardening. |
 | **JG-ADV-2026-004** — fail-open in socket LSM enforcement (two root causes) | High | **Fixed (re-validated on AlmaLinux 9 / 5.14, Run 04)** | Surfaced on AlmaLinux 9 / kernel 5.14: `socket_connect` leaked a *variable* fraction of denied connects under load (a race), while UDP/exec/file held. `setenforce 0` ruled out SELinux; an **incremental standalone reproducer** (`bpf/probe/connect_min/`, branch `probe/lsm-connect-min`) isolated **two independent causes** — and proved the kernel/distro were not at fault. **(1) Load-window:** hooks were attached **before** `configure_policy()` populated the deny maps (`ipv4_denylist`, `allowed_exec_paths`, `denied_*`), so operations in that window consulted an empty policy and were ALLOWED. Fixed by **populate-then-attach** — `AyaLsmMonitor::load` loads programs *without* attaching; the new `attach_all()` runs only after `configure_policy()` (`ebpf_monitor.rs`, `main.rs`). **(2) `sock->type` width bug:** the connect/sendmsg hooks read the kernel's 2-byte `short sock->type` with `bpf_core_read(&sock_type, sizeof(int)=4, …)`, pulling 2 adjacent **padding** bytes; when non-zero, the `sock_type != STREAM/DGRAM` gate **failed OPEN**. The probe confirmed it: an address-only hook enforced 2000/2000 deterministically, and adding *only* the `sock->type` gate reintroduced 20–55% leaks. Fixed by reading into a correctly-sized `short` (`jg_socket_connect.c`, `jg_socket_sendmsg.c`). |
 
 ---
@@ -203,11 +203,13 @@ wraps armed runs in a hard 10-minute watchdog.
    interpreter can drive other tools through it. Mitigated by denying
    interpreters for governed agents; not eliminated.
 5. **Root-equivalent adversary is out of scope** by assumption (§3).
-6. **HMAC secret distribution.** Security reduces to protecting the shared key
-   (kernel keyring / root-owned secret file). Supervised rotation supports a
-   current key plus a previous key accepted only until an operator-configured
-   Unix-epoch grace deadline; partial or malformed rotation state is a fatal
-   startup config error.
+6. **HMAC secret distribution.** Security reduces to protecting the active
+   signing keys: the shared admission key (kernel keyring / root-owned secret
+   file) and any optional per-agent key files. Supervised rotation supports a
+   current shared key plus a previous shared key accepted only until an
+   operator-configured Unix-epoch grace deadline; partial or malformed rotation
+   state is a fatal startup config error. Per-agent key files are loaded once at
+   startup and require a supervised restart to change.
 7. **DNS mediation is heuristic.** `sendmsg`-to-:53 payload inspection is
    best-effort, not a full resolver-level policy.
 8. **Multi-user yes; multi-tenant isolation partial.** The daemon authenticates
@@ -219,12 +221,14 @@ wraps armed runs in a hard 10-minute watchdog.
    unprivileged user who cannot read the secret cannot forge any agent.
    Operators can also set `agent_nodes[].allowed_peer_uids` to bind each signed
    `agent_id` to one or more local UIDs; a mismatched signer is denied before
-   lineage, quota, or policy evaluation. **However**, this is an authorization
-   binding, not per-agent cryptography: installs that omit the binding still use
-   one shared HMAC trust domain, and root-equivalent principals remain out of
-   scope. Mutually distrusting tenants should pair per-agent UID bindings with
-   OS-level isolation, restrictive `--socket-mode 0660`, and eventually
-   per-agent secrets/certificates.
+   lineage, quota, or policy evaluation. For stronger separation, operators can
+   set `--agent-secret-dir`: when a file exists for an `agent_id`, that agent
+   must sign with its own HMAC key and the shared admission key is rejected for
+   that id. This is still symmetric-key authentication, not certificate-bound
+   identity or fleet-managed tenant PKI; installs that omit per-agent key files
+   still use one shared HMAC trust domain, and root-equivalent principals remain
+   out of scope. Mutually distrusting tenants should pair per-agent keys and UID
+   bindings with OS-level isolation and restrictive `--socket-mode 0660`.
 
 ### 7.1 Mount-boundary and TOCTOU properties (precise)
 
@@ -505,7 +509,7 @@ the same observation history always yields the same decision.
 | Daemon-authoritative risk scoring (replace keyword heuristic; cf. §8) | Engineering |
 | eBPF-traced interpreter child-process attribution (close JG-ADV-2026-001 chains) | Engineering |
 | Multi-distribution / multi-kernel validation matrix | Engineering |
-| Per-agent cryptographic secrets/certificates for multi-tenant isolation (UID binding is implemented; cf. §7.8) | Engineering |
+| Certificate-bound / fleet-distributed per-agent identities for multi-tenant isolation (file-backed per-agent HMAC v1 and UID binding are implemented; cf. §7.8) | Engineering |
 
 **Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup
 failures use structured machine-parseable exit codes; opt-in post-load

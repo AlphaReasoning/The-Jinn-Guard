@@ -19,6 +19,12 @@ Operability and review-driven hardening (moving toward pilot-ready).
   UID is denied before lineage/quota/policy evaluation with
   `DENY_AGENT_IDENTITY_BINDING`; omitting the field preserves legacy shared-key
   behavior.
+- **Optional per-agent HMAC secrets.** The UDS admission path can now preload a
+  directory of per-agent HMAC keys with `--agent-secret-dir` /
+  `JINNGUARD_AGENT_SECRET_DIR`. Each regular file name is an `agent_id`; when a
+  key exists for that id, proposals for that agent must be signed with that
+  per-agent key instead of the shared admission key. Agents without a configured
+  file keep the existing shared current/previous key behavior.
 - **Bounded HMAC admission-key rotation.** The daemon now supports a supervised
   current/previous admission keyset: `--secret-file` remains the current signing
   key, while `--previous-secret-file` plus
