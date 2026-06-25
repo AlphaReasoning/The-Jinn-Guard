@@ -252,7 +252,7 @@ async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Resu
     }
 
     // Body. Bound the declared length BEFORE allocating: the gateway listens on
-    // 0.0.0.0 and (unless mTLS is enabled) is unauthenticated, so an attacker-set
+    // [::] and (unless mTLS is enabled) is unauthenticated, so an attacker-set
     // `Content-Length` must never drive an unbounded allocation. Mirrors the UDS
     // wire protocol's MAX_PAYLOAD_LEN cap (JG-RT-001).
     let content_length: usize = match headers.get("content-length") {
@@ -939,7 +939,7 @@ pub(crate) async fn run_mcp_gateway(
     secret: Arc<Vec<u8>>,
     tls: Option<Arc<SslAcceptor>>,
 ) {
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("[::]:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
             let mode = if tls.is_some() { "mTLS" } else { "plaintext" };

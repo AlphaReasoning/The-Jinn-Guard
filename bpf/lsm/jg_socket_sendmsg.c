@@ -31,6 +31,20 @@ struct {
 } ipv6_denylist SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
+} ipv4_allowlist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct jg_ipv6_key);
+    __type(value, __u8);
+} ipv6_allowlist SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
@@ -89,6 +103,7 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
     req->source_program = JG_SRC_SOCKET_SENDMSG;
     req->family = family;
     int denied = 0;
+    int default_deny = jg_connect_default_deny_enabled(&runtime_controls);
 
     switch (family) {
     case AF_INET: {
@@ -98,6 +113,11 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
         __u8 *entry = bpf_map_lookup_elem(&ipv4_denylist, &req->dest.v4.addr);
         if (entry && *entry) {
             denied = 1;
+        } else if (default_deny && !jg_ipv4_is_loopback(req->dest.v4.addr)) {
+            __u8 *allow = bpf_map_lookup_elem(&ipv4_allowlist, &req->dest.v4.addr);
+            if (!(allow && *allow)) {
+                denied = 1;
+            }
         }
         break;
     }
@@ -111,6 +131,11 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
         __u8 *entry = bpf_map_lookup_elem(&ipv6_denylist, &key);
         if (entry && *entry) {
             denied = 1;
+        } else if (default_deny && !jg_ipv6_is_loopback(req->dest.v6.addr)) {
+            __u8 *allow = bpf_map_lookup_elem(&ipv6_allowlist, &key);
+            if (!(allow && *allow)) {
+                denied = 1;
+            }
         }
         break;
     }
