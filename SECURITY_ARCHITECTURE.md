@@ -280,6 +280,7 @@ Consistent with the threat model's honesty bar:
 | For… | See |
 |---|---|
 | Adversary model, threat→mitigation evidence, residual risks | [`THREAT_MODEL.md`](THREAT_MODEL.md) |
+| Residual-risk register and release claim boundary | [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md) |
 | Reproducing the validation tiers | [`PROFESSOR_VALIDATION.md`](PROFESSOR_VALIDATION.md) |
 | Day-2 operations, modes, incident response | [`OPERATOR_RUNBOOK.md`](OPERATOR_RUNBOOK.md) |
 | Disclosure policy | [`SECURITY.md`](SECURITY.md) |

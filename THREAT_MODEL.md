@@ -9,10 +9,12 @@ the code and, where possible, to an automated test or a live validation result.
 > This is a structured **self-review**, not a third-party audit. It is written to
 > be checked: a reviewer can run `scripts/run_professor_validation.sh` and map
 > each PASS back to the rows below. Independent audit remains the open item
-> (see §9). The historical white-box audit that first surfaced JG-ADV-2026-001 and
-> JG-ADV-2026-002 is preserved in [`red-team-report.md`](red-team-report.md); note
-> that report describes an aspirational mTLS identity model — the shipped system
-> uses HMAC-SHA256 over a local Unix-domain socket, documented accurately here.
+> (see §9). The short residual-risk register is maintained in
+> [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md). The historical white-box audit that
+> first surfaced JG-ADV-2026-001 and JG-ADV-2026-002 is preserved in
+> [`red-team-report.md`](red-team-report.md); note that report describes an
+> aspirational mTLS identity model — the shipped system uses HMAC-SHA256 over a
+> local Unix-domain socket, documented accurately here.
 >
 > **Note on identifiers:** `JG-ADV-*` are internal, self-identified advisory IDs, not CVE records issued by a CNA.
 
@@ -503,7 +505,7 @@ the same observation history always yields the same decision.
 | Daemon-authoritative risk scoring (replace keyword heuristic; cf. §8) | Engineering |
 | eBPF-traced interpreter child-process attribution (close JG-ADV-2026-001 chains) | Engineering |
 | Multi-distribution / multi-kernel validation matrix | Engineering |
-| Per-agent secrets / `agent_id`↔UID binding for multi-tenant isolation (cf. §7.8) | Engineering |
+| Per-agent cryptographic secrets/certificates for multi-tenant isolation (UID binding is implemented; cf. §7.8) | Engineering |
 
 **Closed post-rc1 (M7 hardening):** eBPF compilation is now gated in CI; startup
 failures use structured machine-parseable exit codes; opt-in post-load
