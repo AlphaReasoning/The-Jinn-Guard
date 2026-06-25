@@ -1627,10 +1627,7 @@ pub mod aya_backend {
             return None;
         }
         let host = if let Some(stripped) = trimmed.strip_prefix('[') {
-            stripped
-                .split_once(']')
-                .map(|(h, _)| h)
-                .unwrap_or(trimmed)
+            stripped.split_once(']').map(|(h, _)| h).unwrap_or(trimmed)
         } else {
             trimmed
         };

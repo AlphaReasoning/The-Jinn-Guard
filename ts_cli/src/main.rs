@@ -53,10 +53,12 @@ use ebpf_monitor::LsmPathResolutionCache;
 #[derive(Default)]
 pub(crate) struct TelemetryStoreData {
     pub events: HashMap<u32, Vec<KernelTelemetryEvent>>,
+    #[allow(dead_code)]
     pub ppid_map: HashMap<u32, u32>,
 }
 
 impl TelemetryStoreData {
+    #[allow(dead_code)]
     pub fn root_pid(&self, mut pid: u32) -> u32 {
         let mut depth = 0;
         while let Some(&ppid) = self.ppid_map.get(&pid) {
