@@ -51,3 +51,6 @@ text editor and re-run the verifier.
   governed-decision audit stage, so they appear in the live verdict and the
   `/metrics` counters but not as audit-chain entries. Governed decisions (allow,
   risk, quota, replay) are what populate the tamper-evident chain.
+
+## Claims pending code
+- Claim 5 (Risk ceiling): The documentation claims this is backed by a Z3 constraint check (`execute_totality_audit()`), but the actual implementation in `main.rs` only performs a simple float comparison (`assessment.fused_risk > current_policy.upper_safety_boundary`) and does not invoke the Z3 solver for the risk ceiling check.

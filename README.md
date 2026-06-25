@@ -1,14 +1,14 @@
-# 🛡️ Jinn Guard — Kernel-enforced semantic firewall for autonomous AI agents (validated research prototype)
+# 🛡️ Jinn Guard — Kernel-aware agent governance daemon (validated research prototype)
 
 [![CI](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml)
 
-**Jinn Guard** is an asynchronous, kernel-aware semantic firewall designed to enforce mathematical safety constraints on autonomous AI agents before any tool execution is permitted. It intercepts high-level natural language intents and processes them through a lifetime-anchored **Z3 SMT solver pipeline** — verifying state transitions and risk ceilings against formalized compliance models before granting or denying execution authority.
+**Jinn Guard** is an asynchronous, kernel-aware agent governance daemon designed to enforce safety constraints on autonomous AI agents before any tool execution is permitted. It evaluates agent actions using a keyword/intent heuristic plus an optional external AI semantic scorer, and processes them through a lifetime-anchored **Z3 SMT solver pipeline** — performing constraint checks on state transitions and risk ceilings against formalized compliance models before granting or denying execution authority.
 
 Operating locally over high-throughput **UNIX domain sockets**, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to enforce zero-trust process isolation and anti-replay protection for governed cgroups.
 
 ## ▶️ Watch it run
 
-[![Jinn Guard live demo — kernel-aware semantic firewall blocking AI-agent attacks](https://img.youtube.com/vi/aVIEinAn-Jc/maxresdefault.jpg)](https://youtu.be/aVIEinAn-Jc)
+[![Jinn Guard live demo — kernel-aware agent governance daemon blocking AI-agent attacks](https://img.youtube.com/vi/aVIEinAn-Jc/maxresdefault.jpg)](https://youtu.be/aVIEinAn-Jc)
 
 *Automated demo (Rust + eBPF): one legitimate request is allowed; real attacks are blocked live by the daemon.*
 
@@ -235,7 +235,7 @@ repo — happy to talk.
 | **Sequence quota** | Per-agent `max_sequence_quota` hard cap on decisions per lineage session (`DENY_QUOTA_EXHAUSTED`). |
 | **Replay protection** | Monotonic `sequence_counter` validated per `(pid, start_time)` lineage key (`DENY_REPLAY_ATTACK`). |
 | **Behavioral drift** | Statistical drift detector on `fused_risk` delta against lineage baseline (`DENY_BEHAVIORAL_DRIFT`). |
-| **Z3 totality proof** | Every request passes through `execute_totality_audit()` — mathematical proof that `fused_risk ≤ upper_safety_boundary`. |
+| **Z3 constraint check** | Every request passes through `execute_totality_audit()` — Z3-backed constraint check that `fused_risk ≤ ceiling`. |
 | **Z3 invariants** | Per-agent declarative constraints (`spending_ceiling_usd`, `privilege_escalation_depth`, etc.) verified against daemon-computed runtime state. Callers cannot spoof daemon-observed values. |
 | **Audit log** | Hash-chained JSONL log (each entry includes the SHA-256 of the previous — tamper evident), and **erasure-safe**: personal data is kept out of the chain and crypto-shredded on a GDPR Art. 17 request, with the chain still verifying. See [`THREAT_MODEL.md` §12](THREAT_MODEL.md). |
 | **eBPF telemetry** | Kernel-level visibility into execve, file open, network connect, and capability checks — correlated with governance decisions. |

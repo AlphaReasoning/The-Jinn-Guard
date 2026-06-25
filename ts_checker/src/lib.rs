@@ -10,7 +10,7 @@ pub struct PolicyEngine<'a> {
 }
 
 impl<'a> PolicyEngine<'a> {
-    /// Per-`check()` solver timeout in milliseconds. Legitimate policy proofs
+    /// Per-`check()` solver timeout in milliseconds. Legitimate policy constraint checks
     /// here involve a handful of linear constraints and resolve in microseconds;
     /// this bound exists purely so a pathological or maliciously complex policy
     /// cannot stall a decision indefinitely. On timeout Z3 returns
@@ -35,9 +35,6 @@ impl<'a> PolicyEngine<'a> {
 
     /// Backward-Compatible Alias for the Topology Mapping Layer
     pub fn register_bounded_geometry(&self) -> Result<()> {
-        println!(
-            "📐 [TOPOLOGY ENGINE] Bounded geometry coordinates mapped to formal constraint scope."
-        );
         Ok(())
     }
 
@@ -62,7 +59,7 @@ impl<'a> PolicyEngine<'a> {
         Ok(())
     }
 
-    /// Remediation 1: Expanding Scalar Arithmetic into Deep Temporal State Verification
+    /// Remediation 1: Expanding Scalar Arithmetic into Deep Temporal State Checks
     pub fn verify_state_transition(
         &self,
         current_risk: i64,
@@ -82,13 +79,10 @@ impl<'a> PolicyEngine<'a> {
 
         match self.solver.check() {
             z3::SatResult::Sat => {
-                println!(
-                    "\u{2705} [Z3 PROVER] Inductive safety step mathematically locked. Path cleared."
-                );
                 Ok(())
             }
             _ => Err(anyhow!(
-                "SIGNAL: REFUSED_DEGRADED_ENTROPY_THRESHOLD_BREACH. Safety proof failed."
+                "SIGNAL: REFUSED_DEGRADED_ENTROPY_THRESHOLD_BREACH. Safety constraint check failed."
             )),
         }
     }
@@ -166,7 +160,6 @@ impl<'a> PolicyEngine<'a> {
 
         match self.solver.check() {
             z3::SatResult::Sat => {
-                println!("\u{2705} [Z3 INVARIANTS] All policy invariants satisfied.");
                 Ok(())
             }
             _ => Err(anyhow!(
