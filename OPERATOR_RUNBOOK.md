@@ -111,6 +111,22 @@ sudo systemctl reload jinnguard    # or: sudo kill -HUP $(pidof jinnguard)
 > and re-excluded at lookup, so a bad policy cannot place the operator's own
 > system paths under governance.
 
+Per-agent identity binding is optional but recommended on shared hosts. Add
+`allowed_peer_uids` under an `agent_nodes` entry to bind that signed `agent_id`
+to the Unix users observed via `SO_PEERCRED`:
+
+```yaml
+agent_nodes:
+  - id: "locked_agent_dev_01"
+    privilege_tier: 1
+    allowed_peer_uids:
+      - 10001
+```
+
+If the field is empty or omitted, legacy shared-key behavior is preserved. If a
+caller signs as that `agent_id` from any other UID, the daemon returns
+`DENY_AGENT_IDENTITY_BINDING`.
+
 ---
 
 ## 5. Operating modes

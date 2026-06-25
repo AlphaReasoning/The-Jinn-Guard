@@ -135,8 +135,10 @@ is a structural invariant, regression-tested on real kernels
 ```
 agent ──framed bytes──▶ UDS ──▶ STEP 1–2  decode + length-cap        (B1)
                                 STEP 3–4  HMAC verify (constant-time) (B2)
-                                STEP 5–6  lineage / sequence ordering (B3)
+                                STEP 5–6  parse + replay detection    (B3)
                                 STEP 7–8  identity / anonymous gates  (B3)
+                                           optional agent_id↔UID binding
+                                           lineage sequence ordering
                                 STEP 9–11 intent allowlist · policy · quota
                                 STEP 12   adaptive risk penalty (tighten-only)
                                 STEP 13   Z3 invariants + hard ceiling  (ts_checker)
@@ -181,9 +183,10 @@ loudest signal of an uncovered escape path.
   Optional RootAI remote scoring uses outbound HTTPS/mTLS only for scorer
   transport and never replaces proposal authentication or enforcement gates.
 - **Identity (B3):** the daemon does not trust the self-declared `agent_id`. It
-  cross-checks `SO_PEERCRED` peer credentials and binds decisions to a
-  per-`(pid, start_time)` **lineage**, so a restarted/forked process cannot
-  inherit another's standing.
+  cross-checks `SO_PEERCRED` peer credentials, optionally requires the signed
+  `agent_id` to match that agent's configured `allowed_peer_uids`, and binds
+  decisions to a per-`(pid, start_time)` **lineage**, so a restarted/forked
+  process cannot inherit another's standing.
 - **Ordering (B3):** each lineage carries a monotonic sequence counter; replays
   and reorderings are rejected (STEP 6). Audit-log appends are serialized so the
   hash chain cannot fork under concurrency.

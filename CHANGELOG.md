@@ -9,6 +9,12 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Per-agent UID identity binding.** Agent policy entries now support optional
+  `allowed_peer_uids`, binding a signed `agent_id` to local Unix peer identities
+  observed via `SO_PEERCRED`. A caller with a valid shared HMAC key but the wrong
+  UID is denied before lineage/quota/policy evaluation with
+  `DENY_AGENT_IDENTITY_BINDING`; omitting the field preserves legacy shared-key
+  behavior.
 - **Bounded HMAC admission-key rotation.** The daemon now supports a supervised
   current/previous admission keyset: `--secret-file` remains the current signing
   key, while `--previous-secret-file` plus

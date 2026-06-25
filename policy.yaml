@@ -18,6 +18,10 @@ agent_nodes:
   - id: "fabric_swarm_production_01"
     privilege_tier: 2
     max_sequence_quota: 5
+    # Optional: bind this signed agent_id to local Unix users observed through
+    # SO_PEERCRED. Empty/omitted preserves the shared-key legacy behavior.
+    # allowed_peer_uids:
+    #   - 10001
     allowed_intents:
       - "model_inference"
       - "mathematical_computation"
