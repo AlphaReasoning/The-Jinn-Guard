@@ -241,6 +241,24 @@ mod tests {
     }
 
     #[test]
+    fn risk_exactly_at_ceiling_passes() {
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+        // r=40 + w=10 == ceiling 50 → boundary is inclusive (`<=`) → ALLOW.
+        assert!(engine.verify_state_transition(40, 10, 50).is_ok());
+    }
+
+    #[test]
+    fn risk_one_over_ceiling_denies() {
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+        // r=40 + w=11 == 51 > ceiling 50 → constraint unsatisfiable → DENY.
+        assert!(engine.verify_state_transition(40, 11, 50).is_err());
+    }
+
+    #[test]
     fn invariants_empty_list_pass() {
         let config = z3::Config::new();
         let ctx = Context::new(&config);
