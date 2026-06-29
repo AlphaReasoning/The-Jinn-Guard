@@ -385,9 +385,33 @@ checkout and artifact handling.
   `contents: read`. The release workflow already used explicit per-job write/OIDC
   permissions only where publishing and signing require them.
 
+## Batch 23 — Action Manifest verifier key trust (#62 follow-up)
+
+### JG-RT-026 — `--verify-manifests` trusted the in-directory pubkey (MED, fixed)
+The Action Manifest verifier (#62) read the trusted Ed25519 public key from
+`<audit-log>.manifests.pub` — a file in the **same directory as the log it is
+verifying**. An attacker who can rewrite the audit log can also rewrite that
+pubkey file: they regenerate a fully self-consistent set of manifests signed with
+their *own* key, publish that key as `<log>.manifests.pub`, and the verifier
+reports `OK`. That silently defeats the non-repudiation property the manifests
+exist to provide — the forgery is indistinguishable from a genuine log unless the
+verifier already holds the real key. (The original `forgery_with_different_key…`
+test only passed because it manually restored the genuine pubkey, masking this.)
+- **Fix:** `verify_manifests()` now takes an optional **pinned** public key and
+  the CLI exposes `--manifest-pubkey <hex>`. When supplied (out-of-band), the
+  in-directory pubkey is ignored and authenticity is checked against the pinned
+  key — the only mode that resists a malicious log-holder. When omitted, the
+  verifier falls back to the in-directory key for *convenience* (detects accidental
+  corruption / non-malicious regeneration only) and the report/`ManifestVerification`
+  is explicitly flagged `pubkey_pinned = false` ("self-consistency only"), so an
+  unpinned pass can never be mistaken for proven authenticity. Regression test:
+  `swapped_pubkey_forgery_defeated_only_by_pinned_key`. The genuine key is printed
+  at daemon startup; THREAT_MODEL §12.1 documents the out-of-band key-distribution
+  requirement.
+
 ## Closeout
 
-- Internal red-team batches JG-RT-001 through JG-RT-025 are fixed or explicitly
+- Internal red-team batches JG-RT-001 through JG-RT-026 are fixed or explicitly
   documented as defense-in-depth residuals.
 - Post-merge real-kernel validation passed on the supported self-hosted matrix:
   Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /

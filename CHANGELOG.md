@@ -9,6 +9,17 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Manifest verifier hardened — pinned-key authenticity (JG-RT-026, #59).**
+  Internal red-team of the freshly-shipped Action Manifest (#62) found that
+  `--verify-manifests` trusted the public key published *next to* the audit log
+  (`<log>.manifests.pub`). An attacker who can rewrite the log can also rewrite
+  that key and re-sign with their own — a self-consistent forgery that reported
+  `OK`, silently defeating non-repudiation. `verify_manifests()` now accepts a
+  **pinned** key (`--manifest-pubkey <hex>`, supplied out-of-band) and reports
+  `pubkey_pinned`; an unpinned run is explicitly labelled "self-consistency only,"
+  never mistakable for proven authenticity. Regression test
+  `swapped_pubkey_forgery_defeated_only_by_pinned_key`; THREAT_MODEL §12.1 +
+  RED_TEAM_FINDINGS.md JG-RT-026 document the out-of-band key-distribution rule.
 - **Reproducible-build sub-item of JG #46 verified-closed.** The last open
   sub-item of the supply-chain work — *independently-verified* bit-for-bit
   reproducibility — is now confirmed. `scripts/rebuild_and_compare_release.sh`

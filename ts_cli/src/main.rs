@@ -152,6 +152,14 @@ struct CliArgs {
     /// start the daemon). Exit code is non-zero on any failure.
     #[arg(long)]
     verify_manifests: Option<String>,
+    /// #62 Trusted Ed25519 manifest public key (64 hex chars), supplied
+    /// out-of-band, to pin `--verify-manifests` against. STRONGLY RECOMMENDED: an
+    /// attacker who can rewrite the audit log can also rewrite the in-directory
+    /// `<log>.manifests.pub`, so without a pinned key the verifier only proves
+    /// self-consistency, not authenticity. The genuine key is printed at daemon
+    /// startup and published in `<log>.manifests.pub` on a trusted host.
+    #[arg(long)]
+    manifest_pubkey: Option<String>,
     /// MCP gateway TCP port
     #[arg(long, default_value_t = 4750)]
     mcp_port: u16,
@@ -5139,8 +5147,8 @@ async fn main() {
 /// #62 One-shot `--verify-manifests` implementation: re-walk the chain, verify
 /// every manifest/checkpoint signature against the published pubkey, confirm full
 /// coverage, print a report, and exit non-zero on any failure.
-fn run_verify_manifests(audit_path: &str) -> Result<()> {
-    let v = provenance_manifest::verify_manifests(audit_path)?;
+fn run_verify_manifests(audit_path: &str, pinned_pubkey: Option<&str>) -> Result<()> {
+    let v = provenance_manifest::verify_manifests(audit_path, pinned_pubkey)?;
     println!("Action Manifest verification — {audit_path}");
     println!("  chain entries     : {}", v.chain_entries);
     println!("  chain intact      : {}", v.chain_intact);
@@ -5149,6 +5157,14 @@ fn run_verify_manifests(audit_path: &str) -> Result<()> {
     }
     println!("  manifest records  : {}", v.records);
     println!("  authentic records : {}", v.authentic_records);
+    println!(
+        "  trusted key       : {}",
+        if v.pubkey_pinned {
+            "pinned out-of-band (authenticity)"
+        } else {
+            "in-directory pubkey (self-consistency only — pass --manifest-pubkey to assert authenticity)"
+        }
+    );
     if !v.authenticity_failures.is_empty() {
         println!(
             "  authenticity FAIL : {}",
@@ -5159,7 +5175,12 @@ fn run_verify_manifests(audit_path: &str) -> Result<()> {
         println!("  uncovered indices : {:?}", v.uncovered_indices);
     }
     if v.ok() {
-        println!("RESULT: OK — chain intact, all records authentic, full coverage");
+        let scope = if v.pubkey_pinned {
+            "authentic against the pinned key"
+        } else {
+            "self-consistent (key NOT pinned)"
+        };
+        println!("RESULT: OK — chain intact, full coverage, {scope}");
         Ok(())
     } else {
         exit_codes::fatal(
@@ -5176,7 +5197,7 @@ async fn run() -> Result<()> {
     // #62 One-shot manifest verification mode: validate and exit before any
     // daemon setup. Keeps the verifier usable on an offline copy of an audit dir.
     if let Some(audit_path) = args.verify_manifests.as_deref() {
-        return run_verify_manifests(audit_path);
+        return run_verify_manifests(audit_path, args.manifest_pubkey.as_deref());
     }
 
     eprintln!(
