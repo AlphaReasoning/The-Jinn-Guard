@@ -9,6 +9,24 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Action Manifest v0 — Ed25519-signed per-action provenance (JG #62 / M9).** New
+  `ts_cli::provenance_manifest` module adds *authenticity* on top of the audit
+  ledger's existing *tamper-evidence*. The hash chain takes no secret, so anyone
+  with the JSONL can recompute a self-consistent chain; an **Ed25519** (asymmetric,
+  `ed25519-dalek`, BSD-3, no `ring`/`aws-lc`) signature over a canonical,
+  machine-readable manifest lets a third party verify a log **offline with only the
+  public key**. Opt-in via `--manifest-key` (key generated `0600` on first use,
+  pubkey published beside the log); default **checkpoint** signing (one Ed25519 sig
+  over a Merkle root every *N* entries) with **per-action** signing under
+  `--manifest-per-action`. New one-shot verifier `ts_cli --verify-manifests <log>`
+  checks chain integrity + signature authenticity + full coverage and exits
+  non-zero on any gap. All signing happens **after** an entry is committed, off the
+  decision path — provenance never affects a verdict. Signatures cover the redacted
+  chain bytes only, so crypto-shredding (#61) leaves them valid. 7 unit tests
+  including tamper, **forgery-with-different-key**, and post-erasure verification;
+  validated end-to-end through the daemon. README Guarantees row flips
+  🚧→✅ (opt-in); design/threat-model detail in THREAT_MODEL §12.1. Transparency-log
+  anchoring and rotation epochs remain v1/v2.
 - **"Guarantees today vs roadmap" table (external-audit follow-up).** README now
   carries a single conservative table splitting *enforced-now* capabilities by
   plane — the deterministic kernel floor (holds even if the daemon is dead or

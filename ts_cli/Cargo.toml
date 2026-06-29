@@ -26,6 +26,10 @@ signal-hook = "0.4.4"
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
+# #62 Action Manifest v0: asymmetric (Ed25519) runtime signer for per-action
+# provenance. Pure-Rust (no ring/aws-lc), BSD-3-Clause — license-clean against
+# deny.toml. Keygen uses our own /dev/urandom seed, so no rand_core feature.
+ed25519-dalek = "2"
 # #11 optional mTLS for the MCP gateway. openssl is already in the dependency
 # graph (via reqwest/native-tls); tokio-openssl adds async TLS streams. Engaged
 # only when the operator supplies --mcp-tls-{cert,key,ca}; plain TCP otherwise.

@@ -588,3 +588,46 @@ reversible by the operator** holding the install salt (by design — it is
 pseudonymisation, not anonymisation); destroying that salt anonymises all
 remaining pseudonyms. `pid` is retained in the chain as low-sensitivity
 operational metadata.
+
+### 12.1 Authenticity vs tamper-evidence — Action Manifest v0 (#62)
+
+The hash chain gives **tamper-evidence** (you cannot edit one entry in place
+without breaking the chain) but **not authenticity**: the chain hash takes no
+secret, so anyone holding the JSONL can recompute a *fully self-consistent*
+alternative chain. A third party handed a log cannot prove it was produced by a
+genuine instance, nor that it was not wholesale-regenerated. Every other
+signature in the tree is **HMAC** (symmetric) — a verifier would need the secret,
+so HMAC cannot give *external* verifiability either.
+
+**Action Manifest v0** (opt-in, `--manifest-key`) closes this with an **Ed25519**
+(asymmetric) signature over a canonical, machine-readable manifest. Verifiers
+need only the *public* key (published next to the log). Two signed units, both
+emitted **after** an entry is committed — never on the decision path, so
+provenance can never affect a verdict:
+
+- **Per-action manifest** (`--manifest-per-action`): one detached signature per
+  `AuditEntry`, carrying the claim taxonomy (`verdict`, `denied_reason`,
+  `intent_class`, `fused_risk`, `trust_score`, `z3_checked`).
+- **Checkpoint** (default): every *N* entries, sign a Merkle root over the range;
+  one signature authenticates a whole range.
+
+`ts_cli --verify-manifests <audit-log>` re-walks the chain, verifies every
+signature against the published key, and confirms **coverage** (no committed
+entry lacks a covering signature — gaps are reported, never silently passed).
+
+- **What it adds:** offline non-repudiation. A regenerated/forged chain signed
+  with a *different* key has an intact chain but **fails authenticity** against
+  the genuine public key (covered by the `forgery_with_different_key_fails_authenticity`
+  test).
+- **What it does NOT add:** defence against an attacker who already holds the live
+  signing key (root on the host) — the same root-trust boundary as the fleet key.
+  Making *silent* retroactive forgery detectable requires external transparency
+  anchoring (#62 v2, roadmap).
+- **GDPR interaction:** signatures cover the **redacted** entry bytes — exactly
+  what `calculate_hash` covers — never `audit_pii`. Crypto-shredding deletes only
+  `audit_pii`, so erasing a subject leaves every signature and the chain valid
+  (covered by the `erasure_keeps_chain_and_signatures_valid` test). Provenance and
+  the right-to-erasure stay compatible.
+- **Key management:** the Ed25519 private key is root-only (`0600`, generated on
+  first use), `signer_key_id = SHA-256(pubkey)[..16]`. Rotation epochs are a v1
+  item; v0 uses epoch 0.

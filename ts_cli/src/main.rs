@@ -15,6 +15,7 @@ pub mod fleet_policy;
 pub mod governance;
 pub mod mcp_gateway;
 pub mod metrics;
+pub mod provenance_manifest;
 pub mod system_immunity;
 
 use anyhow::{Context as AnyhowContext, Result};
@@ -127,6 +128,30 @@ struct CliArgs {
     /// Allow anonymous agents regardless of policy setting
     #[arg(long, default_value_t = false)]
     allow_anonymous: bool,
+    /// #62 Action Manifest v0: enable Ed25519-signed per-action provenance. Path
+    /// to the 32-byte runtime signing key (hex); generated `0600` on first use.
+    /// When set, every committed audit entry is recorded to a signed manifest
+    /// sidecar (`<audit-log>.manifests`) with the pubkey at `<...>.manifests.pub`.
+    #[arg(long, env = "JINNGUARD_MANIFEST_KEY")]
+    manifest_key: Option<String>,
+    /// #62 Emit a detached signature per action (heavier storage) in addition to
+    /// the default checkpoint signing. Off by default — checkpoints give the same
+    /// non-repudiation at a fraction of the storage.
+    #[arg(long, env = "JINNGUARD_MANIFEST_PER_ACTION", default_value_t = false)]
+    manifest_per_action: bool,
+    /// #62 Entries per signed checkpoint (checkpoint mode). 0 uses the built-in
+    /// default. Ignored in per-action mode.
+    #[arg(
+        long,
+        env = "JINNGUARD_MANIFEST_CHECKPOINT_INTERVAL",
+        default_value_t = 0
+    )]
+    manifest_checkpoint_interval: u64,
+    /// #62 One-shot verifier: validate the chain, signature authenticity, and
+    /// coverage for the given audit-log path, print a report, and exit (does not
+    /// start the daemon). Exit code is non-zero on any failure.
+    #[arg(long)]
+    verify_manifests: Option<String>,
     /// MCP gateway TCP port
     #[arg(long, default_value_t = 4750)]
     mcp_port: u16,
@@ -5111,8 +5136,49 @@ async fn main() {
     }
 }
 
+/// #62 One-shot `--verify-manifests` implementation: re-walk the chain, verify
+/// every manifest/checkpoint signature against the published pubkey, confirm full
+/// coverage, print a report, and exit non-zero on any failure.
+fn run_verify_manifests(audit_path: &str) -> Result<()> {
+    let v = provenance_manifest::verify_manifests(audit_path)?;
+    println!("Action Manifest verification — {audit_path}");
+    println!("  chain entries     : {}", v.chain_entries);
+    println!("  chain intact      : {}", v.chain_intact);
+    if let Some(idx) = v.first_broken_index {
+        println!("  first broken index: {idx}");
+    }
+    println!("  manifest records  : {}", v.records);
+    println!("  authentic records : {}", v.authentic_records);
+    if !v.authenticity_failures.is_empty() {
+        println!(
+            "  authenticity FAIL : {}",
+            v.authenticity_failures.join(", ")
+        );
+    }
+    if !v.uncovered_indices.is_empty() {
+        println!("  uncovered indices : {:?}", v.uncovered_indices);
+    }
+    if v.ok() {
+        println!("RESULT: OK — chain intact, all records authentic, full coverage");
+        Ok(())
+    } else {
+        exit_codes::fatal(
+            exit_codes::EX_SOFTWARE,
+            "MANIFEST_VERIFICATION_FAILED",
+            "chain integrity, signature authenticity, or coverage check failed",
+        )
+    }
+}
+
 async fn run() -> Result<()> {
     let args = CliArgs::parse();
+
+    // #62 One-shot manifest verification mode: validate and exit before any
+    // daemon setup. Keeps the verifier usable on an offline copy of an audit dir.
+    if let Some(audit_path) = args.verify_manifests.as_deref() {
+        return run_verify_manifests(audit_path);
+    }
+
     eprintln!(
         "[startup] pid={} socket_path={} policy_file={} kernel_telemetry_feature={} enterprise_required={} safe_mode={}",
         std::process::id(),
@@ -5185,7 +5251,39 @@ async fn run() -> Result<()> {
     let registry_store = Arc::new(Mutex::new(LineageRegistry::load_or_create(
         &args.lineage_file,
     )));
-    let audit_logger = Arc::new(AuditLogger::new(&args.audit_log));
+    let audit_logger = Arc::new({
+        let mut logger = AuditLogger::new(&args.audit_log);
+        // #62 Attach the Ed25519 provenance signer when --manifest-key is set.
+        if let Some(key_path) = args.manifest_key.as_deref() {
+            match provenance_manifest::ManifestSigner::load_or_generate(
+                key_path,
+                &args.audit_log,
+                args.manifest_per_action,
+                0, // epoch 0 in v0; rotation epochs are a v1 item
+                args.manifest_checkpoint_interval,
+            ) {
+                Ok(signer) => {
+                    eprintln!(
+                        "[startup] Action Manifest signing enabled (key_id={} mode={} interval={})",
+                        signer.key_id(),
+                        if args.manifest_per_action {
+                            "per-action"
+                        } else {
+                            "checkpoint"
+                        },
+                        args.manifest_checkpoint_interval
+                    );
+                    logger.set_manifest_signer(signer);
+                }
+                Err(err) => exit_codes::fatal(
+                    exit_codes::EX_CONFIG,
+                    "MANIFEST_KEY_CONFIG",
+                    &format!("{err:#}"),
+                ),
+            }
+        }
+        logger
+    });
     if let Err(err) = audit_logger.log_boot_marker() {
         eprintln!("[audit] boot marker skipped: {err:#}");
     }
