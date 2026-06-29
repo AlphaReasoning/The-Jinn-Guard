@@ -9,6 +9,17 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **Reproducible-build sub-item of JG #46 verified-closed.** The last open
+  sub-item of the supply-chain work — *independently-verified* bit-for-bit
+  reproducibility — is now confirmed. `scripts/rebuild_and_compare_release.sh`
+  builds `ts_cli --release --locked` twice from clean `git archive` checkouts
+  under the pinned toolchain (`SOURCE_DATE_EPOCH` from the commit, path remapping,
+  symbol stripping, no incremental) and byte-compares the results; a local run and
+  the `Reproducible release build` CI job (every push/PR) both produce an
+  **identical** binary hash. cargo-deny (advisories/licenses/bans/sources), SBOM,
+  SLSA v3 provenance, and cosign signing were already in place. (The
+  `slsa-github-generator` pin must still be re-confirmed current at release time —
+  see the note in `release.yml`.)
 - **Action Manifest v0 — Ed25519-signed per-action provenance (JG #62 / M9).** New
   `ts_cli::provenance_manifest` module adds *authenticity* on top of the audit
   ledger's existing *tamper-evidence*. The hash chain takes no secret, so anyone
