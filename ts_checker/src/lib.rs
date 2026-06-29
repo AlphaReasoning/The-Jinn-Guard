@@ -59,7 +59,10 @@ impl<'a> PolicyEngine<'a> {
         Ok(())
     }
 
-    /// Remediation 1: Expanding Scalar Arithmetic into Deep Temporal State Checks
+    /// Checks the single bounded inequality `current_risk + action_weight <= ceiling`
+    /// with one Z3 SAT query. This is a satisfiability check of one linear arithmetic
+    /// constraint, not a temporal/multi-step proof: SAT => the bound holds for the
+    /// supplied integers (ALLOW), anything else (incl. timeout `Unknown`) => DENY.
     pub fn verify_state_transition(
         &self,
         current_risk: i64,
@@ -78,9 +81,7 @@ impl<'a> PolicyEngine<'a> {
         self.solver.assert(&safety_constraint);
 
         match self.solver.check() {
-            z3::SatResult::Sat => {
-                Ok(())
-            }
+            z3::SatResult::Sat => Ok(()),
             _ => Err(anyhow!(
                 "SIGNAL: REFUSED_DEGRADED_ENTROPY_THRESHOLD_BREACH. Safety constraint check failed."
             )),
@@ -159,9 +160,7 @@ impl<'a> PolicyEngine<'a> {
         }
 
         match self.solver.check() {
-            z3::SatResult::Sat => {
-                Ok(())
-            }
+            z3::SatResult::Sat => Ok(()),
             _ => Err(anyhow!(
                 "POLICY_INVARIANT_VIOLATED: One or more Z3 invariants are unsatisfiable."
             )),

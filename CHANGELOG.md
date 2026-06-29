@@ -16,11 +16,14 @@ Operability and review-driven hardening (moving toward pilot-ready).
   items (per-action signed manifests JG #62, transparency anchoring, reproducible
   builds JG #46, OTLP export JG #11). Directly answers an independent review note
   that earlier wording could read as if user-space verdicts were kernel-enforced.
-- **Z3 component wording calibrated.** The `ts_checker` row in the README
-  Components table no longer says "state transition proofs"; it now reads
-  "bounded risk-ceiling + declarative-invariant satisfiability checks (sound on
-  its inputs)" and links to THREAT_MODEL §8, the lone residual overstatement
-  flagged by the external review.
+- **Z3 wording calibrated across docs + code.** Removed every phrasing that could
+  read as formal/temporal proof. The README `ts_checker` row now reads "bounded
+  risk-ceiling + declarative-invariant satisfiability checks (sound on its
+  inputs)" and links THREAT_MODEL §8; the shippable-components rows are relabeled
+  "Z3 risk-ceiling check (bounded SMT: `r + w ≤ c`)" and "Z3 declarative-invariant
+  satisfiability check"; and the `verify_state_transition` doc comment in
+  `ts_checker/src/lib.rs` now describes the single linear inequality it checks
+  with one SAT query, rather than a grandiose multi-step abstraction.
 - **Portable validation harness.** `scripts/run_professor_validation.sh` now runs
   on macOS's stock bash 3.2 (replaced the bash-4 associative array with indirect
   per-tier variables), auto-exports Homebrew Z3/libclang paths on Darwin so

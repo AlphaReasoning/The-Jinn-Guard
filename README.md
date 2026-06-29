@@ -618,8 +618,8 @@ register and release claim boundary.
 | Bounded HMAC key rotation grace | ✅ Production |
 | Optional per-agent HMAC key files | ✅ Production |
 | `SO_PEERCRED` process identity | ✅ Production |
-| Z3 totality audit | ✅ Production |
-| Z3 per-agent invariant verification (G2) | ✅ Production |
+| Z3 risk-ceiling check (bounded SMT: `r + w ≤ c`) | ✅ Production |
+| Z3 declarative-invariant satisfiability check (G2) | ✅ Production |
 | Per-agent intent allowlist enforcement (G1) | ✅ Production |
 | Per-agent sequence quota enforcement (G1) | ✅ Production |
 | Replay attack protection | ✅ Production |
