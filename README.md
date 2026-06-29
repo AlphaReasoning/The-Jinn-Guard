@@ -298,8 +298,8 @@ Z3 step does and does **not** prove) and Known Limitations below.
 | Release provenance — SLSA v3 + cosign keyless signatures on tagged builds | Build/release | ✅ Enforced |
 | Semantic risk assessment — keyword/intent heuristic (+ optional external scorer) | User-space (cooperative) | ✅ Active, heuristic-primary |
 | Bounded SMT checks — risk-ceiling arithmetic + invariant satisfiability | User-space (cooperative) | ✅ Active; *sound on its inputs, not a proof of the risk oracle* — [THREAT_MODEL §8](THREAT_MODEL.md) |
-| Per-action signed provenance manifests (C2PA-style, prev-hash linked) | User-space | 🚧 Roadmap (JG #62) |
-| External transparency-log anchoring of audit checkpoints | User-space | 🚧 Roadmap (JG #62) |
+| Ed25519-signed provenance manifests — offline-verifiable authenticity over the audit ledger (`--manifest-key`; `--verify-manifests`) | User-space | ✅ Active (opt-in, Action Manifest v0) |
+| External transparency-log anchoring of audit checkpoints | User-space | 🚧 Roadmap (JG #62 v2) |
 | Bit-for-bit reproducible builds | Build/release | 🚧 Roadmap (JG #46) |
 | Full cross-mount path *strings* in the audit log (`bpf_d_path`) | Kernel floor | 🚧 Roadmap (enforcement already mount-safe — see Known Limitations) |
 | OpenTelemetry/OTLP metric export | User-space | 🚧 Roadmap (JG #11) |

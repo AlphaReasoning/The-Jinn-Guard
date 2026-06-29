@@ -1355,6 +1355,11 @@ pub struct AuditLogger {
     /// command-line arguments are never persisted — only their count is kept — so
     /// the most sensitive free-text field is not collected in the first place.
     minimize_argv: bool,
+    /// #62 Action Manifest v0: optional Ed25519 provenance signer. When attached
+    /// (operator passes `--manifest-key`), every committed entry is recorded to a
+    /// signed manifest/checkpoint sidecar. `None` preserves the prior behaviour
+    /// exactly (tamper-evidence only, no asymmetric signatures).
+    manifest_signer: Option<crate::provenance_manifest::ManifestSigner>,
 }
 
 /// The active pseudonym salt and the epoch it belongs to. A rotation installs a
@@ -1481,7 +1486,29 @@ impl AuditLogger {
             minimize_argv: std::env::var("JINNGUARD_AUDIT_MINIMIZE_ARGV")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            manifest_signer: None,
         }
+    }
+
+    /// #62 Attach an Ed25519 provenance signer (call once, before the logger is
+    /// shared). Idempotent-by-replacement. Returns `&mut Self` for chaining at
+    /// construction.
+    pub fn set_manifest_signer(
+        &mut self,
+        signer: crate::provenance_manifest::ManifestSigner,
+    ) -> &mut Self {
+        self.manifest_signer = Some(signer);
+        self
+    }
+
+    /// #62 Force-sign a checkpoint over any pending entries. No-op when no signer
+    /// is attached. Call on a clean shutdown so the trailing partial batch is
+    /// covered (per-action mode covers every entry immediately and needs no flush).
+    pub fn flush_manifests(&self) -> Result<()> {
+        if let Some(signer) = &self.manifest_signer {
+            signer.flush()?;
+        }
+        Ok(())
     }
 
     /// Read the active (highest-epoch) salt from the salt-epoch table.
@@ -1852,6 +1879,19 @@ impl AuditLogger {
         // #11 monitoring: this entry's index is 0-based, so the chain now holds
         // `next_index + 1` entries.
         crate::metrics::set_audit_chain_entries(next_index + 1);
+
+        // #62 Action Manifest: record signed provenance for this committed entry.
+        // Strictly best-effort and *after* the entry is already on the chain — a
+        // signing failure is logged and swallowed, never propagated, so provenance
+        // can never affect a verdict or break audit logging.
+        if let Some(signer) = &self.manifest_signer {
+            if let Err(err) = signer.record_entry(&entry) {
+                eprintln!(
+                    "[manifest] provenance signing skipped for index {}: {err:#}",
+                    entry.index
+                );
+            }
+        }
 
         Ok(())
     }
