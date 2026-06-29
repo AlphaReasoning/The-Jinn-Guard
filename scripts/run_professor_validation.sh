@@ -33,9 +33,25 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || { echo "fatal: cannot cd to repo root '$REPO_ROOT'" >&2; exit 1; }
 ARM=0
 [[ "${1:-}" == "--arm" ]] && ARM=1
+
+OS="$(uname -s 2>/dev/null || echo unknown)"
+
+# On macOS, Homebrew's Z3 and LLVM are not on the default linker/bindgen search
+# path, so `ts_checker` fails to link (`ld: library 'z3' not found`) and the Z3
+# bindings can't find libclang. Export the paths if the kegs are present. This is
+# a no-op on Linux and harmless when Homebrew isn't installed.
+if [[ "$OS" == "Darwin" ]]; then
+  for pfx in /opt/homebrew /usr/local; do
+    if [[ -d "$pfx/opt/z3/lib" ]]; then
+      export LIBRARY_PATH="$pfx/opt/z3/lib:${LIBRARY_PATH:-}"
+      export DYLD_LIBRARY_PATH="$pfx/opt/z3/lib:${DYLD_LIBRARY_PATH:-}"
+    fi
+    [[ -d "$pfx/opt/llvm/lib" ]] && export LIBCLANG_PATH="$pfx/opt/llvm/lib:${LIBCLANG_PATH:-}"
+  done
+fi
 
 c_hdr()  { printf '\n\033[1;36m========== %s ==========\033[0m\n' "$*"; }
 c_ok()   { printf '\033[1;32m  [OK]   %s\033[0m\n' "$*"; }
@@ -43,9 +59,10 @@ c_skip() { printf '\033[1;33m  [SKIP] %s\033[0m\n' "$*"; }
 c_fail() { printf '\033[1;31m  [FAIL] %s\033[0m\n' "$*"; }
 c_info() { printf '         %s\n' "$*"; }
 
-# Results accumulators.
-declare -A RESULT
-mark() { RESULT["$1"]="$2"; }   # mark <tier> <PASS|FAIL|SKIP>
+# Results accumulators. Indirect per-tier variables (RESULT_T1…RESULT_T4) instead
+# of an associative array, so this runs on macOS's stock bash 3.2 as well as 4+.
+mark() { printf -v "RESULT_$1" '%s' "$2"; }   # mark <tier> <PASS|FAIL|SKIP>
+res()  { local v="RESULT_$1"; printf '%s' "${!v:-}"; }   # res <tier> -> status (empty if unset)
 
 # ---------------------------------------------------------------------------
 c_hdr "Environment"
@@ -81,13 +98,27 @@ fi
 
 # ---------------------------------------------------------------------------
 c_hdr "Tier 1 — build + full automated test suite (no root, no Docker)"
-if run_cargo build --release >/dev/null 2>&1; then
+# The daemon (ts_cli) and eBPF layer are Linux-only. On other hosts (e.g. a
+# reviewer's macOS laptop), Tier 1 validates the portable crates — the Z3 SMT
+# engine (ts_checker) and the wire-protocol parser (ts_wire) — which is the most
+# that can be checked without a Linux kernel. Full enforcement needs tiers 2-4.
+if [[ "$OS" == "Linux" ]]; then
+  T1_BUILD="build --release"
+  T1_TEST="test --workspace"
+else
+  c_info "non-Linux host ($OS): ts_cli + eBPF are Linux-only; validating the"
+  c_info "portable crates only (ts_checker SMT engine, ts_wire protocol)."
+  c_info "Run tiers 2-4 on a Linux host for full enforcement validation."
+  T1_BUILD="build --release -p ts_checker -p ts_wire"
+  T1_TEST="test -p ts_checker -p ts_wire"
+fi
+if run_cargo $T1_BUILD >/dev/null 2>&1; then
   c_ok "release build succeeded"
 else
-  c_fail "release build failed; run 'cargo build --release' to see the error"
+  c_fail "release build failed; run 'cargo $T1_BUILD' to see the error"
   mark T1 FAIL
 fi
-T1_OUT="$(run_cargo test --workspace 2>&1)"
+T1_OUT="$(run_cargo $T1_TEST 2>&1)"
 echo "$T1_OUT" | grep -E "test result:" | sed 's/^/         /'
 if echo "$T1_OUT" | grep -q "test result: FAILED"; then
   c_fail "one or more test suites failed"
@@ -159,7 +190,7 @@ else
     && install -m 0644 bpf/lsm/*.o /usr/lib/jinnguard/lsm/ \
     || { c_fail "LSM object build/install failed"; mark T4 FAIL; }
 
-  if [[ "${RESULT[T4]:-}" != "FAIL" ]]; then
+  if [[ "$(res T4)" != "FAIL" ]]; then
     c_info "building enterprise daemon (as $CARGO_USER)..."
     run_cargo build --features enterprise >/tmp/jg-prof-build.log 2>&1 || { c_fail "enterprise build failed (see /tmp/jg-prof-build.log)"; mark T4 FAIL; }
   fi
@@ -168,7 +199,7 @@ else
   # PATH, not root's) and run the compiled binary directly as root. The test
   # itself needs root for BPF + cgroup setup, but needs no cargo at run time.
   TEST_BIN=""
-  if [[ "${RESULT[T4]:-}" != "FAIL" ]]; then
+  if [[ "$(res T4)" != "FAIL" ]]; then
     c_info "building kernel allow/deny test binary (as $CARGO_USER)..."
     if run_cargo test --features enterprise --test kernel_lsm --no-run >/tmp/jg-prof-testbuild.log 2>&1; then
       TEST_BIN="$(find "$REPO_ROOT/target/debug/deps" -maxdepth 1 -type f -executable -name 'kernel_lsm-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
@@ -178,7 +209,7 @@ else
     fi
   fi
 
-  if [[ "${RESULT[T4]:-}" != "FAIL" ]]; then
+  if [[ "$(res T4)" != "FAIL" ]]; then
     BIN="$REPO_ROOT/target/debug/ts_cli"
     c_info "running the project's kernel allow/deny suite (10-min watchdog)..."
     # A hard timeout guarantees enforcement is removed even if a test hangs.
@@ -199,10 +230,10 @@ fi
 c_hdr "Summary"
 overall=0
 for t in T1 T2 T3 T4; do
-  case "${RESULT[$t]:-SKIP}" in
+  case "$(res "$t")" in
     PASS) printf '  \033[1;32m%-4s PASS\033[0m\n' "$t" ;;
     FAIL) printf '  \033[1;31m%-4s FAIL\033[0m\n' "$t"; overall=1 ;;
-    SKIP) printf '  \033[1;33m%-4s SKIP\033[0m\n' "$t" ;;
+    *)    printf '  \033[1;33m%-4s SKIP\033[0m\n' "$t" ;;
   esac
 done
 echo

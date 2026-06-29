@@ -199,7 +199,7 @@ Kernel Layer (eBPF)
 | Crate / Directory | Purpose |
 |---|---|
 | `ts_cli/` | Main daemon — UDS listener, enforcement pipeline, audit logger |
-| `ts_checker/` | Z3 SMT policy engine — state transition proofs + declarative invariants |
+| `ts_checker/` | Z3 SMT policy engine — bounded risk-ceiling + declarative-invariant satisfiability checks (sound on its inputs; scope and limits in [THREAT_MODEL §8](THREAT_MODEL.md)) |
 | `jinnguard_py/` | Python SDK for agent integration |
 | `bpf/` | eBPF C programs (execve, openat, connect, cap_capable) + Makefile |
 | `deploy/` | systemd unit + `install.sh` provisioner |
@@ -279,6 +279,36 @@ Validated on three distributions / three kernel generations: **Debian 13 / kerne
 6.12** ([`BENCHMARKS-01.md`](BENCHMARKS-01.md), [`BENCHMARKS-02.md`](BENCHMARKS-02.md)),
 **Ubuntu 24.04 / kernel 6.17** ([`BENCHMARKS-03.md`](BENCHMARKS-03.md)), and
 **AlmaLinux 9 / kernel 5.14 under SELinux Enforcing** ([`BENCHMARKS-04.md`](BENCHMARKS-04.md)).
+
+---
+
+## What Jinn Guard guarantees today — vs roadmap
+
+A single, deliberately conservative split of **what is enforced now** from **what is
+aspirational**, by plane. The distinction that matters: the *kernel floor* holds even
+if the daemon is dead or bypassed; the *user-space gate* only acts while the daemon is
+in the request path. Read this alongside [THREAT_MODEL §8](THREAT_MODEL.md) (what the
+Z3 step does and does **not** prove) and Known Limitations below.
+
+| Capability | Plane | Status today |
+|---|---|---|
+| Cgroup-scoped allow/deny on `execve`/`connect`/`sendmsg`/`inode_create`/`inode_unlink` | **Kernel floor** (holds without daemon) | ✅ Enforced |
+| Fail-closed decisions — Z3 `Unknown`/timeout → DENY; bad signature / replay → reject | Kernel floor + user-space | ✅ Enforced |
+| Tamper-evident audit ledger — SHA-256 hash chain, in-repo verifier, crypto-shredding | User-space | ✅ Enforced |
+| Release provenance — SLSA v3 + cosign keyless signatures on tagged builds | Build/release | ✅ Enforced |
+| Semantic risk assessment — keyword/intent heuristic (+ optional external scorer) | User-space (cooperative) | ✅ Active, heuristic-primary |
+| Bounded SMT checks — risk-ceiling arithmetic + invariant satisfiability | User-space (cooperative) | ✅ Active; *sound on its inputs, not a proof of the risk oracle* — [THREAT_MODEL §8](THREAT_MODEL.md) |
+| Per-action signed provenance manifests (C2PA-style, prev-hash linked) | User-space | 🚧 Roadmap (JG #62) |
+| External transparency-log anchoring of audit checkpoints | User-space | 🚧 Roadmap (JG #62) |
+| Bit-for-bit reproducible builds | Build/release | 🚧 Roadmap (JG #46) |
+| Full cross-mount path *strings* in the audit log (`bpf_d_path`) | Kernel floor | 🚧 Roadmap (enforcement already mount-safe — see Known Limitations) |
+| OpenTelemetry/OTLP metric export | User-space | 🚧 Roadmap (JG #11) |
+
+> **Why this table exists.** An external review noted that earlier wording could read
+> as if user-space semantic verdicts were kernel-enforced. They are two planes: the
+> kernel floor is deterministic and map-driven; the semantic/risk/SMT layer is a
+> cooperative user-space gate. Both are real; only the kernel floor survives a dead or
+> bypassed daemon.
 
 ---
 

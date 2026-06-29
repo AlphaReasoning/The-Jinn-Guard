@@ -9,6 +9,24 @@ validated research prototype / controlled-pilot MVP; see
 Operability and review-driven hardening (moving toward pilot-ready).
 
 ### Added
+- **"Guarantees today vs roadmap" table (external-audit follow-up).** README now
+  carries a single conservative table splitting *enforced-now* capabilities by
+  plane — the deterministic kernel floor (holds even if the daemon is dead or
+  bypassed) vs the cooperative user-space semantic/risk/SMT gate — from roadmap
+  items (per-action signed manifests JG #62, transparency anchoring, reproducible
+  builds JG #46, OTLP export JG #11). Directly answers an independent review note
+  that earlier wording could read as if user-space verdicts were kernel-enforced.
+- **Z3 component wording calibrated.** The `ts_checker` row in the README
+  Components table no longer says "state transition proofs"; it now reads
+  "bounded risk-ceiling + declarative-invariant satisfiability checks (sound on
+  its inputs)" and links to THREAT_MODEL §8, the lone residual overstatement
+  flagged by the external review.
+- **Portable validation harness.** `scripts/run_professor_validation.sh` now runs
+  on macOS's stock bash 3.2 (replaced the bash-4 associative array with indirect
+  per-tier variables), auto-exports Homebrew Z3/libclang paths on Darwin so
+  `ts_checker` links, scopes Tier 1 to the portable crates (`ts_checker`,
+  `ts_wire`) on non-Linux hosts, and fails fast if it cannot enter the repo root —
+  so an evaluator on a Mac gets a green Tier 1 instead of a link error.
 - **Residual risk register.** Added [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md)
   as the concise operator-facing inventory of open, partially mitigated, and
   out-of-scope risks, with an explicit release claim boundary to prevent
