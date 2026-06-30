@@ -1387,7 +1387,16 @@ impl AuditLogger {
         let conn =
             rusqlite::Connection::open(&db_path).expect("AuditLogger: failed to open SQLite DB");
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS audit_log (
+            // JG-RT L1 (crypto-shred): `secure_delete = ON` makes SQLite overwrite
+            // deleted content with zeros in-place, so a GDPR Art. 17 erasure of the
+            // `audit_pii` rows actually removes the plaintext PII from the on-disk
+            // file rather than leaving it recoverable in freed pages. Persisted on
+            // the database so it survives reopen. NOTE: this is *secure erasure*
+            // (plaintext wipe), not key-destruction cryptographic shredding — the
+            // PII columns are stored in cleartext; see THREAT_MODEL for the
+            // distinction. Set before the schema so it governs all later deletes.
+            "PRAGMA secure_delete = ON;
+            CREATE TABLE IF NOT EXISTS audit_log (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 idx            INTEGER,
                 timestamp_secs INTEGER,
@@ -1733,6 +1742,28 @@ impl AuditLogger {
             }
             prev = entry.hash.clone();
             count += 1;
+        }
+        // Fail-closed (JG-RT L2): walking an empty or missing JSONL file alone
+        // verifies "cleanly" (zero links, nothing to break), so deleting or
+        // truncating the chain used to report intact=true and keep the tamper
+        // gauge green — the exact evidence-destruction an attacker wants. The
+        // durable SQLite `audit_log` table independently records every committed
+        // entry, so a JSONL chain shorter than the recorded count means the file
+        // was truncated or removed: treat it as NOT intact.
+        let db_count: i64 = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+            conn.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        if (count as i64) < db_count {
+            return Ok(ChainVerification {
+                entries: count,
+                intact: false,
+                first_broken_index: Some(count as u64),
+            });
         }
         Ok(ChainVerification {
             entries: count,
@@ -2740,6 +2771,96 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_erasure_actually_wipes_plaintext_from_disk() {
+        // JG-RT verification L1 (DISCLOSURE-CRITICAL): the #61 guarantee is marketed
+        // as GDPR Art. 17 "crypto-shredding". Erasure must remove the plaintext PII
+        // from the on-disk store, not merely unlink the row logically. Without
+        // `PRAGMA secure_delete`, a row DELETE leaves the cell bytes intact in freed
+        // pages, so the "shredded" PII is still recoverable by reading the raw file.
+        let path = "/tmp/test_audit_shred_disk.log";
+        let db_path = format!("{path}.db");
+        for p in [
+            path.to_string(),
+            db_path.clone(),
+            format!("{db_path}-wal"),
+            format!("{db_path}-shm"),
+        ] {
+            let _ = fs::remove_file(&p);
+        }
+
+        {
+            let logger = AuditLogger::new(path);
+            let obs = pii_observation(4242);
+            let (intent, assessment, decision) = audit_inputs(&obs);
+            logger.log(&obs, &intent, &assessment, &decision).unwrap();
+
+            let subject = logger.pseudonym_for_uid(4242);
+            assert_eq!(logger.read_subject_pii(&subject).unwrap().len(), 1);
+            // Erase (GDPR Art. 17).
+            assert_eq!(logger.erase_subject(&subject).unwrap(), 1);
+            assert!(logger.read_subject_pii(&subject).unwrap().is_empty());
+        } // drop the logger so SQLite flushes to disk.
+
+        // Now read the raw on-disk database (plus any WAL) and confirm the
+        // plaintext PII is gone. If it is still present, "crypto-shred" is a
+        // logical DELETE only and the data is forensically recoverable.
+        let mut bytes = fs::read(&db_path).unwrap();
+        if let Ok(wal) = fs::read(format!("{db_path}-wal")) {
+            bytes.extend_from_slice(&wal);
+        }
+        for needle in ["hunter2", "/home/alice/secret-tool"] {
+            let recoverable = bytes
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes());
+            assert!(
+                !recoverable,
+                "plaintext PII '{needle}' is still recoverable from the raw DB after \
+                 erasure — 'crypto-shredding' is only a logical row DELETE"
+            );
+        }
+
+        for p in [path.to_string(), db_path.clone(), format!("{db_path}-wal")] {
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn verify_chain_fails_closed_when_log_deleted_after_entries() {
+        // JG-RT verification L2 (DISCLOSURE-CRITICAL): the public validator invites
+        // reviewers to corrupt the log and watch the chain catch it. But an attacker
+        // who *deletes* (or truncates) the JSONL chain erases the evidence entirely —
+        // and `verify_chain` walked an empty/missing file cleanly, returning
+        // intact=true, which drives the tamper-evidence health gauge GREEN. The
+        // durable SQLite store still records how many entries were committed, so a
+        // shorter-than-recorded chain must fail CLOSED.
+        let path = "/tmp/test_verify_chain_deleted.log";
+        let db_path = format!("{path}.db");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
+
+        let logger = AuditLogger::new(path);
+        let obs = pii_observation(4242);
+        let (intent, assessment, decision) = audit_inputs(&obs);
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+        assert!(
+            logger.verify_chain().unwrap().intact,
+            "freshly written chain should verify"
+        );
+
+        // Attacker removes the audit log to destroy evidence of tampering.
+        fs::remove_file(path).unwrap();
+        let v = logger.verify_chain().unwrap();
+        assert!(
+            !v.intact,
+            "a deleted audit log must NOT report intact (fail-open lets an attacker \
+             erase the chain and keep the tamper gauge green); got {v:?}"
+        );
+
         let _ = fs::remove_file(&db_path);
     }
 

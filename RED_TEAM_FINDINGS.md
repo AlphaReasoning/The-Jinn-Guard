@@ -385,10 +385,78 @@ checkout and artifact handling.
   `contents: read`. The release workflow already used explicit per-job write/OIDC
   permissions only where publishing and signing require them.
 
+## Batch 23 — #59 capstone verification round (post #61/#62 surface)
+
+Verification pass over six high-signal leads from the interrupted Round 1. Each
+was reproduced before fixing (failing-first regression test). JG-RT-026 is
+reserved for the manifest pinned-key fix on the still-open PR #54.
+
+### JG-RT-027 — GDPR "crypto-shred" erasure left plaintext PII recoverable on disk (MED, fixed)
+`AuditLogger::erase_subject` removed a subject's `audit_pii` rows with a plain
+SQLite `DELETE`. Without `PRAGMA secure_delete`, the deleted cell bytes remained
+in freed pages, so the "shredded" plaintext PII (executable path, argv) was still
+recoverable by reading the raw `.db` file after erasure reported success.
+- **Repro:** `audit_erasure_actually_wipes_plaintext_from_disk` — logs PII, erases
+  it, then greps the raw on-disk DB and finds `hunter2` / `/home/alice/secret-tool`.
+- **Fix:** `governance.rs` opens the DB with `PRAGMA secure_delete = ON`, so the
+  erase overwrites freed content with zeros in place. Test now passes.
+- **Honesty note (disclosure):** this is *secure erasure* (plaintext wipe), NOT
+  key-destruction cryptographic shredding — the PII columns are stored in
+  cleartext, never encrypted under a per-record key. The "crypto-shredding" claim
+  in #61 docs/THREAT_MODEL should be re-worded accordingly; a reviewer validated
+  the original framing, so this is a disclosure-relevant correction.
+
+### JG-RT-028 — verify_chain() failed OPEN on a deleted/truncated audit log (MED, fixed)
+`verify_chain()` read the JSONL chain with `unwrap_or_default()`; a missing or
+empty file walked cleanly and returned `intact=true, entries=0`, driving the
+tamper-evidence health gauge GREEN. An attacker who deletes the log to destroy
+evidence was reported as "intact". (Tamper *within* a populated log was already
+caught — only the absent/truncated case failed open.)
+- **Repro:** `verify_chain_fails_closed_when_log_deleted_after_entries` — logs two
+  entries, deletes the JSONL, observes `intact=true` before the fix.
+- **Fix:** `verify_chain()` cross-checks the walked line count against the durable
+  SQLite `audit_log` row count; a JSONL shorter than the committed count is
+  reported `intact=false`. Test now passes.
+
+### JG-RT-029 — Z3 invariant i32 saturation let an out-of-range value pass a `<=` check (LOW-MED, fixed)
+`PolicyEngine::verify_policy_invariants` scaled operands with `(v * 1e6) as i32`.
+Values whose scaled form exceeded i32 (`|v| ≳ 2147.48`) saturated to `i32::MAX`,
+so two distinct large operands compared equal and an out-of-range value passed a
+`<=`/`>=` check it should fail (fail-open). Reachable via caller-supplied
+`context_vars` (e.g. through the MCP gateway) when an invariant is authored over a
+caller-influenced variable; the daemon-guaranteed risk variables are all bounded
+well inside the range, which limits real-world reach.
+- **Repro:** `invariant_large_value_does_not_saturate_fail_open` and
+  `invariant_two_distinct_huge_values_are_not_conflated` (ts_checker).
+- **Fix:** out-of-range or non-finite operands are now rejected as a DENY
+  (fail-closed) before the cast, instead of being silently clamped.
+
+### Leads NOT fixed this round (left in the verification table for review)
+- **JG-RT (L3) MCP gateway app-layer replay — LIKELY, repro pending.** The MCP
+  gateway derives `sequence_counter` from the *server* clock (`mcp_gateway.rs:394`)
+  and discards the `validate_sequence` result (`:646`, `let _ = lineage_ok`), and
+  does not use the enforced `ReplayGuard` nonce store that the main wire daemon
+  uses (JG-RT-002). Source is unambiguous, but no live-gateway replay was executed,
+  so it is recorded LIKELY pending a runtime harness. A correct fix needs a
+  client-supplied nonce, not just un-discarding the server-clock value.
+- **Weak-RNG clock-seeded fallback — LIKELY, contrived reachability.** Both
+  `os_random_bytes` (audit salt) and `os_random_32` (#62 manifest seed) downgrade
+  to a deterministic clock-derived value if `/dev/urandom` is unavailable. Correct
+  behavior is fail-closed. Only reachable when `/dev/urandom` cannot be opened
+  (minimal/broken container, seccomp, fd exhaustion); left for a scoped fail-closed
+  fix.
+- **Startup policy load fails OPEN to a permissive default** (`main.rs:374-393`):
+  a missing/unreadable/malformed policy at startup yields
+  `deny_anonymous_agents=false`, boundary 75 — asymmetric with the fail-safe
+  *reload* path. Deliberate dev-ergonomics behavior; flagged for a
+  production fail-closed decision.
+
 ## Closeout
 
 - Internal red-team batches JG-RT-001 through JG-RT-025 are fixed or explicitly
-  documented as defense-in-depth residuals.
+  documented as defense-in-depth residuals. JG-RT-026 (manifest pinned-key) is on
+  open PR #54; JG-RT-027..029 (capstone verification round) are fixed on
+  `redteam-verify` with failing-first regression tests.
 - Post-merge real-kernel validation passed on the supported self-hosted matrix:
   Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /
   kernel 5.14. The AlmaLinux timeout accounting fix in PR #33 preserved hard
