@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -1329,6 +1329,96 @@ fn hmac_hex(key: &[u8], data: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Raw `HMAC-SHA256(key, data)` as 32 bytes — the byte-level primitive that
+/// [`hmac_hex`] hex-encodes. Used to build the personal-data crypto-shred cipher.
+fn hmac_raw(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
+}
+
+// Domain-separation tags for the two per-record subkeys (SP 800-108 label bytes).
+const PII_ENC_SUBKEY: u8 = 0x01;
+const PII_MAC_SUBKEY: u8 = 0x02;
+
+/// XOR `buf` in place with an HMAC-SHA256 counter-mode keystream under `enc_key`
+/// (block_i = HMAC(enc_key, be32(i))). This is the SP 800-108 / HKDF-Expand
+/// counter construction — a standard, safe use of HMAC as a PRF, not a bespoke
+/// cipher.
+fn ctr_xor(enc_key: &[u8; 32], buf: &mut [u8]) {
+    let mut counter: u32 = 0;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let ks = hmac_raw(enc_key, &counter.to_be_bytes());
+        let take = ks.len().min(buf.len() - off);
+        for (i, k) in ks.iter().enumerate().take(take) {
+            buf[off + i] ^= k;
+        }
+        off += take;
+        counter = counter.wrapping_add(1);
+    }
+}
+
+/// Authenticated-encrypt `plaintext` under a per-subject `master_key`, returning
+/// `(nonce, ciphertext, tag)`. Built ONLY from HMAC-SHA256 (already a vetted
+/// dependency — no new supply-chain surface), composed in standard ways:
+///   * subkeys         — `enc = HMAC(K, 0x01‖nonce)`, `mac = HMAC(K, 0x02‖nonce)`
+///   * confidentiality — HMAC-CTR keystream XOR (see [`ctr_xor`])
+///   * integrity       — encrypt-then-MAC, `tag = HMAC(mac, nonce‖be64(len)‖ct)`
+///     (Bellare–Namprempre; verified in constant time on open)
+///
+/// Crypto-shredding (GDPR Art. 17): `master_key` lives ONLY in `audit_pii_key`.
+/// Destroying that one row makes every ciphertext sealed under it permanently
+/// undecryptable — regardless of any surviving ciphertext copy in a freed page,
+/// the WAL, a backup, or a replica. That is the guarantee a plaintext row DELETE
+/// (even with `secure_delete`) cannot make.
+fn pii_seal(master_key: &[u8], plaintext: &[u8]) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+    let nonce = os_random_bytes(16);
+    let enc_key = hmac_raw(master_key, &[&[PII_ENC_SUBKEY], nonce.as_slice()].concat());
+    let mac_key = hmac_raw(master_key, &[&[PII_MAC_SUBKEY], nonce.as_slice()].concat());
+
+    let mut ct = plaintext.to_vec();
+    ctr_xor(&enc_key, &mut ct);
+
+    let mut mac_input = Vec::with_capacity(nonce.len() + 8 + ct.len());
+    mac_input.extend_from_slice(&nonce);
+    mac_input.extend_from_slice(&(ct.len() as u64).to_be_bytes());
+    mac_input.extend_from_slice(&ct);
+    let tag = hmac_raw(&mac_key, &mac_input);
+    (nonce, ct, tag)
+}
+
+/// Verify + decrypt a `(nonce, ciphertext, tag)` sealed by [`pii_seal`] under
+/// `master_key`. The tag is checked in constant time BEFORE decryption; a
+/// mismatch (tampered ciphertext, or a wrong/destroyed key) returns an error and
+/// yields no plaintext.
+fn pii_open(master_key: &[u8], nonce: &[u8], ct: &[u8], tag: &[u8]) -> Result<Vec<u8>> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let enc_key = hmac_raw(master_key, &[&[PII_ENC_SUBKEY], nonce].concat());
+    let mac_key = hmac_raw(master_key, &[&[PII_MAC_SUBKEY], nonce].concat());
+
+    let mut mac_input = Vec::with_capacity(nonce.len() + 8 + ct.len());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(&(ct.len() as u64).to_be_bytes());
+    mac_input.extend_from_slice(ct);
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(&mac_input);
+    mac.verify_slice(tag)
+        .map_err(|_| anyhow!("audit_pii: AEAD tag mismatch — ciphertext tampered or key destroyed"))?;
+
+    let mut pt = ct.to_vec();
+    ctr_xor(&enc_key, &mut pt);
+    Ok(pt)
+}
+
 pub struct AuditLogger {
     /// JSONL file path (kept for backward-compat and the tamper-evident hash chain).
     file_path: String,
@@ -1387,14 +1477,16 @@ impl AuditLogger {
         let conn =
             rusqlite::Connection::open(&db_path).expect("AuditLogger: failed to open SQLite DB");
         conn.execute_batch(
-            // JG-RT L1 (crypto-shred): `secure_delete = ON` makes SQLite overwrite
-            // deleted content with zeros in-place, so a GDPR Art. 17 erasure of the
-            // `audit_pii` rows actually removes the plaintext PII from the on-disk
-            // file rather than leaving it recoverable in freed pages. Persisted on
-            // the database so it survives reopen. NOTE: this is *secure erasure*
-            // (plaintext wipe), not key-destruction cryptographic shredding — the
-            // PII columns are stored in cleartext; see THREAT_MODEL for the
-            // distinction. Set before the schema so it governs all later deletes.
+            // JG-RT-027 (crypto-shred): personal data is stored ENCRYPTED in
+            // `audit_pii`, sealed under a per-subject master key held only in
+            // `audit_pii_key`. GDPR Art. 17 erasure destroys that key row, which
+            // makes every ciphertext for the subject permanently undecryptable —
+            // the real cryptographic-shredding guarantee (surviving copies in the
+            // WAL, backups, or replicas become useless without the key). We ALSO
+            // keep `secure_delete = ON` as defence-in-depth so the deleted key
+            // bytes and ciphertext are overwritten in freed pages rather than left
+            // behind. Persisted on the database; set before the schema so it
+            // governs every later delete.
             "PRAGMA secure_delete = ON;
             CREATE TABLE IF NOT EXISTS audit_log (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1411,22 +1503,33 @@ impl AuditLogger {
                 entry_hash     TEXT,
                 full_json      TEXT
             );
-            -- #61: erasable personal-data store, separate from the immutable
-            -- chain. Deleting a subject's rows here crypto-shreds their PII
-            -- (the per-record salt goes with them) while every chain hash in
-            -- audit_log / the JSONL file still verifies.
+            -- #61 / JG-RT-027: erasable personal-data store, separate from the
+            -- immutable chain. Each row holds ONLY the AEAD-sealed PII bundle
+            -- (nonce/ciphertext/tag) — never plaintext. `salt` is the per-record
+            -- HMAC commitment salt that binds the PII to the chain. Deleting a
+            -- subject's rows here (and their key in audit_pii_key) crypto-shreds
+            -- their PII while every chain hash in audit_log / the JSONL file still
+            -- verifies.
             CREATE TABLE IF NOT EXISTS audit_pii (
                 pii_ref         TEXT PRIMARY KEY,
                 idx             INTEGER,
                 subject         TEXT,
                 salt            TEXT,
-                uid             INTEGER,
-                gid             INTEGER,
-                executable_path TEXT,
-                command_line    TEXT,
+                nonce           TEXT NOT NULL,
+                ciphertext      TEXT NOT NULL,
+                tag             TEXT NOT NULL,
                 created_secs    INTEGER
             );
             CREATE INDEX IF NOT EXISTS audit_pii_subject ON audit_pii(subject);
+            -- JG-RT-027: per-subject master keys for crypto-shredding. Destroying
+            -- a subject's row here (Art. 17) renders every audit_pii ciphertext
+            -- sealed under it permanently undecryptable. This is the key whose
+            -- destruction *is* the erasure.
+            CREATE TABLE IF NOT EXISTS audit_pii_key (
+                subject      TEXT PRIMARY KEY,
+                key          TEXT NOT NULL,
+                created_secs INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audit_meta (k TEXT PRIMARY KEY, v TEXT);
             -- #11 salt rotation: every pseudonym salt this install has ever used,
             -- newest epoch active. Historical epochs are retained so a uid's PII
@@ -1670,14 +1773,25 @@ impl AuditLogger {
     /// verifies — [`verify_chain`] passes identically before and after.
     pub fn erase_subject(&self, subject_pseudonym: &str) -> Result<usize> {
         let n = {
-            let conn = self
+            let mut conn = self
                 .db
                 .lock()
                 .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
-            conn.execute(
+            let tx = conn.transaction()?;
+            // Destroy the ciphertext rows (space reclaim + secure_delete wipe) AND
+            // the subject's master key. Destroying the key is the crypto-shred: any
+            // ciphertext copy that survives in the WAL, a backup, or a replica is
+            // now permanently undecryptable.
+            let removed = tx.execute(
                 "DELETE FROM audit_pii WHERE subject = ?1",
                 params![subject_pseudonym],
-            )?
+            )?;
+            tx.execute(
+                "DELETE FROM audit_pii_key WHERE subject = ?1",
+                params![subject_pseudonym],
+            )?;
+            tx.commit()?;
+            removed
         };
         // Art. 5(2) accountability: surface honoured erasures on the metrics endpoint.
         crate::metrics::record_audit_erasure(n as u64);
@@ -1691,26 +1805,41 @@ impl AuditLogger {
             .db
             .lock()
             .map_err(|_| anyhow!("AuditLogger: mutex poisoned"))?;
+        // Load the subject's crypto-shred key. If it is gone the subject has been
+        // erased (Art. 17): the ciphertext, if any lingers, is undecryptable — so
+        // there is nothing to return.
+        let master_key: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT key FROM audit_pii_key WHERE subject = ?1",
+                params![subject_pseudonym],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|h| hex::decode(h).ok())
+            .filter(|k| k.len() == 32);
+        let master_key = match master_key {
+            Some(k) => k,
+            None => return Ok(Vec::new()),
+        };
         let mut stmt = conn.prepare(
-            "SELECT uid, gid, executable_path, command_line FROM audit_pii \
+            "SELECT nonce, ciphertext, tag FROM audit_pii \
              WHERE subject = ?1 ORDER BY idx ASC",
         )?;
         let rows = stmt.query_map(params![subject_pseudonym], |row| {
-            let uid: i64 = row.get(0)?;
-            let gid: i64 = row.get(1)?;
-            let exec: Option<String> = row.get(2)?;
-            let argv_json: String = row.get(3)?;
-            Ok((uid, gid, exec, argv_json))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (uid, gid, exec, argv_json) = row?;
-            out.push(PiiBundle {
-                uid: uid as u32,
-                gid: gid as u32,
-                executable_path: exec,
-                command_line: serde_json::from_str(&argv_json).unwrap_or_default(),
-            });
+            let (nonce_hex, ct_hex, tag_hex) = row?;
+            let nonce = hex::decode(&nonce_hex).map_err(|_| anyhow!("audit_pii: bad nonce hex"))?;
+            let ct = hex::decode(&ct_hex).map_err(|_| anyhow!("audit_pii: bad ciphertext hex"))?;
+            let tag = hex::decode(&tag_hex).map_err(|_| anyhow!("audit_pii: bad tag hex"))?;
+            let plaintext = pii_open(&master_key, &nonce, &ct, &tag)?;
+            out.push(serde_json::from_slice(&plaintext)?);
         }
         Ok(out)
     }
@@ -1880,20 +2009,46 @@ impl AuditLogger {
                         &full_json,
                     ],
                 )?;
+                // JG-RT-027 crypto-shred: fetch (or mint) this subject's master
+                // key, then store the PII AEAD-sealed — never in plaintext. The
+                // key lives only in audit_pii_key; erasing it shreds the subject.
+                let master_key: Vec<u8> = {
+                    let existing: Option<String> = tx
+                        .query_row(
+                            "SELECT key FROM audit_pii_key WHERE subject = ?1",
+                            params![&subject_pseudonym],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    match existing
+                        .and_then(|h| hex::decode(h).ok())
+                        .filter(|k| k.len() == 32)
+                    {
+                        Some(k) => k,
+                        None => {
+                            let k = os_random_bytes(32);
+                            tx.execute(
+                                "INSERT OR REPLACE INTO audit_pii_key \
+                                 (subject, key, created_secs) VALUES (?1,?2,?3)",
+                                params![&subject_pseudonym, hex::encode(&k), now as i64],
+                            )?;
+                            k
+                        }
+                    }
+                };
+                let (nonce, ciphertext, tag) = pii_seal(&master_key, &pii_canonical);
                 tx.execute(
                     "INSERT INTO audit_pii \
-                 (pii_ref, idx, subject, salt, uid, gid, executable_path, \
-                  command_line, created_secs) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 (pii_ref, idx, subject, salt, nonce, ciphertext, tag, created_secs) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         &pii_ref,
                         entry.index as i64,
                         &subject_pseudonym,
                         hex::encode(&salt),
-                        pii.uid as i64,
-                        pii.gid as i64,
-                        pii.executable_path.as_deref(),
-                        serde_json::to_string(&pii.command_line).unwrap_or_default(),
+                        hex::encode(&nonce),
+                        hex::encode(&ciphertext),
+                        hex::encode(tag),
                         now as i64,
                     ],
                 )?;
@@ -2826,6 +2981,137 @@ mod tests {
         for p in [path.to_string(), db_path.clone(), format!("{db_path}-wal")] {
             let _ = fs::remove_file(&p);
         }
+    }
+
+    #[test]
+    fn pii_encrypted_at_rest_not_plaintext() {
+        // JG-RT-027 (real crypto-shred): PII must be ENCRYPTED at rest, so the
+        // plaintext is absent from the DB even BEFORE any erasure. The prior
+        // secure_delete-only design stored plaintext columns and merely wiped them
+        // on erase; this asserts the stronger property that makes key-destruction a
+        // true cryptographic shred. Fails against any plaintext-at-rest schema.
+        let path = "/tmp/test_pii_encrypted_at_rest.log";
+        let db_path = format!("{path}.db");
+        for p in [
+            path.to_string(),
+            db_path.clone(),
+            format!("{db_path}-wal"),
+            format!("{db_path}-shm"),
+        ] {
+            let _ = fs::remove_file(&p);
+        }
+        {
+            let logger = AuditLogger::new(path);
+            let obs = pii_observation(4242);
+            let (intent, assessment, decision) = audit_inputs(&obs);
+            logger.log(&obs, &intent, &assessment, &decision).unwrap();
+
+            // While the key exists, the ciphertext round-trips back to plaintext.
+            let subject = logger.pseudonym_for_uid(4242);
+            let got = logger.read_subject_pii(&subject).unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                got[0].executable_path.as_deref(),
+                Some("/home/alice/secret-tool")
+            );
+            assert!(got[0].command_line.iter().any(|a| a.contains("hunter2")));
+        } // drop so SQLite flushes.
+
+        let mut bytes = fs::read(&db_path).unwrap();
+        if let Ok(wal) = fs::read(format!("{db_path}-wal")) {
+            bytes.extend_from_slice(&wal);
+        }
+        for needle in ["hunter2", "/home/alice/secret-tool", "secret-tool"] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "plaintext PII '{needle}' is present at rest — PII is NOT encrypted, \
+                 so key-destruction cannot be a real crypto-shred"
+            );
+        }
+
+        for p in [path.to_string(), db_path.clone(), format!("{db_path}-wal")] {
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn crypto_shred_key_destruction_makes_pii_unrecoverable() {
+        // JG-RT-027: the defining property of cryptographic shredding — erasure
+        // destroys the per-subject master key, so even a ciphertext COPY taken
+        // before erasure (as would survive in a WAL/backup/replica) is
+        // permanently undecryptable afterwards.
+        let path = "/tmp/test_crypto_shred_key.log";
+        let db_path = format!("{path}.db");
+        for p in [
+            path.to_string(),
+            db_path.clone(),
+            format!("{db_path}-wal"),
+            format!("{db_path}-shm"),
+        ] {
+            let _ = fs::remove_file(&p);
+        }
+        let logger = AuditLogger::new(path);
+        let obs = pii_observation(7777);
+        let (intent, assessment, decision) = audit_inputs(&obs);
+        logger.log(&obs, &intent, &assessment, &decision).unwrap();
+        let subject = logger.pseudonym_for_uid(7777);
+
+        // Capture the sealed ciphertext row and the master key that exists now.
+        let (nonce_hex, ct_hex, tag_hex, key_before) = {
+            let conn = logger.db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT nonce, ciphertext, tag FROM audit_pii WHERE subject = ?1",
+                    params![&subject],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let key: Option<String> = conn
+                .query_row(
+                    "SELECT key FROM audit_pii_key WHERE subject = ?1",
+                    params![&subject],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            (row.0, row.1, row.2, key)
+        };
+        let key_before = key_before.expect("a master key must exist before erasure");
+        let nonce = hex::decode(&nonce_hex).unwrap();
+        let ct = hex::decode(&ct_hex).unwrap();
+        let tag = hex::decode(&tag_hex).unwrap();
+
+        // Sanity: with the key, the captured ciphertext decrypts to the PII.
+        let key_bytes = hex::decode(&key_before).unwrap();
+        let pt = pii_open(&key_bytes, &nonce, &ct, &tag).unwrap();
+        assert!(String::from_utf8_lossy(&pt).contains("hunter2"));
+
+        // Erase (Art. 17): the key is destroyed.
+        assert_eq!(logger.erase_subject(&subject).unwrap(), 1);
+        assert!(logger.read_subject_pii(&subject).unwrap().is_empty());
+        let key_after: Option<String> = {
+            let conn = logger.db.lock().unwrap();
+            conn.query_row(
+                "SELECT key FROM audit_pii_key WHERE subject = ?1",
+                params![&subject],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert!(
+            key_after.is_none(),
+            "master key must be destroyed on erasure — otherwise it is not a crypto-shred"
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]

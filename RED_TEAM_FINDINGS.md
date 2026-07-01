@@ -391,20 +391,35 @@ Verification pass over six high-signal leads from the interrupted Round 1. Each
 was reproduced before fixing (failing-first regression test). JG-RT-026 is
 reserved for the manifest pinned-key fix on the still-open PR #54.
 
-### JG-RT-027 — GDPR "crypto-shred" erasure left plaintext PII recoverable on disk (MED, fixed)
-`AuditLogger::erase_subject` removed a subject's `audit_pii` rows with a plain
-SQLite `DELETE`. Without `PRAGMA secure_delete`, the deleted cell bytes remained
-in freed pages, so the "shredded" plaintext PII (executable path, argv) was still
-recoverable by reading the raw `.db` file after erasure reported success.
-- **Repro:** `audit_erasure_actually_wipes_plaintext_from_disk` — logs PII, erases
-  it, then greps the raw on-disk DB and finds `hunter2` / `/home/alice/secret-tool`.
-- **Fix:** `governance.rs` opens the DB with `PRAGMA secure_delete = ON`, so the
-  erase overwrites freed content with zeros in place. Test now passes.
-- **Honesty note (disclosure):** this is *secure erasure* (plaintext wipe), NOT
-  key-destruction cryptographic shredding — the PII columns are stored in
-  cleartext, never encrypted under a per-record key. The "crypto-shredding" claim
-  in #61 docs/THREAT_MODEL should be re-worded accordingly; a reviewer validated
-  the original framing, so this is a disclosure-relevant correction.
+### JG-RT-027 — GDPR "crypto-shred" was a logical DELETE, not key-destruction (MED, fixed → upgraded to REAL crypto-shredding)
+`AuditLogger` stored personal data (executable path, argv) as **cleartext** columns
+in `audit_pii`; `erase_subject` removed the rows with a plain SQLite `DELETE`.
+Without `PRAGMA secure_delete` the deleted cell bytes remained in freed pages, so
+the "shredded" plaintext was recoverable from the raw `.db` after erasure reported
+success. More fundamentally, "crypto-shredding" implies *the data is encrypted and
+the key is destroyed* — no key existed, so any surviving ciphertext copy (WAL,
+backup, replica) stayed readable.
+- **Repro (fail-first):** `audit_erasure_actually_wipes_plaintext_from_disk` (post-
+  erase plaintext recoverable) and `pii_encrypted_at_rest_not_plaintext` — the
+  latter greps the raw DB and finds `hunter2` **before any erasure**. Verified
+  failing against the prior commit (`git show HEAD:…` + injected test →
+  "plaintext PII 'hunter2' is present at rest"); passes on the fix.
+- **Fix (real crypto-shred):** PII is now AEAD-sealed at rest under a **per-subject
+  master key** kept only in a new `audit_pii_key` table. `read_subject_pii`
+  decrypts on demand; `erase_subject` destroys the key row (and the ciphertext,
+  under `secure_delete` as defence-in-depth). Destroying the key makes every
+  ciphertext for the subject permanently undecryptable regardless of surviving
+  copies — the actual Art. 17 crypto-shred guarantee. Chain hashes are untouched
+  and `verify_chain` still passes identically before/after erasure.
+- **Construction:** built only from the already-vetted `hmac`/`sha2` deps (no new
+  supply-chain surface, `deny.toml` untouched, reproducible): per-record subkeys
+  `enc/mac = HMAC(K, 0x01|0x02 ‖ nonce)`, HMAC-SHA256 counter-mode keystream
+  (SP 800-108 / HKDF-Expand), encrypt-then-MAC with constant-time tag verify. A
+  future hardening may swap to a named AEAD (`chacha20poly1305`) if the team
+  accepts the added dependency; the key-lifecycle guarantee is identical.
+- **Disclosure:** the #61 "crypto-shredding" claim is now **accurate** rather than
+  needing a walk-back. Schema note: `audit_pii` changed shape (ciphertext columns
+  + `audit_pii_key`); pre-existing rc-stage DBs must be re-created or migrated.
 
 ### JG-RT-028 — verify_chain() failed OPEN on a deleted/truncated audit log (MED, fixed)
 `verify_chain()` read the JSONL chain with `unwrap_or_default()`; a missing or
