@@ -487,6 +487,35 @@ JG-RT-028, but in the disclosure-critical external validator.
   and the signed-manifest verifier (`ts_cli manifest verify`) is authoritative. Both
   are now surfaced to the reviewer.
 
+### JG-RT-032 — system-process immunity granted on spoofable/attacker fields (HIGH userspace, fixed)
+`immunity_reason_for_observation` (main.rs:2281) emits `SIGNAL: ALLOW` and skips
+ALL risk/Z3/policy evaluation for "system processes", logging the action as
+`system_process_immunity`. It decided immunity from two attacker-controlled
+inputs: (a) `observation.command_line[0]` = `/proc/<pid>/cmdline` argv[0], which a
+process sets freely via execve (`argv[0]="bash"`), and (b) the client-supplied
+`proposed_action` payload (`ShellCommand{command:"bash -c ..."}`). Either let an
+authenticated governed agent obtain a rubber-stamp ALLOW with no risk evaluation.
+Total bypass in audit-only / userspace-only deployments (no kernel BPF-LSM floor
+as backstop); with the kernel floor it still defeats userspace mediation, the MCP
+path, and pollutes the audit trail. `path_is_immune` also basename-matches, so a
+renamed on-disk payload (`/home/agent/bash`) is immune — a harder residual, see
+below.
+- **Repro (CONFIRMED):** `immunity_ignores_spoofable_argv0` and
+  `immunity_ignores_client_supplied_proposed_action` — both previously granted
+  immunity, now denied; `immunity_still_honors_real_system_exe` confirms
+  anti-lockout is preserved.
+- **Fix:** immunity is now decided SOLELY by the kernel-attested `/proc/<pid>/exe`
+  path from SO_PEERCRED (`observation_is_immune`), never by `command_line` or the
+  proposed action. If `/proc/exe` is unreadable there is no trusted identity →
+  fail closed (no immunity, normal policy path). Anti-lockout for real system
+  binaries is unchanged (their real exe is in `IMMUNE_EXACT_PATHS`).
+- **RESIDUAL (open, JG-RT-032b):** `path_is_immune` still falls back to
+  basename-matching `IMMUNE_PROCESS_NAMES`, so a governed agent that execs a file
+  it literally named `bash`/`sh`/`cargo`/`systemd` (real /proc/exe basename) is
+  immune. Closing it means dropping the basename fallback for the exe check, which
+  touches the anti-lockout core and MUST be validated against real desktop lockout
+  (Xfce/lightdm) before shipping — deferred, not fixed this pass.
+
 ### Leads NOT fixed this round (left in the verification table for review)
 - **JG-RT (L3) MCP gateway app-layer replay — LIKELY, repro pending.** The MCP
   gateway derives `sequence_counter` from the *server* clock (`mcp_gateway.rs:394`)
