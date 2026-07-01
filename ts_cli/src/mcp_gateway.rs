@@ -8,10 +8,10 @@
 //! 5. **ALLOW**: forward to upstream (`--mcp-upstream`) and stream the response back.
 //! 6. **DENY**: return HTTP 403 with the deny signal as the JSON body.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,64 @@ struct JsonRpcErrorObj {
 /// Derive a deterministic synthetic agent_id from the client IP address using
 /// an HMAC-SHA256 over the IP string.  This allows the governance pipeline to
 /// track per-IP behavioral lineage without requiring the caller to register.
+
+// ---------------------------------------------------------------------------
+// Per-gateway replay guard (JG-RT-L3)
+// ---------------------------------------------------------------------------
+
+/// Bounded FIFO nonce cache shared across all MCP connections on this gateway
+/// instance. Mirrors the UDS-path `ReplayGuard` in `main.rs`; defined here to
+
+/// avoid cross-module visibility coupling.
+pub(crate) struct McpReplayGuard {
+    seen: HashSet<(String, u64)>,
+    order: VecDeque<(String, u64)>,
+    cap: usize,
+}
+
+impl McpReplayGuard {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Returns `true` if the `(agent_id, nonce)` pair is NEW; `false` if it
+    /// has been seen within the current bounded window (→ replay).
+    fn observe(&mut self, key: (String, u64)) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        true
+    }
+}
+
+/// Maximum number of (agent_id, nonce) pairs retained in the MCP replay window.
+/// Same order-of-magnitude as the UDS `MAX_REPLAY_ENTRIES`.
+const MCP_MAX_REPLAY_ENTRIES: usize = 1 << 20;
+
+/// Derive a u64 nonce from `(agent_id ‖ raw_body)` using SHA-256.
+/// Used when the client does not supply an explicit `jg_nonce` param.
+/// Catches exact-body replays even without client cooperation.
+fn body_request_nonce(agent_id: &str, body: &[u8]) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(agent_id.as_bytes());
+    h.update(b"|");
+    h.update(body);
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().unwrap())
+}
+
 fn synthetic_agent_id(peer_ip: &str, secret: &[u8]) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
@@ -318,6 +376,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     telemetry_store: TelemetryStore,
     secret: Arc<Vec<u8>>,
     upstream_addr: String,
+    nonce_store: Arc<Mutex<McpReplayGuard>>,
 ) {
     // Read the incoming HTTP request.
     let http_req = match timeout(MCP_REQUEST_READ_TIMEOUT, read_http_request(&mut stream)).await {
@@ -390,11 +449,43 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .and_then(|obj| obj.get("action_risk_score"))
         .and_then(|v| v.as_f64());
 
-    // Build a synthetic sequence counter from the current timestamp.
-    let seq = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // ── Replay detection (JG-RT-L3) ──────────────────────────────────────
+    // Prefer an explicit client-supplied nonce (`jg_nonce` u64 in params);
+    // fall back to SHA-256(agent_id ‖ body) which catches exact-body replays
+    // without requiring client changes. Either way the nonce is checked against
+    // the shared bounded McpReplayGuard before anything else runs.
+    let nonce: u64 = jsonrpc
+        .params
+        .as_object()
+        .and_then(|o| o.get("jg_nonce"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| body_request_nonce(&agent_id, &http_req.body));
+
+    let replay_detected = {
+        let mut guard = nonce_store.lock().unwrap();
+        !guard.observe((agent_id.clone(), nonce))
+    };
+    if replay_detected {
+        eprintln!(
+            "[mcp_gateway] DENY_REPLAY_ATTACK peer={peer_ip} agent={agent_id} nonce={nonce}"
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "signal": "DENY_REPLAY_ATTACK",
+            "reason": "replay_attack",
+            "jsonrpc": "2.0",
+            "id": jsonrpc.id,
+            "error": {
+                "code": -32600,
+                "message": "Request denied by Jinn Guard: replay attack detected",
+            }
+        }))
+        .unwrap_or_default();
+        let _ = write_http_response(&mut stream, 403, "Forbidden", "application/json", &body).await;
+        return;
+    }
+
+    // seq for lineage tracking: use the nonce so lineage and replay guard share the same value.
+    let seq: u64 = nonce;
 
     let proposal = ClientProposal {
         sequence_counter: seq,
@@ -628,22 +719,42 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // ── Lineage tracking ─────────────────────────────────────────────────
-    let lineage_ok = {
+    // Sequence validation is now enforced: the nonce doubles as the sequence
+    // counter, so a replayed nonce was already caught above; here we catch
+    // out-of-order fresh nonces (monotonicity). Mirrors the UDS path.
+    let lineage_sequence_err = {
         let mut reg = registry_store.lock().unwrap();
         let lineage = reg
             .data
             .lineages
             .entry(lineage_key.clone())
             .or_insert_with(|| AgentLineage::new(&observation, seq, &assessment));
-        if lineage.validate_sequence(seq).is_err() {
-            false // sequence replay — tolerated for TCP (no strict ordering required)
+        if let Err(e) = lineage.validate_sequence(seq) {
+            Some(e.to_string())
         } else {
             lineage.record(&observation, seq, &assessment);
             let _ = reg.save();
-            true
+            None
         }
     };
-    let _ = lineage_ok; // MCP gateway is lenient on sequence ordering
+    if let Some(err) = lineage_sequence_err {
+        eprintln!(
+            "[mcp_gateway] DENY_REPLAY_ATTACK peer={peer_ip} agent={agent_id} lineage_err={err}"
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "signal": "DENY_REPLAY_ATTACK",
+            "reason": "lineage_sequence_invalid",
+            "jsonrpc": "2.0",
+            "id": jsonrpc.id,
+            "error": {
+                "code": -32600,
+                "message": format!("Request denied by Jinn Guard: {err}"),
+            }
+        }))
+        .unwrap_or_default();
+        let _ = write_http_response(&mut stream, 403, "Forbidden", "application/json", &body).await;
+        return;
+    }
 
     // ── Policy decision ──────────────────────────────────────────────────
     let decision = policy_decision(&assessment, &current_policy);
@@ -939,6 +1050,9 @@ pub(crate) async fn run_mcp_gateway(
     secret: Arc<Vec<u8>>,
     tls: Option<Arc<SslAcceptor>>,
 ) {
+    // Shared replay guard for all MCP connections on this gateway instance.
+    let nonce_store: Arc<Mutex<McpReplayGuard>> =
+        Arc::new(Mutex::new(McpReplayGuard::with_capacity(MCP_MAX_REPLAY_ENTRIES)));
     let addr = format!("[::]:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -962,6 +1076,7 @@ pub(crate) async fn run_mcp_gateway(
                 let upstream_clone = upstream.clone();
                 let secret_clone = Arc::clone(&secret);
                 let tls_clone = tls.clone();
+                let nonce_clone = Arc::clone(&nonce_store);
 
                 tokio::spawn(async move {
                     let worker = tokio::spawn(async move {
@@ -980,6 +1095,7 @@ pub(crate) async fn run_mcp_gateway(
                                         telemetry_clone,
                                         secret_clone,
                                         upstream_clone,
+                                        nonce_clone,
                                     )
                                     .await;
                                 }
@@ -997,6 +1113,7 @@ pub(crate) async fn run_mcp_gateway(
                                     telemetry_clone,
                                     secret_clone,
                                     upstream_clone,
+                                    nonce_clone,
                                 )
                                 .await;
                             }
@@ -1192,4 +1309,65 @@ mod mcp_gateway_tests {
             "got: {err}"
         );
     }
+
+    // ── JG-RT-L3: MCP replay guard ──────────────────────────────────────────
+
+    /// body_request_nonce must be deterministic: same inputs → same nonce.
+    #[test]
+    fn body_nonce_is_deterministic() {
+        let n1 = body_request_nonce("agent_a", b"hello world");
+        let n2 = body_request_nonce("agent_a", b"hello world");
+        assert_eq!(n1, n2, "same inputs must produce the same nonce");
+    }
+
+    /// body_request_nonce must distinguish different agent_ids.
+    #[test]
+    fn body_nonce_differs_by_agent() {
+        let n1 = body_request_nonce("agent_a", b"hello world");
+        let n2 = body_request_nonce("agent_b", b"hello world");
+        assert_ne!(n1, n2, "different agent_ids must produce different nonces");
+    }
+
+    /// body_request_nonce must distinguish different bodies.
+    #[test]
+    fn body_nonce_differs_by_body() {
+        let n1 = body_request_nonce("agent_a", b"request_1");
+        let n2 = body_request_nonce("agent_a", b"request_2");
+        assert_ne!(n1, n2, "different bodies must produce different nonces");
+    }
+
+    /// McpReplayGuard.observe: first observation is NEW; second is a replay.
+    #[test]
+    fn mcp_replay_guard_catches_replay() {
+        let mut g = McpReplayGuard::with_capacity(16);
+        let key = ("agent_x".to_string(), 42u64);
+        assert!(g.observe(key.clone()), "first observe must be NEW");
+        assert!(!g.observe(key.clone()), "second observe of same key must be a replay");
+    }
+
+    /// McpReplayGuard: different (agent, nonce) pairs are independent.
+    #[test]
+    fn mcp_replay_guard_allows_distinct_nonces() {
+        let mut g = McpReplayGuard::with_capacity(16);
+        assert!(g.observe(("agent_x".to_string(), 1)), "nonce 1 must be NEW");
+        assert!(g.observe(("agent_x".to_string(), 2)), "nonce 2 must be NEW");
+        assert!(!g.observe(("agent_x".to_string(), 1)), "nonce 1 must now be a replay");
+    }
+
+    /// McpReplayGuard: eviction at capacity allows old nonces to be re-observed
+    /// (the bounded-window trade-off, same semantics as the UDS ReplayGuard).
+    #[test]
+    fn mcp_replay_guard_evicts_at_capacity() {
+        let mut g = McpReplayGuard::with_capacity(2);
+        g.observe(("a".to_string(), 1));
+        g.observe(("a".to_string(), 2));
+        // Inserting a third entry evicts the first.
+        g.observe(("a".to_string(), 3));
+        // Nonce 1 was evicted, so it is accepted again.
+        assert!(
+            g.observe(("a".to_string(), 1)),
+            "evicted nonce must be re-accepted (bounded window)"
+        );
+    }
 }
+
