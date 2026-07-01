@@ -461,6 +461,32 @@ predictable signing seed lets an attacker forge Action Manifest signatures.
   fail-closed** if neither is available — never a fabricated value. Guarded by an
   entropy smoke test (`os_random_bytes_are_high_entropy_not_clock_seeded`).
 
+### JG-RT-031 — external audit-chain validator accepted tail-truncation (MED-HIGH disclosure, fixed)
+`scripts/validate/verify_audit_chain.py` is the tool the public break-it challenge
+tells reviewers to run to "prove it yourself." It genesis-anchors the chain and
+catches insert/delete/reorder/content-tamper *within* the file and fails on an
+empty file — but it had **no tail anchor**. An attacker who truncates the last K
+entries (deleting the records of their own actions) leaves a valid shorter prefix,
+and the script printed `AUDIT CHAIN VERIFIED ✓`. Same fail-open class as
+JG-RT-028, but in the disclosure-critical external validator.
+- **Repro (CONFIRMED):** built a valid 4-entry chain (incl. a "malicious" entry
+  #3) with the script's own `recompute_hash`, dropped the last line → the script
+  still reported `VERIFIED 3 entries — links intact`. Reproduced end-to-end via
+  `main()` (exit 0).
+- **Fix:** tail anchoring, in order — explicit `--expected-head <hash>` /
+  `--min-entries <n>` pins, else an auto cross-check against the signed
+  `<log>.manifests` sidecar (#62): if the chain's highest index is below the
+  manifest's highest signed index, it FAILS with a truncation error and points to
+  `ts_cli manifest verify` for the authoritative Ed25519 check. Absent any anchor
+  the result now carries an explicit WARNING instead of an unqualified ✓, so it can
+  no longer imply completeness it cannot prove.
+- **Regression test:** `scripts/validate/test_verify_audit_chain_tail_truncation.py`
+  (all three anchors + the unanchored-warning path).
+- **Honesty note:** a bare hash chain fundamentally cannot detect tail-truncation
+  without an external anchor; the stdlib count cross-check catches naive truncation
+  and the signed-manifest verifier (`ts_cli manifest verify`) is authoritative. Both
+  are now surfaced to the reviewer.
+
 ### Leads NOT fixed this round (left in the verification table for review)
 - **JG-RT (L3) MCP gateway app-layer replay — LIKELY, repro pending.** The MCP
   gateway derives `sequence_counter` from the *server* clock (`mcp_gateway.rs:394`)
