@@ -1301,19 +1301,55 @@ pub struct ChainVerification {
 /// `/dev/urandom` is always available; the (defensive) fallback mixes the clock
 /// so a salt is never all-zero even in a degraded environment.
 fn os_random_bytes(n: usize) -> Vec<u8> {
-    use std::io::Read;
     let mut buf = vec![0u8; n];
+    fill_os_random(&mut buf);
+    buf
+}
+
+/// Fill `buf` with cryptographically secure OS entropy, or abort. There is
+/// deliberately NO insecure fallback (JG-RT-030, weak-RNG lead): this entropy
+/// seeds audit pseudonym salts AND the per-subject crypto-shred master keys
+/// (JG-RT-027), so a predictable value would silently void the GDPR Art. 17
+/// erasure guarantee and audit pseudonymity. On a host where the kernel CSPRNG
+/// is genuinely unavailable, refusing to generate key material is the correct
+/// fail-closed behaviour — and `getrandom(2)` needs no file descriptor, so fd
+/// exhaustion cannot force the weak path.
+fn fill_os_random(buf: &mut [u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let ret = unsafe {
+                libc::getrandom(
+                    buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - filled,
+                    0,
+                )
+            };
+            if ret < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break; // fall through to /dev/urandom
+            }
+            filled += ret as usize;
+        }
+        if filled == buf.len() {
+            return;
+        }
+    }
+    use std::io::Read;
     if fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
+        .and_then(|mut f| f.read_exact(buf))
         .is_ok()
     {
-        return buf;
+        return;
     }
-    let seed = now_unix_secs().to_le_bytes();
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = seed[i % seed.len()] ^ (i as u8).wrapping_mul(31);
-    }
-    buf
+    // Fail-closed: no secure entropy source. Never fabricate a predictable value.
+    panic!(
+        "JinnGuard: no OS CSPRNG available (getrandom + /dev/urandom both failed) — \
+         refusing to generate predictable key/salt material (fail-closed)"
+    );
 }
 
 /// `HMAC-SHA256(key, data)` as lowercase hex. The HMAC construction means that
@@ -2981,6 +3017,25 @@ mod tests {
         for p in [path.to_string(), db_path.clone(), format!("{db_path}-wal")] {
             let _ = fs::remove_file(&p);
         }
+    }
+
+    #[test]
+    fn os_random_bytes_are_high_entropy_not_clock_seeded() {
+        // JG-RT-030: the RNG must draw from the OS CSPRNG with NO predictable
+        // clock-seeded fallback (a guessable value would void the JG-RT-027
+        // crypto-shred keys and pseudonym salts). This is an entropy smoke test;
+        // the removal of the weak fallback itself is verified by construction —
+        // the absent-CSPRNG branch now panics rather than fabricating a value.
+        let a = os_random_bytes(32);
+        let b = os_random_bytes(32);
+        assert_ne!(a, b, "two CSPRNG draws must differ");
+        assert!(a.iter().any(|&x| x != 0), "draw must not be all-zero");
+        let big = os_random_bytes(256);
+        let distinct = big.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(
+            distinct > 128,
+            "256-byte draw had only {distinct} distinct byte values — suspiciously low entropy"
+        );
     }
 
     #[test]

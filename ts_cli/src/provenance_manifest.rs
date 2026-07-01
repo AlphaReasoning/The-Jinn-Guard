@@ -480,21 +480,42 @@ fn harden_key_perms(_path: &str) {}
 
 fn os_random_32() -> [u8; 32] {
     let mut buf = [0u8; 32];
+    // Fail-closed (JG-RT-030): this seeds the Ed25519 provenance signing key, so a
+    // predictable value would let an attacker forge Action Manifest signatures.
+    // getrandom(2) first (no fd needed), then /dev/urandom; if neither is
+    // available we refuse to mint a key rather than fabricate a guessable one.
+    #[cfg(target_os = "linux")]
+    {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let ret = unsafe {
+                libc::getrandom(
+                    buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - filled,
+                    0,
+                )
+            };
+            if ret < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            filled += ret as usize;
+        }
+        if filled == buf.len() {
+            return buf;
+        }
+    }
     if let Ok(mut f) = fs::File::open("/dev/urandom") {
         if f.read_exact(&mut buf).is_ok() {
             return buf;
         }
     }
-    // Defensive fallback: never an all-zero seed even without /dev/urandom.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9e37_79b9_7f4a_7c15)
-        .to_le_bytes();
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = seed[i % 8] ^ (i as u8).wrapping_mul(31).wrapping_add(0x5a);
-    }
-    buf
+    panic!(
+        "JinnGuard: no OS CSPRNG available (getrandom + /dev/urandom both failed) — \
+         refusing to generate a predictable signing seed (fail-closed)"
+    );
 }
 
 // ---------------------------------------------------------------------------

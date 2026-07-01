@@ -446,6 +446,21 @@ well inside the range, which limits real-world reach.
 - **Fix:** out-of-range or non-finite operands are now rejected as a DENY
   (fail-closed) before the cast, instead of being silently clamped.
 
+### JG-RT-030 — weak-RNG clock-seeded fallback undermined key material (MED, fixed)
+`os_random_bytes` (audit salts + the new JG-RT-027 crypto-shred master keys) and
+`os_random_32` (Ed25519 provenance signing seed) both silently downgraded to a
+**deterministic clock-derived value** if `/dev/urandom` could not be opened. Once
+JG-RT-027 landed, this became load-bearing: a predictable master key makes the
+"destroy the key" crypto-shred meaningless (an attacker re-derives it), and a
+predictable signing seed lets an attacker forge Action Manifest signatures.
+- **Reach:** triggered when the CSPRNG is unavailable (minimal/broken container,
+  seccomp, fd exhaustion). Cannot be faithfully reproduced in-process, so this is
+  verified by construction + build, not a failing-first repro.
+- **Fix:** both draws now use `getrandom(2)` first (no fd required, so fd
+  exhaustion cannot force the weak path), then `/dev/urandom`, and **panic
+  fail-closed** if neither is available — never a fabricated value. Guarded by an
+  entropy smoke test (`os_random_bytes_are_high_entropy_not_clock_seeded`).
+
 ### Leads NOT fixed this round (left in the verification table for review)
 - **JG-RT (L3) MCP gateway app-layer replay — LIKELY, repro pending.** The MCP
   gateway derives `sequence_counter` from the *server* clock (`mcp_gateway.rs:394`)
@@ -454,12 +469,6 @@ well inside the range, which limits real-world reach.
   uses (JG-RT-002). Source is unambiguous, but no live-gateway replay was executed,
   so it is recorded LIKELY pending a runtime harness. A correct fix needs a
   client-supplied nonce, not just un-discarding the server-clock value.
-- **Weak-RNG clock-seeded fallback — LIKELY, contrived reachability.** Both
-  `os_random_bytes` (audit salt) and `os_random_32` (#62 manifest seed) downgrade
-  to a deterministic clock-derived value if `/dev/urandom` is unavailable. Correct
-  behavior is fail-closed. Only reachable when `/dev/urandom` cannot be opened
-  (minimal/broken container, seccomp, fd exhaustion); left for a scoped fail-closed
-  fix.
 - **Startup policy load fails OPEN to a permissive default** (`main.rs:374-393`):
   a missing/unreadable/malformed policy at startup yields
   `deny_anonymous_agents=false`, boundary 75 — asymmetric with the fail-safe
