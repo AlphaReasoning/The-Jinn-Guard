@@ -544,23 +544,38 @@ the gateway had none.
   `body_nonce_differs_by_agent`, `body_nonce_differs_by_body`.
   180+16+13 pass, clippy clean.
 
-### JG-RT-L3b — MCP replay: body-hash fallback is weak (MED, open; review of L3)
-Cross-agent review (Fable) of the JG-RT-L3 fix (Antigravity). The explicit
-`jg_nonce` path is correct. But the **default fallback** — nonce = SHA-256(agent_id
-‖ raw_body) — has two problems, because existing clients send no `jg_nonce`:
-- **False negative (bypass):** the nonce covers the *entire raw body*, including
-  non-semantic bytes an attacker controls. Replaying a captured request while
-  flipping the JSON-RPC `id` (or adding whitespace) yields a different hash → NOT
-  detected as a replay, yet the semantic `method`+`params` (the dangerous action)
-  is replayed. The protection is defeated by a one-byte mutation.
-- **False positive:** two *legitimately* byte-identical requests (idempotent
-  `tools/list`, a retried notification with no `id`) hash the same → the second is
-  wrongly denied `DENY_REPLAY_ATTACK`. Also, `seq = nonce` feeds a non-monotonic
-  hash into lineage sequence validation, which can spuriously trip.
-- **Recommended fix:** hash a *canonical semantic projection* (method + params with
-  `jg_nonce` removed) rather than the raw body — or make `jg_nonce` **required**
-  (fail-closed when absent) — or issue a server-side challenge nonce. Raised to
-  Antigravity in `AGENT-COMMS.md`; left for its decision (its lane).
+### JG-RT-L3b — MCP replay: body-hash fallback was weak (MED, fixed by Fable)
+Cross-agent review (Fable) of the JG-RT-L3 fix (Antigravity), then fixed. The
+explicit `jg_nonce` path was correct, but the default fallback — nonce =
+SHA-256(agent_id ‖ raw_body) — had three problems (existing clients send no
+`jg_nonce`, so the fallback is the common path):
+- **False negative (bypass):** the raw-body hash covered attacker-controlled
+  non-semantic bytes, so replaying a captured request while flipping the JSON-RPC
+  `id` (or adding whitespace) produced a different hash → NOT flagged, yet the
+  dangerous `method`+`params` were replayed. One-byte mutation defeated it.
+- **Lineage regression (confirmed):** `seq = nonce` fed the content hash into
+  lineage `validate_sequence`, which requires *strictly increasing* seq
+  (`governance.rs:978`). A hash is not monotonic, so **~half of legitimate
+  distinct requests were spuriously denied `sequence_replay`** — a real functional
+  break the unit tests didn't exercise.
+- **False positive:** two legitimately byte-identical requests were denied forever
+  (unbounded dedup window).
+- **Fix (`mcp_gateway.rs`):** (1) fallback nonce now hashes the **semantic
+  identity** — `agent_id ‖ method ‖ canonical(params)` with `jg_nonce` removed —
+  so non-semantic mutation no longer evades and key order is canonical; (2) the
+  lineage `seq` is drawn from a **monotonic per-gateway counter**
+  (`next_lineage_seq`), fully decoupled from the replay nonce, so
+  `validate_sequence` never spuriously trips; (3) the replay guard is now
+  **time-windowed** (`JINNGUARD_MCP_REPLAY_WINDOW_SECS`, default 120s) so a
+  legitimate identical request after the window is allowed while a rapid replay is
+  caught. `jg_nonce` remains the explicit strongest-guarantee override.
+- **Tests:** `semantic_nonce_ignores_nonsemantic_bytes` (the bypass regression),
+  `semantic_nonce_differs_by_semantic_content`, `semantic_nonce_excludes_jg_nonce_field`,
+  `mcp_replay_guard_allows_repeat_after_window`,
+  `mcp_lineage_seq_is_strictly_increasing_and_nonzero`. ts_cli 182 pass, clippy clean.
+- **Residual:** content-based dedup still cannot distinguish a legit repeat from a
+  replay across the window boundary without client freshness; strongest guarantee
+  needs `jg_nonce` or mTLS. Documented.
 
 ### JG-RT-B1 — BPF ringbuf-full deny path: `barrier_var` consistency (LOW, fixed — all 4 sites)
 Antigravity's B1 added the `barrier_var` guard to `jg_socket_sendmsg.c` (stops
