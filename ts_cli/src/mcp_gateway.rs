@@ -69,9 +69,9 @@ struct JsonRpcErrorObj {
 // Synthetic agent_id derivation
 // ---------------------------------------------------------------------------
 
-/// Derive a deterministic synthetic agent_id from the client IP address using
-/// an HMAC-SHA256 over the IP string.  This allows the governance pipeline to
-/// track per-IP behavioral lineage without requiring the caller to register.
+// Derive a deterministic synthetic agent_id from the client IP address using an
+// HMAC-SHA256 over the IP string, so the governance pipeline can track per-IP
+// behavioral lineage without requiring the caller to register.
 
 // ---------------------------------------------------------------------------
 // Per-gateway replay guard (JG-RT-L3)
@@ -79,7 +79,6 @@ struct JsonRpcErrorObj {
 
 /// Bounded FIFO nonce cache shared across all MCP connections on this gateway
 /// instance. Mirrors the UDS-path `ReplayGuard` in `main.rs`; defined here to
-
 /// avoid cross-module visibility coupling.
 pub(crate) struct McpReplayGuard {
     seen: HashSet<(String, u64)>,
