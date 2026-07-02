@@ -932,12 +932,23 @@ pub(crate) fn policy_decision(
     if assessment.trust_score < policy.minimum_trust_score {
         return PolicyDecision::deny("trust_floor_breached", assessment);
     }
-    // CONSTRAIN band: 40%–75% of the safety ceiling.
+    // CONSTRAIN band: from 40% of the ceiling up to the ceiling itself. Anything
+    // ABOVE the ceiling was already hard-denied above, so every remaining action at
+    // or over the 40% floor gets guardrails (rate limit, output cap, and — for the
+    // upper portion — output redaction).
+    //
+    // JG-RT-PD1: the upper bound used to be 0.75*ceiling, which let the HIGHEST
+    // sub-ceiling band [0.75*ceiling, ceiling] fall through to an UNCONSTRAINED
+    // allow — a non-monotonic inversion where the riskiest permitted actions got
+    // the fewest guardrails (no rate limit, no output cap, no redaction). The band
+    // now extends to the ceiling so restriction increases monotonically with risk.
+    // The redaction threshold is unchanged (0.75*0.85*ceiling), so behaviour below
+    // 0.75*ceiling is identical to before; only the high band flips allow→constrain.
     let constrain_lower = policy.upper_safety_boundary * 0.40;
-    let constrain_upper = policy.upper_safety_boundary * 0.75;
-    if assessment.fused_risk >= constrain_lower && assessment.fused_risk < constrain_upper {
+    let redact_threshold = policy.upper_safety_boundary * 0.75 * 0.85;
+    if assessment.fused_risk >= constrain_lower {
         let constraints = ConstraintSet {
-            redact_output: assessment.fused_risk >= constrain_upper * 0.85,
+            redact_output: assessment.fused_risk >= redact_threshold,
             rate_limit_rps: Some(5),
             allowed_network_destinations: vec![],
             output_byte_limit: Some(65_536),
@@ -6303,6 +6314,31 @@ mod decision_property_tests {
             if d.is_allow() {
                 assert!(fused <= ceiling, "ALLOW implies risk within ceiling");
                 assert!(trust >= 100.0 - ceiling, "ALLOW implies trust above floor");
+            }
+        }
+    }
+
+    /// INVARIANT (JG-RT-PD1): restriction is monotonic in risk. Any finite risk at
+    /// or above the constrain floor (0.40*ceiling) but not over the ceiling must be
+    /// CONSTRAINed, never plain-ALLOWed — otherwise the riskiest permitted actions
+    /// would get fewer guardrails than mid-band ones. Below the floor: ALLOW.
+    #[test]
+    fn prop_policy_decision_constrains_up_to_ceiling() {
+        let mut rng = Rng(0x00C0_FFEE_1234_5678);
+        for _ in 0..100_000 {
+            let ceiling = 1.0 + rng.frac(98.0); // (1, 99)
+            let fused = rng.frac(ceiling); // finite, within [0, ceiling]
+            let trust = 100.0; // above any floor, so trust never forces a deny
+            let d = policy_decision(&assess(fused, trust), &policy(ceiling));
+            let floor = ceiling * 0.40;
+            if fused >= floor {
+                assert_eq!(
+                    d.verdict,
+                    PolicyVerdict::Constrain,
+                    "risk {fused} in [{floor}, {ceiling}] must CONSTRAIN, not allow"
+                );
+            } else {
+                assert!(d.is_allow(), "risk {fused} below floor {floor} should allow");
             }
         }
     }
