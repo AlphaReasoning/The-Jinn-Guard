@@ -153,7 +153,16 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
     }
 
     bpf_ringbuf_submit(req, 0);
-    return audit_only ? 0 : (denied ? -JG_EPERM : 0);
+
+    // barrier_var forces a real branch so each exit returns a verifier-boundable
+    // literal. Without it clang -O2 lowers `denied ? -EPERM : 0` to an unbounded
+    // BPF_NEG, and the verifier rejects the program at exit ("R0 has unknown
+    // scalar value should have been in [-4095, 0]"). Matches jg_socket_connect (B1).
+    int deny = !audit_only && denied;
+    barrier_var(deny);
+    if (deny)
+        return -JG_EPERM;
+    return 0;
 }
 
 char LICENSE_socket_sendmsg[] SEC("license") = "GPL";
