@@ -275,13 +275,13 @@ if [ "$LSM_ARMED" = false ] && [ "$START_NOW" = true ] && [ "$SAFE_MODE" = false
 fi
 
 if $DRY_RUN; then
-    printf '    %s+ %ssh %s/deploy/install.sh%s%s\n' \
+    printf '    %s+ %sbash %s/deploy/install.sh%s%s\n' \
         "$YEL" "${SUDO:+$SUDO }" "$REPO_ROOT" "$INSTALL_ARGS" "$NC"
     ok "dry-run complete — no changes made"
     exit 0
 fi
 
-sudo_run sh "$REPO_ROOT/deploy/install.sh" $INSTALL_ARGS
+sudo_run bash "$REPO_ROOT/deploy/install.sh" $INSTALL_ARGS
 
 if $SAFE_MODE; then
     info "Configuring safe-mode (audit-only) systemd drop-in..."
