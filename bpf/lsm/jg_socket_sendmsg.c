@@ -92,7 +92,15 @@ int BPF_PROG(jg_socket_sendmsg, struct socket *sock, struct msghdr *msg, int siz
 
     struct jg_request *req = bpf_ringbuf_reserve(&requests, sizeof(*req), 0);
     if (!req) {
-        return audit_only ? 0 : -JG_EPERM;
+        // barrier_var prevents clang -O2 from lowering `cond ? -EPERM : 0` to
+        // `-(cond & 1)` (BPF_NEG), whose result the verifier cannot bound to
+        // [-4095, 0] at exit (JG-ADV-2026-004 pattern; matches socket_connect).
+        int deny = !audit_only;
+        barrier_var(deny);
+        if (deny) {
+            return -JG_EPERM;
+        }
+        return 0;
     }
     __builtin_memset(req, 0, sizeof(*req));
 

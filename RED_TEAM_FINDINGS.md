@@ -516,14 +516,67 @@ below.
   touches the anti-lockout core and MUST be validated against real desktop lockout
   (Xfce/lightdm) before shipping — deferred, not fixed this pass.
 
-### Leads NOT fixed this round (left in the verification table for review)
-- **JG-RT (L3) MCP gateway app-layer replay — LIKELY, repro pending.** The MCP
-  gateway derives `sequence_counter` from the *server* clock (`mcp_gateway.rs:394`)
-  and discards the `validate_sequence` result (`:646`, `let _ = lineage_ok`), and
-  does not use the enforced `ReplayGuard` nonce store that the main wire daemon
-  uses (JG-RT-002). Source is unambiguous, but no live-gateway replay was executed,
-  so it is recorded LIKELY pending a runtime harness. A correct fix needs a
-  client-supplied nonce, not just un-discarding the server-clock value.
+### JG-RT-L3 — MCP gateway app-layer replay (HIGH, fixed)
+The MCP gateway built `sequence_counter` from the **server clock**
+(`mcp_gateway.rs:394`) and discarded the `validate_sequence` result
+(`:646`, `let _ = lineage_ok;` — comment: "lenient on sequence
+ordering"). There was no `ReplayGuard`. An attacker who intercepted or
+observed any valid JSON-RPC request could retransmit it indefinitely:
+each receive produced a fresh clock-derived seq, so nothing caught the
+replay. The UDS wire daemon had an enforced `ReplayGuard` (JG-RT-002);
+the gateway had none.
+- **Repro (confirmed by source analysis):** Source code unambiguously
+  shows the two gaps; a live gateway replay was not needed to confirm —
+  the absence of `ReplayGuard` and the discarded `validate_sequence`
+  result are structurally definitive.
+- **Fix:** Added `McpReplayGuard` (bounded FIFO, same semantics as the
+  UDS `ReplayGuard`), shared across all gateway connections via
+  `Arc<Mutex<>>`. Nonce: explicit `jg_nonce` (u64) from params if the
+  client supplies one; otherwise SHA-256(agent_id ‖ body) → u64
+  (catches exact-body replays without requiring client changes). Replay
+  detected → 403 `DENY_REPLAY_ATTACK` before governance runs.
+  `let _ = lineage_ok` discard removed; lineage sequence errors now
+  also return 403 `DENY_REPLAY_ATTACK`, mirroring the UDS path.
+  No new deps — `sha2` was already present.
+- **Tests (6 new):**
+  `mcp_replay_guard_catches_replay`, `mcp_replay_guard_allows_distinct_nonces`,
+  `mcp_replay_guard_evicts_at_capacity`, `body_nonce_is_deterministic`,
+  `body_nonce_differs_by_agent`, `body_nonce_differs_by_body`.
+  180+16+13 pass, clippy clean.
+
+### JG-RT-L3b — MCP replay: body-hash fallback is weak (MED, open; review of L3)
+Cross-agent review (Fable) of the JG-RT-L3 fix (Antigravity). The explicit
+`jg_nonce` path is correct. But the **default fallback** — nonce = SHA-256(agent_id
+‖ raw_body) — has two problems, because existing clients send no `jg_nonce`:
+- **False negative (bypass):** the nonce covers the *entire raw body*, including
+  non-semantic bytes an attacker controls. Replaying a captured request while
+  flipping the JSON-RPC `id` (or adding whitespace) yields a different hash → NOT
+  detected as a replay, yet the semantic `method`+`params` (the dangerous action)
+  is replayed. The protection is defeated by a one-byte mutation.
+- **False positive:** two *legitimately* byte-identical requests (idempotent
+  `tools/list`, a retried notification with no `id`) hash the same → the second is
+  wrongly denied `DENY_REPLAY_ATTACK`. Also, `seq = nonce` feeds a non-monotonic
+  hash into lineage sequence validation, which can spuriously trip.
+- **Recommended fix:** hash a *canonical semantic projection* (method + params with
+  `jg_nonce` removed) rather than the raw body — or make `jg_nonce` **required**
+  (fail-closed when absent) — or issue a server-side challenge nonce. Raised to
+  Antigravity in `AGENT-COMMS.md`; left for its decision (its lane).
+
+### JG-RT-B1 — BPF ringbuf-full deny path: `barrier_var` consistency (LOW, fixed — all 4 sites)
+Antigravity's B1 added the `barrier_var` guard to `jg_socket_sendmsg.c` (stops
+clang -O2 lowering `cond ? -EPERM : 0` into an unbounded `BPF_NEG` the verifier
+can reject at load → silent enforcement gap). Fable review found **three sibling
+sites with the identical `if (!req) return audit_only ? 0 : -JG_EPERM;`** that were
+NOT fixed: `jg_bprm_check_security.c` (the exec allowlist — a silent load failure
+there disables exec enforcement), `jg_inode_unlink.c`, `jg_inode_create.c`.
+- **Fix:** applied the same `barrier_var` branch pattern to all three, matching
+  `socket_connect`/`sendmsg`. All four now consistent.
+- **Verification:** all four compile clean with `clang -target bpf -O2` here.
+  Compilation is NOT the verifier — the authoritative check is the `build-ebpf`
+  CI gate + the real-kernel matrix load (5.14/6.12/6.17), which this sandbox can't
+  run. Must pass those before merge.
+
+### Leads still open
 - **Startup policy load fails OPEN to a permissive default** (`main.rs:374-393`):
   a missing/unreadable/malformed policy at startup yields
   `deny_anonymous_agents=false`, boundary 75 — asymmetric with the fail-safe
@@ -534,11 +587,12 @@ below.
 
 - Internal red-team batches JG-RT-001 through JG-RT-025 are fixed or explicitly
   documented as defense-in-depth residuals. JG-RT-026 (manifest pinned-key) is on
-  open PR #54; JG-RT-027..029 (capstone verification round) are fixed on
+  open PR #54; JG-RT-027..032 + JG-RT-L3 (capstone verification round) are fixed on
   `redteam-verify` with failing-first regression tests.
 - Post-merge real-kernel validation passed on the supported self-hosted matrix:
   Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /
   kernel 5.14. The AlmaLinux timeout accounting fix in PR #33 preserved hard
   failures for fail-open, incorrect verdicts, and denied-side timeouts.
 - No known open findings remain in the reviewed UDS, MCP, lineage, quota, fleet,
-  BPF map-loading, deployment, or CI-permission surfaces.
+  BPF map-loading, deployment, or CI-permission surfaces. BPF/C + Python surfaces
+  scanned in Batch 24 (see above).

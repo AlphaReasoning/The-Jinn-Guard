@@ -130,7 +130,14 @@ int BPF_PROG(jg_inode_unlink, struct inode *dir, struct dentry *dentry) {
 
     struct jg_request *req = bpf_ringbuf_reserve(&requests, sizeof(*req), 0);
     if (!req) {
-        return audit_only ? 0 : -JG_EPERM;
+        // barrier_var forces a real branch so each exit returns a
+        // verifier-boundable constant (matches socket_connect/sendmsg; B1).
+        int deny = !audit_only;
+        barrier_var(deny);
+        if (deny) {
+            return -JG_EPERM;
+        }
+        return 0;
     }
     __builtin_memset(req, 0, sizeof(*req));
 
