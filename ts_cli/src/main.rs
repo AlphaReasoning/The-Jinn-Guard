@@ -375,15 +375,42 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
     if let Ok(policy) = try_load_policy_from_path(policy_file, false) {
         return policy;
     }
-    // No readable/valid policy: clear any previously-installed governed scope so
-    // startup fallback preserves historical local-dev behavior without carrying
-    // a stale scope from an earlier in-process test.
+    // JG-RT-L6a: no readable/valid policy at startup. This USED to drop to a
+    // PERMISSIVE default (deny_anonymous_agents=false), silently failing OPEN — a
+    // missing or MALFORMED policy would then admit unregistered agents. That is
+    // asymmetric with the hot-reload path, which keeps the last-good policy on
+    // error. Fail CLOSED instead: deny anonymous agents by default and warn
+    // loudly. Local dev can restore the old permissive default explicitly with
+    // JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1. (An operator who genuinely wants
+    // open access still passes --allow-anonymous, which layers on top.)
     set_governed_scope_prefixes(&[]);
+
+    let permissive = std::env::var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let reason = if std::path::Path::new(policy_file).exists() {
+        "unreadable or MALFORMED"
+    } else {
+        "missing"
+    };
+    if permissive {
+        eprintln!(
+            "[startup][WARN] policy file {policy_file:?} is {reason}; \
+             JINNGUARD_PERMISSIVE_STARTUP_DEFAULT is set -> using the PERMISSIVE \
+             default (deny_anonymous_agents=false). Do NOT use this in production."
+        );
+    } else {
+        eprintln!(
+            "[startup][WARN] policy file {policy_file:?} is {reason}; failing CLOSED \
+             to a restrictive default (deny_anonymous_agents=true). Fix the policy \
+             file, or set JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1 for local dev."
+        );
+    }
     PolicyConfig {
         upper_safety_boundary: 75.0,
         minimum_trust_score: 25.0,
         agent_nodes: HashMap::new(),
-        deny_anonymous_agents: false,
+        deny_anonymous_agents: !permissive,
         allow_anonymous_override: false,
         network_policy: NetworkPolicy::default(),
         runtime_policy: RuntimePolicy::default(),
@@ -5881,8 +5908,8 @@ mod interpreter_bypass_tests {
 #[cfg(test)]
 mod governed_scope_tests {
     use super::{
-        is_base_system_path, is_enforcement_target, is_path_in_test_scope, path_is_governed,
-        set_governed_scope_prefixes, try_load_policy_from_path,
+        is_base_system_path, is_enforcement_target, is_path_in_test_scope, load_policy_from_path,
+        path_is_governed, set_governed_scope_prefixes, try_load_policy_from_path,
     };
     use std::sync::Mutex;
     use std::{fs, path::PathBuf};
@@ -5997,6 +6024,44 @@ mod governed_scope_tests {
             "failed reload must leave last good governed scope intact"
         );
         let _ = fs::remove_file(path);
+        reset();
+    }
+
+    #[test]
+    fn startup_policy_fallback_fails_closed_on_missing_or_malformed() {
+        // JG-RT-L6a: a missing/unreadable/malformed policy at startup must fail
+        // CLOSED (deny anonymous agents), not drop to a permissive default.
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        std::env::remove_var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT");
+
+        // Missing file → fail closed.
+        let missing = temp_policy_path("does_not_exist");
+        let _ = fs::remove_file(&missing);
+        let p = load_policy_from_path(missing.to_str().unwrap());
+        assert!(
+            p.deny_anonymous_agents,
+            "missing startup policy must fail CLOSED (deny_anonymous_agents=true)"
+        );
+
+        // Malformed file → also fail closed.
+        let bad = temp_policy_path("malformed_startup");
+        fs::write(&bad, "global_safety_ceiling: [not-valid").unwrap();
+        let p2 = load_policy_from_path(bad.to_str().unwrap());
+        assert!(
+            p2.deny_anonymous_agents,
+            "malformed startup policy must fail CLOSED"
+        );
+        let _ = fs::remove_file(&bad);
+
+        // Explicit local-dev opt-out restores the permissive default.
+        std::env::set_var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT", "1");
+        let p3 = load_policy_from_path(missing.to_str().unwrap());
+        assert!(
+            !p3.deny_anonymous_agents,
+            "JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1 must restore permissive default"
+        );
+        std::env::remove_var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT");
         reset();
     }
 

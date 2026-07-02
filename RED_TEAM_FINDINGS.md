@@ -606,12 +606,33 @@ there disables exec enforcement), `jg_inode_unlink.c`, `jg_inode_create.c`.
   CI gate + the real-kernel matrix load (5.14/6.12/6.17), which this sandbox can't
   run. Must pass those before merge.
 
+### JG-RT-L6a — startup policy load failed OPEN to a permissive default (MED, fixed)
+`load_policy_from_path` (`main.rs`) returned a **permissive** default
+(`deny_anonymous_agents=false`) whenever the policy was missing, unreadable, or
+malformed at startup — so a corrupted or absent `/etc/jinnguard/policy.yaml`
+silently admitted unregistered agents. Asymmetric with the hot-reload path, which
+keeps the last-good policy on error.
+- **Fix:** the startup fallback now fails **CLOSED**
+  (`deny_anonymous_agents=true`) and logs a loud `[startup][WARN]` distinguishing
+  *missing* from *malformed*. Local dev can restore the old permissive default
+  with `JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1`. An operator wanting open access
+  still passes `--allow-anonymous`, which layers on top independently.
+- **Tests:** `startup_policy_fallback_fails_closed_on_missing_or_malformed`
+  (missing + malformed both deny; env opt-out restores permissive). ts_cli 185
+  pass, clippy clean.
+
 ### Leads still open
-- **Startup policy load fails OPEN to a permissive default** (`main.rs:374-393`):
-  a missing/unreadable/malformed policy at startup yields
-  `deny_anonymous_agents=false`, boundary 75 — asymmetric with the fail-safe
-  *reload* path. Deliberate dev-ergonomics behavior; flagged for a
-  production fail-closed decision.
+- _(none in the reviewed userspace surfaces; see "needs external validation" below)_
+
+### Needs external / non-sandbox validation before merge
+- **BPF verifier load** for JG-RT-B1 (4 hooks) — needs the `build-ebpf` CI gate +
+  real-kernel matrix (5.14/6.12/6.17); compiles clean locally but the verifier
+  cannot run here.
+- **JG-RT-032b desktop smoke** — a real Xfce/lightdm session to confirm no
+  anti-lockout regression (the change only narrows immunity for non-system dirs,
+  so risk is low, but the constraint requires the check).
+- **`deploy/bootstrap.sh`** end-to-end on a bare host + the non-apt distros.
+- **PR #54** CI must be freshly green before merge (no `gh`/network in-sandbox).
 
 ## Closeout
 
