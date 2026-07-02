@@ -154,7 +154,15 @@ int BPF_PROG(jg_inode_create, struct inode *dir, struct dentry *dentry, umode_t 
     __builtin_memcpy(req->resource_path, resource_path, sizeof(req->resource_path));
 
     bpf_ringbuf_submit(req, 0);
-    return audit_only ? 0 : decision;
+
+    // barrier_var forces a real branch so each exit returns a verifier-boundable
+    // literal — prevents a future clang from lowering `audit_only ? 0 : decision`
+    // to an unbounded BPF_NEG at exit (the B1c failure mode). Matches socket_connect.
+    int deny = !audit_only && decision != 0;
+    barrier_var(deny);
+    if (deny)
+        return -JG_EPERM;
+    return 0;
 }
 
 char LICENSE_inode_create[] SEC("license") = "GPL";

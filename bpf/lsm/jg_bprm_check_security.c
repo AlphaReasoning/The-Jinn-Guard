@@ -77,7 +77,15 @@ int BPF_PROG(jg_bprm_check_security, struct linux_binprm *bprm) {
     int decision = (allowed && *allowed) ? 0 : -JG_EPERM;
 
     bpf_ringbuf_submit(req, 0);
-    return audit_only ? 0 : decision;
+
+    // barrier_var forces a real branch so each exit returns a verifier-boundable
+    // literal — prevents a future clang from lowering `audit_only ? 0 : decision`
+    // to an unbounded BPF_NEG at exit (the B1c failure mode). Matches socket_connect.
+    int deny = !audit_only && decision != 0;
+    barrier_var(deny);
+    if (deny)
+        return -JG_EPERM;
+    return 0;
 }
 
 char LICENSE_bprm_check_security[] SEC("license") = "GPL";
