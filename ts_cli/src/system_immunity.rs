@@ -46,6 +46,24 @@ pub const IMMUNE_EXACT_PATHS: &[&str] = &[
 
 pub const IMMUNE_PATH_PREFIXES: &[&str] = &["/lib/systemd/", "/usr/lib/systemd/"];
 
+/// Trusted system directories a base-system binary legitimately lives in. A bare
+/// **basename** immunity match (e.g. a shell at a non-listed path) is honored ONLY
+/// for executables under these roots — never for agent-writable locations
+/// (`/home`, `/tmp`, `/dev/shm`, `/run/user`, …). Closes JG-RT-032b: without this
+/// gate, a governed agent that drops a file literally named `bash`/`sh`/`cargo`
+/// anywhere it can write inherits full system-process immunity via its
+/// `/proc/<pid>/exe` basename. Writing into these roots already requires root.
+pub const IMMUNE_EXEC_DIRS: &[&str] = &[
+    "/bin/",
+    "/sbin/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/lib/",
+    "/usr/lib/",
+    "/usr/local/bin/",
+    "/usr/local/sbin/",
+];
+
 pub fn observation_is_immune(observation: &ObservationRecord) -> bool {
     // JG-RT-032: immunity is granted ONLY on the kernel-attested executable path
     // (readlink /proc/<pid>/exe from SO_PEERCRED), never on `command_line`. argv
@@ -84,11 +102,21 @@ pub fn path_is_immune(path: &str) -> bool {
         return false;
     }
 
-    IMMUNE_EXACT_PATHS.contains(&trimmed)
+    if IMMUNE_EXACT_PATHS.contains(&trimmed)
         || IMMUNE_PATH_PREFIXES
             .iter()
             .any(|prefix| trimmed.starts_with(prefix))
-        || process_name_is_immune(basename(trimmed))
+    {
+        return true;
+    }
+
+    // JG-RT-032b: a bare-basename match (a shell/system binary at a path not in
+    // the exact list) is honored ONLY when the executable lives in a trusted
+    // system directory. This preserves anti-lockout for real system binaries
+    // (their /proc/exe is always under /bin, /usr/bin, …) while denying immunity
+    // to an agent-dropped binary named `bash` in /home, /tmp, /dev/shm, etc.
+    IMMUNE_EXEC_DIRS.iter().any(|dir| trimmed.starts_with(dir))
+        && process_name_is_immune(basename(trimmed))
 }
 
 pub fn process_name_is_immune(name: &str) -> bool {
@@ -250,6 +278,28 @@ mod system_immunity_tests {
             immunity_reason_for_observation(&obs, None),
             Some("system_process_immunity")
         );
+    }
+
+    #[test]
+    fn immunity_denies_basename_match_in_agent_writable_dir() {
+        // JG-RT-032b: a governed agent drops a file named like a system binary in
+        // a writable location and execs it. The /proc/exe basename matches an
+        // immune name, but the DIRECTORY is untrusted → no immunity.
+        assert!(!path_is_immune("/home/agent/bash"), "$HOME binary must not be immune");
+        assert!(!path_is_immune("/tmp/sh"), "/tmp binary must not be immune");
+        assert!(!path_is_immune("/dev/shm/cargo"), "/dev/shm binary must not be immune");
+        assert!(!path_is_immune("/run/user/1000/systemd"), "/run/user binary must not be immune");
+        // …and through the kernel-attested observation path.
+        let obs = observation(Some("/home/agent/bash"), "bash");
+        assert!(!observation_is_immune(&obs));
+    }
+
+    #[test]
+    fn immunity_honors_basename_match_in_trusted_system_dir() {
+        // Anti-lockout: a real system binary at a trusted path NOT in the exact
+        // list stays immune via the (now dir-gated) basename fallback.
+        assert!(path_is_immune("/usr/local/sbin/bash"));
+        assert!(path_is_immune("/usr/local/sbin/getty"));
     }
 
     #[test]

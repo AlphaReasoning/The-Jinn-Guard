@@ -509,12 +509,27 @@ below.
   proposed action. If `/proc/exe` is unreadable there is no trusted identity →
   fail closed (no immunity, normal policy path). Anti-lockout for real system
   binaries is unchanged (their real exe is in `IMMUNE_EXACT_PATHS`).
-- **RESIDUAL (open, JG-RT-032b):** `path_is_immune` still falls back to
-  basename-matching `IMMUNE_PROCESS_NAMES`, so a governed agent that execs a file
-  it literally named `bash`/`sh`/`cargo`/`systemd` (real /proc/exe basename) is
-  immune. Closing it means dropping the basename fallback for the exe check, which
-  touches the anti-lockout core and MUST be validated against real desktop lockout
-  (Xfce/lightdm) before shipping — deferred, not fixed this pass.
+### JG-RT-032b — immunity basename fallback matched agent-writable paths (MED, fixed)
+Residual of JG-RT-032: `path_is_immune` granted immunity to ANY path whose
+*basename* was in `IMMUNE_PROCESS_NAMES`, regardless of directory. So a governed
+agent that dropped a file literally named `bash`/`sh`/`cargo`/`systemd` in a
+writable location (`/home`, `/tmp`, `/dev/shm`) and exec'd it — making its
+kernel-attested `/proc/<pid>/exe` basename match — inherited full system-process
+immunity.
+- **Fix (`system_immunity.rs`):** the bare-basename fallback is now gated to
+  `IMMUNE_EXEC_DIRS` (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/usr/lib`,
+  `/usr/local/bin`, `/usr/local/sbin`). A basename match is honored only when the
+  exe lives under a trusted system root — writing there already requires root.
+  Exact-path and systemd-prefix immunity are unchanged.
+- **Anti-lockout preserved (low risk):** every real base-system binary's
+  `/proc/exe` is under a trusted root, so no desktop component loses immunity;
+  only agent-writable-location matches are dropped. Behavior change: dev tools in
+  `$HOME` (e.g. `~/.cargo/bin/cargo`) lose *automatic* immunity — add them to
+  `IMMUNE_EXACT_PATHS` if needed. **Still recommend a real Xfce/lightdm desktop
+  smoke test before merge**, per the anti-lockout constraint, though this change
+  only narrows immunity for non-system directories.
+- **Tests:** `immunity_denies_basename_match_in_agent_writable_dir`,
+  `immunity_honors_basename_match_in_trusted_system_dir`. ts_cli immunity 9/9.
 
 ### JG-RT-L3 — MCP gateway app-layer replay (HIGH, fixed)
 The MCP gateway built `sequence_counter` from the **server clock**
