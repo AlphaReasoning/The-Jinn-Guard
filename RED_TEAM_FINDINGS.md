@@ -387,9 +387,32 @@ checkout and artifact handling.
 
 ## Batch 23 — #59 capstone verification round (post #61/#62 surface)
 
-Verification pass over six high-signal leads from the interrupted Round 1. Each
-was reproduced before fixing (failing-first regression test). JG-RT-026 is
-reserved for the manifest pinned-key fix on the still-open PR #54.
+Verification pass over the high-signal leads from the interrupted Round 1. Each
+was reproduced before fixing (failing-first regression test). JG-RT-026 (manifest
+pinned-key) landed first via PR #54 and is now merged to `main`; its writeup is
+retained here for a single consolidated record.
+
+### JG-RT-026 — `--verify-manifests` trusted the in-directory pubkey (MED, fixed)
+The Action Manifest verifier (#62) read the trusted Ed25519 public key from
+`<audit-log>.manifests.pub` — a file in the **same directory as the log it is
+verifying**. An attacker who can rewrite the audit log can also rewrite that
+pubkey file: they regenerate a fully self-consistent set of manifests signed with
+their *own* key, publish that key as `<log>.manifests.pub`, and the verifier
+reports `OK`. That silently defeats the non-repudiation property the manifests
+exist to provide — the forgery is indistinguishable from a genuine log unless the
+verifier already holds the real key. (The original `forgery_with_different_key…`
+test only passed because it manually restored the genuine pubkey, masking this.)
+- **Fix:** `verify_manifests()` now takes an optional **pinned** public key and
+  the CLI exposes `--manifest-pubkey <hex>`. When supplied (out-of-band), the
+  in-directory pubkey is ignored and authenticity is checked against the pinned
+  key — the only mode that resists a malicious log-holder. When omitted, the
+  verifier falls back to the in-directory key for *convenience* (detects accidental
+  corruption / non-malicious regeneration only) and the report/`ManifestVerification`
+  is explicitly flagged `pubkey_pinned = false` ("self-consistency only"), so an
+  unpinned pass can never be mistaken for proven authenticity. Regression test:
+  `swapped_pubkey_forgery_defeated_only_by_pinned_key`. The genuine key is printed
+  at daemon startup; THREAT_MODEL §12.1 documents the out-of-band key-distribution
+  requirement.
 
 ### JG-RT-027 — GDPR "crypto-shred" was a logical DELETE, not key-destruction (MED, fixed → upgraded to REAL crypto-shredding)
 `AuditLogger` stored personal data (executable path, argv) as **cleartext** columns
@@ -632,14 +655,16 @@ keeps the last-good policy on error.
   anti-lockout regression (the change only narrows immunity for non-system dirs,
   so risk is low, but the constraint requires the check).
 - **`deploy/bootstrap.sh`** end-to-end on a bare host + the non-apt distros.
-- **PR #54** CI must be freshly green before merge (no `gh`/network in-sandbox).
+- **PR #55** CI must be freshly green before merge (no `gh`/network in-sandbox);
+  JG-RT-026 already merged via PR #54.
 
 ## Closeout
 
-- Internal red-team batches JG-RT-001 through JG-RT-025 are fixed or explicitly
-  documented as defense-in-depth residuals. JG-RT-026 (manifest pinned-key) is on
-  open PR #54; JG-RT-027..032 + JG-RT-L3 (capstone verification round) are fixed on
-  `redteam-verify` with failing-first regression tests.
+- Internal red-team batches JG-RT-001 through JG-RT-032 (plus JG-RT-L3/L3b/L6a/B1)
+  are fixed or explicitly documented as defense-in-depth residuals. JG-RT-026
+  (manifest pinned-key) merged to `main` via PR #54; JG-RT-027..032 + JG-RT-L3/L3b
+  + JG-RT-B1 + JG-RT-L6a (capstone verification round) are on `redteam-verify`
+  (PR #55) with failing-first regression tests.
 - Post-merge real-kernel validation passed on the supported self-hosted matrix:
   Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /
   kernel 5.14. The AlmaLinux timeout accounting fix in PR #33 preserved hard

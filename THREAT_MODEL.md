@@ -612,13 +612,24 @@ provenance can never affect a verdict:
   one signature authenticates a whole range.
 
 `ts_cli --verify-manifests <audit-log>` re-walks the chain, verifies every
-signature against the published key, and confirms **coverage** (no committed
-entry lacks a covering signature — gaps are reported, never silently passed).
+signature, and confirms **coverage** (no committed entry lacks a covering
+signature — gaps are reported, never silently passed).
 
-- **What it adds:** offline non-repudiation. A regenerated/forged chain signed
-  with a *different* key has an intact chain but **fails authenticity** against
-  the genuine public key (covered by the `forgery_with_different_key_fails_authenticity`
-  test).
+- **Key distribution (critical — JG-RT-026).** Authenticity holds only against a
+  public key the verifier trusts *out-of-band*. The verifier reads the published
+  `<log>.manifests.pub` for convenience, but that file lives beside the log: an
+  attacker who can rewrite the log can also rewrite the pubkey and re-sign with
+  their own key, producing a self-consistent forgery. So a verifier asserting
+  authenticity against a malicious log-holder **must** pin the genuine key with
+  `--verify-manifests … --manifest-pubkey <hex>` (the key is printed at daemon
+  startup; record it on a trusted host). Without `--manifest-pubkey`, the result
+  is flagged `pubkey_pinned = false` and proves only internal self-consistency
+  (catches accidental corruption, not malicious regeneration).
+- **What it adds:** offline non-repudiation **against a pinned key**. A
+  regenerated/forged chain signed with a *different* key has an intact chain but
+  **fails authenticity** when checked against the genuine pinned key (covered by
+  the `forgery_with_different_key_fails_authenticity` and
+  `swapped_pubkey_forgery_defeated_only_by_pinned_key` tests).
 - **What it does NOT add:** defence against an attacker who already holds the live
   signing key (root on the host) — the same root-trust boundary as the fleet key.
   Making *silent* retroactive forgery detectable requires external transparency

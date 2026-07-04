@@ -540,11 +540,25 @@ pub struct ManifestVerification {
     /// Committed entry indices with no covering signature (per-action or
     /// enclosing checkpoint).
     pub uncovered_indices: Vec<u64>,
+    /// Whether the verifying key was **pinned out-of-band** by the caller
+    /// (`true`) or read from the in-directory `<log>.manifests.pub` (`false`).
+    ///
+    /// This is a trust qualifier, not a pass/fail: against an attacker who can
+    /// rewrite the audit log, the in-directory pubkey is *also* attacker-writable,
+    /// so an unpinned verification only proves internal self-consistency (catches
+    /// accidental corruption / non-malicious regeneration). Genuine
+    /// non-repudiation requires a pubkey obtained from a trusted channel.
+    pub pubkey_pinned: bool,
 }
 
 impl ManifestVerification {
     /// True only when the chain is intact, every record is authentic, and every
     /// committed entry is covered. This is the CLI's exit-zero condition.
+    ///
+    /// Note: this does **not** require the key to be pinned — an unpinned run can
+    /// still report `ok`, but only as self-consistency. Callers asserting
+    /// authenticity against a malicious log-holder must also check
+    /// [`Self::pubkey_pinned`].
     pub fn ok(&self) -> bool {
         self.chain_intact
             && self.authenticity_failures.is_empty()
@@ -570,23 +584,39 @@ fn parse_sig(sig_hex: &str) -> Result<Signature> {
     Ok(Signature::from_bytes(&arr))
 }
 
-fn load_pubkey(pubkey_path: &str) -> Result<VerifyingKey> {
-    let raw = fs::read_to_string(pubkey_path)
-        .with_context(|| format!("reading manifest pubkey {pubkey_path}"))?;
+/// Parse a 32-byte Ed25519 public key from a lowercase-hex string (64 chars).
+pub fn pubkey_from_hex(raw: &str) -> Result<VerifyingKey> {
     let bytes = hex::decode(raw.trim()).context("manifest pubkey is not valid hex")?;
     let arr: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow!("manifest pubkey must be 32 bytes"))?;
+        .map_err(|_| anyhow!("manifest pubkey must be 32 bytes (64 hex chars)"))?;
     VerifyingKey::from_bytes(&arr).map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))
 }
 
-/// Verify the manifests for an audit log: chain integrity, signature authenticity
-/// (against the published pubkey), and coverage of every committed entry.
+fn load_pubkey(pubkey_path: &str) -> Result<VerifyingKey> {
+    let raw = fs::read_to_string(pubkey_path)
+        .with_context(|| format!("reading manifest pubkey {pubkey_path}"))?;
+    pubkey_from_hex(&raw)
+}
+
+/// Verify the manifests for an audit log: chain integrity, signature authenticity,
+/// and coverage of every committed entry.
 ///
 /// `audit_log_path` is the chain JSONL; the manifests are expected at
-/// `<audit_log_path>.manifests` and the pubkey at `<...>.manifests.pub`.
-pub fn verify_manifests(audit_log_path: &str) -> Result<ManifestVerification> {
+/// `<audit_log_path>.manifests`.
+///
+/// `pinned_pubkey_hex` is the **trusted** Ed25519 public key (hex), obtained
+/// out-of-band. When `Some`, authenticity is checked against it and the
+/// in-directory `<...>.manifests.pub` is ignored — this is the only mode that
+/// gives non-repudiation against an attacker who can rewrite the log (such an
+/// attacker can also rewrite the in-directory pubkey). When `None`, the verifier
+/// falls back to the published in-directory pubkey for convenience (detects
+/// accidental corruption only); the result's `pubkey_pinned` flag is `false`.
+pub fn verify_manifests(
+    audit_log_path: &str,
+    pinned_pubkey_hex: Option<&str>,
+) -> Result<ManifestVerification> {
     let entries = read_chain(audit_log_path)?;
 
     // ── 1. Chain integrity (independent re-walk; same rule as AuditLogger). ──
@@ -624,22 +654,29 @@ pub fn verify_manifests(audit_log_path: &str) -> Result<ManifestVerification> {
         authentic_records: 0,
         authenticity_failures: Vec::new(),
         uncovered_indices: Vec::new(),
+        pubkey_pinned: pinned_pubkey_hex.is_some(),
     };
 
-    // A missing pubkey is not a parse error — it means provenance was never
-    // enabled (or the published key is absent). Report it as a coverage gap
-    // (every entry uncovered) rather than aborting the whole verification.
-    let pubkey = match load_pubkey(&pubkey_path) {
-        Ok(pk) => pk,
-        Err(err) => {
-            result
-                .authenticity_failures
-                .push(format!("no published pubkey at {pubkey_path}: {err}"));
-            for entry in &entries {
-                result.uncovered_indices.push(entry.index);
+    // Select the trusted key. A *pinned* key (out-of-band) is the only one that
+    // resists a malicious log-holder; a bad pinned key is operator error → hard
+    // fail. Otherwise fall back to the in-directory published key (convenience):
+    // a missing one means provenance was never enabled, reported as a coverage
+    // gap rather than aborting.
+    let pubkey = match pinned_pubkey_hex {
+        Some(hex_key) => pubkey_from_hex(hex_key)
+            .context("invalid --manifest-pubkey (expected 64 hex chars of an Ed25519 key)")?,
+        None => match load_pubkey(&pubkey_path) {
+            Ok(pk) => pk,
+            Err(err) => {
+                result
+                    .authenticity_failures
+                    .push(format!("no published pubkey at {pubkey_path}: {err}"));
+                for entry in &entries {
+                    result.uncovered_indices.push(entry.index);
+                }
+                return Ok(result);
             }
-            return Ok(result);
-        }
+        },
     };
     let expected_key_id = key_id_from_pubkey(&pubkey);
 
@@ -844,7 +881,7 @@ mod tests {
         populate_chain(&base, 5);
         sign_existing_chain(&base, &key, false, 2);
 
-        let v = verify_manifests(&base).unwrap();
+        let v = verify_manifests(&base, None).unwrap();
         assert!(v.chain_intact, "chain must be intact");
         assert!(v.ok(), "clean log must verify: {v:?}");
         assert!(v.uncovered_indices.is_empty());
@@ -860,7 +897,7 @@ mod tests {
         populate_chain(&base, 4);
         sign_existing_chain(&base, &key, true, 1000);
 
-        let v = verify_manifests(&base).unwrap();
+        let v = verify_manifests(&base, None).unwrap();
         assert!(v.ok(), "per-action log must verify: {v:?}");
         assert_eq!(v.uncovered_indices.len(), 0);
         cleanup(&base);
@@ -885,7 +922,7 @@ mod tests {
         }
         fs::write(&base, lines.join("\n") + "\n").unwrap();
 
-        let v = verify_manifests(&base).unwrap();
+        let v = verify_manifests(&base, None).unwrap();
         assert!(!v.chain_intact, "tamper must break the chain");
         assert!(!v.ok(), "tampered log must not verify");
         cleanup(&base);
@@ -904,7 +941,7 @@ mod tests {
         populate_chain(&base, 3);
         // Genuine signer publishes the real pubkey + manifests.
         sign_existing_chain(&base, &genuine_key, false, 2);
-        let genuine = verify_manifests(&base).unwrap();
+        let genuine = verify_manifests(&base, None).unwrap();
         assert!(genuine.ok(), "genuine log must verify first: {genuine:?}");
 
         // Attacker regenerates a fully self-consistent set of manifests with their
@@ -920,13 +957,70 @@ mod tests {
         // Restore the genuine published pubkey the verifier trusts.
         fs::write(format!("{base}.manifests.pub"), pub_backup).unwrap();
 
-        let forged = verify_manifests(&base).unwrap();
+        let forged = verify_manifests(&base, None).unwrap();
         assert!(forged.chain_intact, "chain itself is still self-consistent");
         assert!(
             !forged.ok(),
             "forged manifests must fail authenticity against the genuine pubkey: {forged:?}"
         );
         assert!(!forged.authenticity_failures.is_empty());
+
+        cleanup(&base);
+        let _ = fs::remove_file(&genuine_key);
+        let _ = fs::remove_file(&attacker_key);
+    }
+
+    #[test]
+    fn swapped_pubkey_forgery_defeated_only_by_pinned_key() {
+        // JG-RT-026: an attacker who can rewrite the audit log can ALSO rewrite the
+        // in-directory `<log>.manifests.pub`. If the verifier trusts that in-dir key
+        // (the `None` / convenience path), a fully self-consistent forgery — manifests
+        // re-signed with the attacker's key AND that key published as the pubkey —
+        // passes. Genuine non-repudiation requires PINNING the real key out-of-band.
+        let base = unique_path("swapkey");
+        cleanup(&base);
+        let genuine_key = format!("{base}.genuine.key");
+        let attacker_key = format!("{base}.attacker.key");
+
+        populate_chain(&base, 3);
+        let genuine_signer =
+            ManifestSigner::load_or_generate(&genuine_key, &base, false, 0, 2).unwrap();
+        for entry in read_chain(&base).unwrap() {
+            genuine_signer.record_entry(&entry).unwrap();
+        }
+        genuine_signer.flush().unwrap();
+        let genuine_pubkey_hex = genuine_signer.public_key_hex();
+
+        // Attacker rewrites BOTH the manifests and the published pubkey.
+        let _ = fs::remove_file(format!("{base}.manifests"));
+        let attacker = ManifestSigner::load_or_generate(&attacker_key, &base, false, 0, 2).unwrap();
+        for entry in read_chain(&base).unwrap() {
+            attacker.record_entry(&entry).unwrap();
+        }
+        attacker.flush().unwrap();
+        // attacker.load_or_generate already overwrote `<base>.manifests.pub` with
+        // the attacker key — the in-dir pubkey is now attacker-controlled.
+
+        // Convenience mode (None) trusts the in-dir key → the forgery LOOKS ok, but
+        // the result is explicitly flagged as not pinned (self-consistency only).
+        let unpinned = verify_manifests(&base, None).unwrap();
+        assert!(
+            unpinned.ok(),
+            "self-consistent forgery passes the convenience path: {unpinned:?}"
+        );
+        assert!(
+            !unpinned.pubkey_pinned,
+            "convenience path must report pubkey_pinned=false"
+        );
+
+        // Pinned to the genuine key (out-of-band) → attacker signatures fail.
+        let pinned = verify_manifests(&base, Some(&genuine_pubkey_hex)).unwrap();
+        assert!(pinned.pubkey_pinned);
+        assert!(
+            !pinned.ok(),
+            "pinned genuine key must reject attacker-signed manifests: {pinned:?}"
+        );
+        assert!(!pinned.authenticity_failures.is_empty());
 
         cleanup(&base);
         let _ = fs::remove_file(&genuine_key);
@@ -946,13 +1040,13 @@ mod tests {
         logger.log(&obs, &intent, &assessment, &decision).unwrap();
         sign_existing_chain(&base, &key, true, 2);
 
-        let before = verify_manifests(&base).unwrap();
+        let before = verify_manifests(&base, None).unwrap();
         assert!(before.ok(), "must verify before erasure: {before:?}");
 
         // Erase the subject's PII (no-op on the chain bytes by design).
         let _ = logger.erase_uid(4242);
 
-        let after = verify_manifests(&base).unwrap();
+        let after = verify_manifests(&base, None).unwrap();
         assert!(after.ok(), "must still verify after erasure: {after:?}");
         assert_eq!(before.chain_intact, after.chain_intact);
         cleanup(&base);
