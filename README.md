@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/AlphaReasoning/The-Jinn-Guard/actions/workflows/ci.yml)
 
+> 🛡️ **Break-It Challenge is open** — think a governed agent can escape the BPF-LSM floor, lock out the operator, or win an ALLOW that should be a DENY? Try to break it. Public credit for valid findings; it all reproduces locally. See [`BREAK_IT_CHALLENGE.md`](BREAK_IT_CHALLENGE.md).
+
 **Jinn Guard** is an asynchronous, kernel-aware agent governance daemon designed to enforce safety constraints on autonomous AI agents before any tool execution is permitted. It evaluates agent actions using a keyword/intent heuristic plus an optional external AI semantic scorer, and processes them through a lifetime-anchored **Z3 SMT solver pipeline** — performing constraint checks on state transitions and risk ceilings against formalized compliance models before granting or denying execution authority.
 
 Operating locally over high-throughput **UNIX domain sockets**, the platform binds user-space proxy validation with low-level **eBPF kernel telemetry** and namespace tracking to enforce zero-trust process isolation and anti-replay protection for governed cgroups.
