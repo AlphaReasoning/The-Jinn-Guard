@@ -529,9 +529,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
         (fresh, guard.next_lineage_seq())
     };
     if !fresh {
-        eprintln!(
-            "[mcp_gateway] DENY_REPLAY_ATTACK peer={peer_ip} agent={agent_id} nonce={nonce}"
-        );
+        eprintln!("[mcp_gateway] DENY_REPLAY_ATTACK peer={peer_ip} agent={agent_id} nonce={nonce}");
         let body = serde_json::to_vec(&serde_json::json!({
             "signal": "DENY_REPLAY_ATTACK",
             "reason": "replay_attack",
@@ -1414,9 +1412,19 @@ mod mcp_gateway_tests {
         )
         .unwrap();
         let n = semantic_request_nonce("a", &base.method, &base.params);
-        assert_ne!(n, semantic_request_nonce("a", &diff_method.method, &diff_method.params));
-        assert_ne!(n, semantic_request_nonce("a", &diff_param.method, &diff_param.params));
-        assert_ne!(n, semantic_request_nonce("b", &base.method, &base.params), "agent must matter");
+        assert_ne!(
+            n,
+            semantic_request_nonce("a", &diff_method.method, &diff_method.params)
+        );
+        assert_ne!(
+            n,
+            semantic_request_nonce("a", &diff_param.method, &diff_param.params)
+        );
+        assert_ne!(
+            n,
+            semantic_request_nonce("b", &base.method, &base.params),
+            "agent must matter"
+        );
     }
 
     /// The `jg_nonce` freshness token is excluded from the semantic identity, so
@@ -1444,7 +1452,10 @@ mod mcp_gateway_tests {
         let mut g = McpReplayGuard::with_capacity(16);
         let key = ("agent_x".to_string(), 42u64);
         assert!(g.observe(key.clone()), "first observe must be NEW");
-        assert!(!g.observe(key.clone()), "second observe of same key must be a replay");
+        assert!(
+            !g.observe(key.clone()),
+            "second observe of same key must be a replay"
+        );
     }
 
     /// McpReplayGuard: different (agent, nonce) pairs are independent.
@@ -1453,7 +1464,10 @@ mod mcp_gateway_tests {
         let mut g = McpReplayGuard::with_capacity(16);
         assert!(g.observe(("agent_x".to_string(), 1)), "nonce 1 must be NEW");
         assert!(g.observe(("agent_x".to_string(), 2)), "nonce 2 must be NEW");
-        assert!(!g.observe(("agent_x".to_string(), 1)), "nonce 1 must now be a replay");
+        assert!(
+            !g.observe(("agent_x".to_string(), 1)),
+            "nonce 1 must now be a replay"
+        );
     }
 
     /// McpReplayGuard: eviction at capacity allows old nonces to be re-observed
@@ -1498,4 +1512,3 @@ mod mcp_gateway_tests {
         assert!(b > a && c > b, "seq must be strictly increasing");
     }
 }
-

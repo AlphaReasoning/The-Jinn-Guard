@@ -153,10 +153,7 @@ impl<'a> PolicyEngine<'a> {
             let lhs_scaled = lhs_val * SCALE;
             let rhs_scaled = rhs_val * SCALE;
             for (name, scaled) in [(lhs, lhs_scaled), (rhs_str.trim(), rhs_scaled)] {
-                if !scaled.is_finite()
-                    || scaled > i32::MAX as f64
-                    || scaled < i32::MIN as f64
-                {
+                if !scaled.is_finite() || scaled > i32::MAX as f64 || scaled < i32::MIN as f64 {
                     return Err(anyhow!(
                         "POLICY_INVARIANT_OUT_OF_RANGE: operand '{}' = {} exceeds the \
                          representable fixed-point range — denying (fail-closed)",

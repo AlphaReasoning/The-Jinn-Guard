@@ -285,10 +285,19 @@ mod system_immunity_tests {
         // JG-RT-032b: a governed agent drops a file named like a system binary in
         // a writable location and execs it. The /proc/exe basename matches an
         // immune name, but the DIRECTORY is untrusted → no immunity.
-        assert!(!path_is_immune("/home/agent/bash"), "$HOME binary must not be immune");
+        assert!(
+            !path_is_immune("/home/agent/bash"),
+            "$HOME binary must not be immune"
+        );
         assert!(!path_is_immune("/tmp/sh"), "/tmp binary must not be immune");
-        assert!(!path_is_immune("/dev/shm/cargo"), "/dev/shm binary must not be immune");
-        assert!(!path_is_immune("/run/user/1000/systemd"), "/run/user binary must not be immune");
+        assert!(
+            !path_is_immune("/dev/shm/cargo"),
+            "/dev/shm binary must not be immune"
+        );
+        assert!(
+            !path_is_immune("/run/user/1000/systemd"),
+            "/run/user binary must not be immune"
+        );
         // …and through the kernel-attested observation path.
         let obs = observation(Some("/home/agent/bash"), "bash");
         assert!(!observation_is_immune(&obs));

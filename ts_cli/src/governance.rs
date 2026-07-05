@@ -1447,8 +1447,9 @@ fn pii_open(master_key: &[u8], nonce: &[u8], ct: &[u8], tag: &[u8]) -> Result<Ve
     let mut mac =
         <Hmac<Sha256>>::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts a key of any length");
     mac.update(&mac_input);
-    mac.verify_slice(tag)
-        .map_err(|_| anyhow!("audit_pii: AEAD tag mismatch — ciphertext tampered or key destroyed"))?;
+    mac.verify_slice(tag).map_err(|_| {
+        anyhow!("audit_pii: AEAD tag mismatch — ciphertext tampered or key destroyed")
+    })?;
 
     let mut pt = ct.to_vec();
     ctr_xor(&enc_key, &mut pt);
@@ -3004,9 +3005,7 @@ mod tests {
             bytes.extend_from_slice(&wal);
         }
         for needle in ["hunter2", "/home/alice/secret-tool"] {
-            let recoverable = bytes
-                .windows(needle.len())
-                .any(|w| w == needle.as_bytes());
+            let recoverable = bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
             assert!(
                 !recoverable,
                 "plaintext PII '{needle}' is still recoverable from the raw DB after \

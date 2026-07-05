@@ -1279,9 +1279,27 @@ fn is_numeric_arg(token: &str) -> bool {
 /// `nohup ruby …`. Each consumes its own leading flags / `NAME=val` / numeric
 /// args before the wrapped command head.
 const COMMAND_WRAPPERS: &[&str] = &[
-    "env", "timeout", "nohup", "nice", "ionice", "stdbuf", "setsid", "time", "xargs", "sudo",
-    "doas", "command", "exec", "chroot", "unshare", "flock", "watch", "eatmydata", "proxychains",
-    "strace", "ltrace",
+    "env",
+    "timeout",
+    "nohup",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "setsid",
+    "time",
+    "xargs",
+    "sudo",
+    "doas",
+    "command",
+    "exec",
+    "chroot",
+    "unshare",
+    "flock",
+    "watch",
+    "eatmydata",
+    "proxychains",
+    "strace",
+    "ltrace",
 ];
 
 /// Resolve the effective command head of a single command segment: skip leading
@@ -6181,7 +6199,9 @@ mod interpreter_bypass_tests {
         assert_eq!(
             interpreter_bypass_denied(
                 Some(&n),
-                Some(&shell("/opt/agent/run_model --msg 'run python3 later; or sh'"))
+                Some(&shell(
+                    "/opt/agent/run_model --msg 'run python3 later; or sh'"
+                ))
             ),
             None
         );
@@ -6632,7 +6652,10 @@ mod decision_property_tests {
                     "risk {fused} in [{floor}, {ceiling}] must CONSTRAIN, not allow"
                 );
             } else {
-                assert!(d.is_allow(), "risk {fused} below floor {floor} should allow");
+                assert!(
+                    d.is_allow(),
+                    "risk {fused} below floor {floor} should allow"
+                );
             }
         }
     }
