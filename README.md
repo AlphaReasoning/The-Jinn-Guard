@@ -357,6 +357,27 @@ flaw. It is explicit about which verdicts the real daemon enforces today
 
 ## 🚀 Quick Start
 
+### One command (bare host → running node)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlphaReasoning/The-Jinn-Guard/main/deploy/bootstrap.sh | sh -s -- --start-now
+```
+
+`deploy/bootstrap.sh` detects your distro, kernel, arch, BTF and BPF-LSM state,
+installs the right dependencies via the native package manager (apt/dnf/yum/
+zypper/pacman), ensures a Rust toolchain, fetches the source, and hands off to
+the privileged installer below. It never weakens the security posture —
+fail-closed defaults, no desktop lockout, and safe-mode stays opt-in. Preview
+everything it will do without changing anything:
+
+```bash
+sh deploy/bootstrap.sh --dry-run           # print the full plan, run nothing
+sh deploy/bootstrap.sh --arm-lsm --safe-mode --start-now   # also arm lsm=bpf (reboot), start audit-only
+```
+
+If you prefer to drive each step yourself, use the prerequisites + installer
+below.
+
 ### Prerequisites
 
 ```bash

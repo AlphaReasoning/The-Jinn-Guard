@@ -8,10 +8,10 @@
 //! 5. **ALLOW**: forward to upstream (`--mcp-upstream`) and stream the response back.
 //! 6. **DENY**: return HTTP 403 with the deny signal as the JSON body.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 use serde::{Deserialize, Serialize};
@@ -69,9 +69,124 @@ struct JsonRpcErrorObj {
 // Synthetic agent_id derivation
 // ---------------------------------------------------------------------------
 
-/// Derive a deterministic synthetic agent_id from the client IP address using
-/// an HMAC-SHA256 over the IP string.  This allows the governance pipeline to
-/// track per-IP behavioral lineage without requiring the caller to register.
+// Derive a deterministic synthetic agent_id from the client IP address using an
+// HMAC-SHA256 over the IP string, so the governance pipeline can track per-IP
+// behavioral lineage without requiring the caller to register.
+
+// ---------------------------------------------------------------------------
+// Per-gateway replay guard (JG-RT-L3)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of (agent_id, nonce) pairs retained in the MCP replay window.
+/// Same order-of-magnitude as the UDS `MAX_REPLAY_ENTRIES`.
+const MCP_MAX_REPLAY_ENTRIES: usize = 1 << 20;
+
+/// Default replay window (seconds). A given `(agent, nonce)` is treated as a
+/// replay only if re-seen within this window; an identical *legitimate* request
+/// issued later is allowed. Bounds both false positives and the replay exposure
+/// (standard timestamp-window trade-off). Overridable via
+/// `JINNGUARD_MCP_REPLAY_WINDOW_SECS`.
+const MCP_DEFAULT_REPLAY_WINDOW_SECS: u64 = 120;
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Bounded, time-windowed replay guard shared across all MCP connections on this
+/// gateway instance. Mirrors the UDS-path `ReplayGuard` in `main.rs`; defined
+/// here to avoid cross-module visibility coupling. Also hands out the monotonic
+/// lineage sequence so replay detection and lineage ordering stay decoupled
+/// (JG-RT-L3b: feeding a content-hash into the strictly-increasing lineage
+/// `validate_sequence` spuriously rejected ~half of legitimate distinct requests).
+pub(crate) struct McpReplayGuard {
+    /// `(agent_id, nonce)` → unix-secs it was last seen.
+    seen: HashMap<(String, u64), u64>,
+    order: VecDeque<(String, u64)>,
+    cap: usize,
+    window_secs: u64,
+    /// Strictly-increasing, non-zero lineage sequence source.
+    next_seq: u64,
+}
+
+impl McpReplayGuard {
+    #[cfg(test)]
+    fn with_capacity(cap: usize) -> Self {
+        Self::with_capacity_and_window(cap, MCP_DEFAULT_REPLAY_WINDOW_SECS)
+    }
+
+    fn with_capacity_and_window(cap: usize, window_secs: u64) -> Self {
+        Self {
+            seen: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+            window_secs: window_secs.max(1),
+            next_seq: 0,
+        }
+    }
+
+    /// Monotonic, strictly-increasing, non-zero sequence for lineage ordering.
+    /// Decoupled from the replay nonce so a content-derived nonce never trips the
+    /// lineage `sequence <= last` replay check.
+    fn next_lineage_seq(&mut self) -> u64 {
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if self.next_seq == 0 {
+            self.next_seq = 1;
+        }
+        self.next_seq
+    }
+
+    /// Returns `true` if the `(agent_id, nonce)` pair is NEW; `false` if it was
+    /// already seen within the replay window. Uses wall-clock now.
+    fn observe(&mut self, key: (String, u64)) -> bool {
+        self.observe_at(key, now_secs())
+    }
+
+    /// Time-injectable core (tests pass an explicit `now_secs`).
+    fn observe_at(&mut self, key: (String, u64), now_secs: u64) -> bool {
+        if let Some(&last) = self.seen.get(&key) {
+            if now_secs.saturating_sub(last) < self.window_secs {
+                return false; // replay within the window
+            }
+        }
+        if self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(key.clone(), now_secs);
+        self.order.push_back(key);
+        true
+    }
+}
+
+/// Derive a u64 replay nonce from the request's **semantic identity** —
+/// `agent_id ‖ method ‖ canonical(params)` with the `jg_nonce` freshness token
+/// removed — rather than the raw body. This is the JG-RT-L3b fix: hashing the
+/// raw body let an attacker evade replay detection by mutating any non-semantic
+/// byte (the JSON-RPC `id`, whitespace) while replaying the same dangerous
+/// `method`+`params`. serde_json's `Map` is a `BTreeMap` (no `preserve_order`
+/// feature), so serialization is key-sorted → canonical.
+fn semantic_request_nonce(agent_id: &str, method: &str, params: &Value) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut canon = params.clone();
+    if let Some(obj) = canon.as_object_mut() {
+        obj.remove("jg_nonce");
+    }
+    let params_bytes = serde_json::to_vec(&canon).unwrap_or_default();
+    let mut h = Sha256::new();
+    h.update(agent_id.as_bytes());
+    h.update(b"|");
+    h.update(method.as_bytes());
+    h.update(b"|");
+    h.update(&params_bytes);
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().unwrap())
+}
+
 fn synthetic_agent_id(peer_ip: &str, secret: &[u8]) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
@@ -318,6 +433,7 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     telemetry_store: TelemetryStore,
     secret: Arc<Vec<u8>>,
     upstream_addr: String,
+    nonce_store: Arc<Mutex<McpReplayGuard>>,
 ) {
     // Read the incoming HTTP request.
     let http_req = match timeout(MCP_REQUEST_READ_TIMEOUT, read_http_request(&mut stream)).await {
@@ -390,11 +506,44 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .and_then(|obj| obj.get("action_risk_score"))
         .and_then(|v| v.as_f64());
 
-    // Build a synthetic sequence counter from the current timestamp.
-    let seq = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // ── Replay detection (JG-RT-L3 / L3b) ────────────────────────────────
+    // Prefer an explicit client-supplied nonce (`jg_nonce` u64 in params). Else
+    // derive the nonce from the request's SEMANTIC identity (method + canonical
+    // params), NOT the raw body — otherwise an attacker evades detection by
+    // mutating a non-semantic byte (the JSON-RPC `id`, whitespace) while replaying
+    // the same dangerous method+params. Checked against the shared time-windowed
+    // McpReplayGuard before anything else runs.
+    let nonce: u64 = jsonrpc
+        .params
+        .as_object()
+        .and_then(|o| o.get("jg_nonce"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| semantic_request_nonce(&agent_id, &jsonrpc.method, &jsonrpc.params));
+
+    // Single lock: test the replay nonce AND draw the monotonic lineage seq. The
+    // seq is DECOUPLED from the content nonce so a hash value never trips
+    // lineage's strictly-increasing `validate_sequence` check (JG-RT-L3b).
+    let (fresh, seq) = {
+        let mut guard = nonce_store.lock().unwrap();
+        let fresh = guard.observe((agent_id.clone(), nonce));
+        (fresh, guard.next_lineage_seq())
+    };
+    if !fresh {
+        eprintln!("[mcp_gateway] DENY_REPLAY_ATTACK peer={peer_ip} agent={agent_id} nonce={nonce}");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "signal": "DENY_REPLAY_ATTACK",
+            "reason": "replay_attack",
+            "jsonrpc": "2.0",
+            "id": jsonrpc.id,
+            "error": {
+                "code": -32600,
+                "message": "Request denied by Jinn Guard: replay attack detected",
+            }
+        }))
+        .unwrap_or_default();
+        let _ = write_http_response(&mut stream, 403, "Forbidden", "application/json", &body).await;
+        return;
+    }
 
     let proposal = ClientProposal {
         sequence_counter: seq,
@@ -628,22 +777,42 @@ pub(crate) async fn handle_mcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // ── Lineage tracking ─────────────────────────────────────────────────
-    let lineage_ok = {
+    // Sequence validation is now enforced: the nonce doubles as the sequence
+    // counter, so a replayed nonce was already caught above; here we catch
+    // out-of-order fresh nonces (monotonicity). Mirrors the UDS path.
+    let lineage_sequence_err = {
         let mut reg = registry_store.lock().unwrap();
         let lineage = reg
             .data
             .lineages
             .entry(lineage_key.clone())
             .or_insert_with(|| AgentLineage::new(&observation, seq, &assessment));
-        if lineage.validate_sequence(seq).is_err() {
-            false // sequence replay — tolerated for TCP (no strict ordering required)
+        if let Err(e) = lineage.validate_sequence(seq) {
+            Some(e.to_string())
         } else {
             lineage.record(&observation, seq, &assessment);
             let _ = reg.save();
-            true
+            None
         }
     };
-    let _ = lineage_ok; // MCP gateway is lenient on sequence ordering
+    if let Some(err) = lineage_sequence_err {
+        eprintln!(
+            "[mcp_gateway] DENY_REPLAY_ATTACK peer={peer_ip} agent={agent_id} lineage_err={err}"
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "signal": "DENY_REPLAY_ATTACK",
+            "reason": "lineage_sequence_invalid",
+            "jsonrpc": "2.0",
+            "id": jsonrpc.id,
+            "error": {
+                "code": -32600,
+                "message": format!("Request denied by Jinn Guard: {err}"),
+            }
+        }))
+        .unwrap_or_default();
+        let _ = write_http_response(&mut stream, 403, "Forbidden", "application/json", &body).await;
+        return;
+    }
 
     // ── Policy decision ──────────────────────────────────────────────────
     let decision = policy_decision(&assessment, &current_policy);
@@ -939,6 +1108,15 @@ pub(crate) async fn run_mcp_gateway(
     secret: Arc<Vec<u8>>,
     tls: Option<Arc<SslAcceptor>>,
 ) {
+    // Shared replay guard for all MCP connections on this gateway instance.
+    let window_secs = std::env::var("JINNGUARD_MCP_REPLAY_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MCP_DEFAULT_REPLAY_WINDOW_SECS);
+    let nonce_store: Arc<Mutex<McpReplayGuard>> = Arc::new(Mutex::new(
+        McpReplayGuard::with_capacity_and_window(MCP_MAX_REPLAY_ENTRIES, window_secs),
+    ));
     let addr = format!("[::]:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -962,6 +1140,7 @@ pub(crate) async fn run_mcp_gateway(
                 let upstream_clone = upstream.clone();
                 let secret_clone = Arc::clone(&secret);
                 let tls_clone = tls.clone();
+                let nonce_clone = Arc::clone(&nonce_store);
 
                 tokio::spawn(async move {
                     let worker = tokio::spawn(async move {
@@ -980,6 +1159,7 @@ pub(crate) async fn run_mcp_gateway(
                                         telemetry_clone,
                                         secret_clone,
                                         upstream_clone,
+                                        nonce_clone,
                                     )
                                     .await;
                                 }
@@ -997,6 +1177,7 @@ pub(crate) async fn run_mcp_gateway(
                                     telemetry_clone,
                                     secret_clone,
                                     upstream_clone,
+                                    nonce_clone,
                                 )
                                 .await;
                             }
@@ -1191,5 +1372,143 @@ mod mcp_gateway_tests {
             err.contains("upstream response exceeds limit"),
             "got: {err}"
         );
+    }
+
+    // ── JG-RT-L3: MCP replay guard ──────────────────────────────────────────
+
+    /// JG-RT-L3b: the semantic nonce must ignore non-semantic bytes (JSON-RPC
+    /// `id`, whitespace, param key order) — otherwise an attacker replays the
+    /// same dangerous method+params while flipping the id to evade detection.
+    #[test]
+    fn semantic_nonce_ignores_nonsemantic_bytes() {
+        let a: JsonRpcRequest = serde_json::from_slice(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rm","arg":"x"}}"#,
+        )
+        .unwrap();
+        let b: JsonRpcRequest = serde_json::from_slice(
+            br#"{  "jsonrpc":"2.0",  "id":99999,  "method":"tools/call",  "params":{"arg":"x","name":"rm"}  }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            semantic_request_nonce("agent_a", &a.method, &a.params),
+            semantic_request_nonce("agent_a", &b.method, &b.params),
+            "id / whitespace / key-order must not change the semantic nonce"
+        );
+    }
+
+    /// The semantic nonce MUST change with the actual method, params, or agent.
+    #[test]
+    fn semantic_nonce_differs_by_semantic_content() {
+        let base: JsonRpcRequest = serde_json::from_slice(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ls"}}"#,
+        )
+        .unwrap();
+        let diff_method: JsonRpcRequest = serde_json::from_slice(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/other","params":{"name":"ls"}}"#,
+        )
+        .unwrap();
+        let diff_param: JsonRpcRequest = serde_json::from_slice(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rm"}}"#,
+        )
+        .unwrap();
+        let n = semantic_request_nonce("a", &base.method, &base.params);
+        assert_ne!(
+            n,
+            semantic_request_nonce("a", &diff_method.method, &diff_method.params)
+        );
+        assert_ne!(
+            n,
+            semantic_request_nonce("a", &diff_param.method, &diff_param.params)
+        );
+        assert_ne!(
+            n,
+            semantic_request_nonce("b", &base.method, &base.params),
+            "agent must matter"
+        );
+    }
+
+    /// The `jg_nonce` freshness token is excluded from the semantic identity, so
+    /// two requests differing only in jg_nonce hash equal (jg_nonce is instead
+    /// the explicit client-supplied override path).
+    #[test]
+    fn semantic_nonce_excludes_jg_nonce_field() {
+        let a: JsonRpcRequest = serde_json::from_slice(
+            br#"{"jsonrpc":"2.0","id":1,"method":"m","params":{"x":1,"jg_nonce":5}}"#,
+        )
+        .unwrap();
+        let b: JsonRpcRequest = serde_json::from_slice(
+            br#"{"jsonrpc":"2.0","id":1,"method":"m","params":{"x":1,"jg_nonce":9}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            semantic_request_nonce("a", &a.method, &a.params),
+            semantic_request_nonce("a", &b.method, &b.params)
+        );
+    }
+
+    /// McpReplayGuard.observe: first observation is NEW; second is a replay.
+    #[test]
+    fn mcp_replay_guard_catches_replay() {
+        let mut g = McpReplayGuard::with_capacity(16);
+        let key = ("agent_x".to_string(), 42u64);
+        assert!(g.observe(key.clone()), "first observe must be NEW");
+        assert!(
+            !g.observe(key.clone()),
+            "second observe of same key must be a replay"
+        );
+    }
+
+    /// McpReplayGuard: different (agent, nonce) pairs are independent.
+    #[test]
+    fn mcp_replay_guard_allows_distinct_nonces() {
+        let mut g = McpReplayGuard::with_capacity(16);
+        assert!(g.observe(("agent_x".to_string(), 1)), "nonce 1 must be NEW");
+        assert!(g.observe(("agent_x".to_string(), 2)), "nonce 2 must be NEW");
+        assert!(
+            !g.observe(("agent_x".to_string(), 1)),
+            "nonce 1 must now be a replay"
+        );
+    }
+
+    /// McpReplayGuard: eviction at capacity allows old nonces to be re-observed
+    /// (the bounded-window trade-off, same semantics as the UDS ReplayGuard).
+    #[test]
+    fn mcp_replay_guard_evicts_at_capacity() {
+        let mut g = McpReplayGuard::with_capacity(2);
+        g.observe(("a".to_string(), 1));
+        g.observe(("a".to_string(), 2));
+        // Inserting a third entry evicts the first.
+        g.observe(("a".to_string(), 3));
+        // Nonce 1 was evicted, so it is accepted again.
+        assert!(
+            g.observe(("a".to_string(), 1)),
+            "evicted nonce must be re-accepted (bounded window)"
+        );
+    }
+
+    /// JG-RT-L3b: an identical request is a replay only WITHIN the time window;
+    /// a legitimate repeat after the window elapses is allowed again.
+    #[test]
+    fn mcp_replay_guard_allows_repeat_after_window() {
+        let mut g = McpReplayGuard::with_capacity_and_window(16, 60);
+        let key = ("a".to_string(), 7u64);
+        assert!(g.observe_at(key.clone(), 1000), "first observe is new");
+        assert!(!g.observe_at(key.clone(), 1030), "within window → replay");
+        assert!(
+            g.observe_at(key.clone(), 1000 + 60),
+            "at/after the window the identical request is allowed again"
+        );
+    }
+
+    /// JG-RT-L3b: the lineage sequence is monotonic and non-zero regardless of
+    /// the (content-derived) replay nonce, so it never trips validate_sequence.
+    #[test]
+    fn mcp_lineage_seq_is_strictly_increasing_and_nonzero() {
+        let mut g = McpReplayGuard::with_capacity(16);
+        let a = g.next_lineage_seq();
+        let b = g.next_lineage_seq();
+        let c = g.next_lineage_seq();
+        assert!(a >= 1, "seq must be non-zero");
+        assert!(b > a && c > b, "seq must be strictly increasing");
     }
 }

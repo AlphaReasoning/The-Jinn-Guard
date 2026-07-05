@@ -148,7 +148,12 @@ fi
 BINARY="$REPO_ROOT/target/release/ts_cli"
 info "Building fresh enterprise release binary (this may take a minute)..."
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-    sudo -u "$SUDO_USER" env "PATH=$PATH" \
+    # Drop back to the invoking user AND restore their PATH: this script runs as
+    # root, so $PATH here is root's and lacks the user's rustup ~/.cargo/bin.
+    # Resolve the user's home explicitly and prepend their cargo bin so a
+    # per-user rustup toolchain is found (the common non-system-Rust case).
+    USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    sudo -u "$SUDO_USER" env "PATH=${USER_HOME}/.cargo/bin:$PATH" \
         cargo build --release --features enterprise --manifest-path "$REPO_ROOT/Cargo.toml"
 else
     cargo build --release --features enterprise --manifest-path "$REPO_ROOT/Cargo.toml"

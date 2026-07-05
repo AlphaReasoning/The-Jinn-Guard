@@ -385,7 +385,12 @@ checkout and artifact handling.
   `contents: read`. The release workflow already used explicit per-job write/OIDC
   permissions only where publishing and signing require them.
 
-## Batch 23 — Action Manifest verifier key trust (#62 follow-up)
+## Batch 23 — #59 capstone verification round (post #61/#62 surface)
+
+Verification pass over the high-signal leads from the interrupted Round 1. Each
+was reproduced before fixing (failing-first regression test). JG-RT-026 (manifest
+pinned-key) landed first via PR #54 and is now merged to `main`; its writeup is
+retained here for a single consolidated record.
 
 ### JG-RT-026 — `--verify-manifests` trusted the in-directory pubkey (MED, fixed)
 The Action Manifest verifier (#62) read the trusted Ed25519 public key from
@@ -409,13 +414,304 @@ test only passed because it manually restored the genuine pubkey, masking this.)
   at daemon startup; THREAT_MODEL §12.1 documents the out-of-band key-distribution
   requirement.
 
+### JG-RT-027 — GDPR "crypto-shred" was a logical DELETE, not key-destruction (MED, fixed → upgraded to REAL crypto-shredding)
+`AuditLogger` stored personal data (executable path, argv) as **cleartext** columns
+in `audit_pii`; `erase_subject` removed the rows with a plain SQLite `DELETE`.
+Without `PRAGMA secure_delete` the deleted cell bytes remained in freed pages, so
+the "shredded" plaintext was recoverable from the raw `.db` after erasure reported
+success. More fundamentally, "crypto-shredding" implies *the data is encrypted and
+the key is destroyed* — no key existed, so any surviving ciphertext copy (WAL,
+backup, replica) stayed readable.
+- **Repro (fail-first):** `audit_erasure_actually_wipes_plaintext_from_disk` (post-
+  erase plaintext recoverable) and `pii_encrypted_at_rest_not_plaintext` — the
+  latter greps the raw DB and finds `hunter2` **before any erasure**. Verified
+  failing against the prior commit (`git show HEAD:…` + injected test →
+  "plaintext PII 'hunter2' is present at rest"); passes on the fix.
+- **Fix (real crypto-shred):** PII is now AEAD-sealed at rest under a **per-subject
+  master key** kept only in a new `audit_pii_key` table. `read_subject_pii`
+  decrypts on demand; `erase_subject` destroys the key row (and the ciphertext,
+  under `secure_delete` as defence-in-depth). Destroying the key makes every
+  ciphertext for the subject permanently undecryptable regardless of surviving
+  copies — the actual Art. 17 crypto-shred guarantee. Chain hashes are untouched
+  and `verify_chain` still passes identically before/after erasure.
+- **Construction:** built only from the already-vetted `hmac`/`sha2` deps (no new
+  supply-chain surface, `deny.toml` untouched, reproducible): per-record subkeys
+  `enc/mac = HMAC(K, 0x01|0x02 ‖ nonce)`, HMAC-SHA256 counter-mode keystream
+  (SP 800-108 / HKDF-Expand), encrypt-then-MAC with constant-time tag verify. A
+  future hardening may swap to a named AEAD (`chacha20poly1305`) if the team
+  accepts the added dependency; the key-lifecycle guarantee is identical.
+- **Disclosure:** the #61 "crypto-shredding" claim is now **accurate** rather than
+  needing a walk-back. Schema note: `audit_pii` changed shape (ciphertext columns
+  + `audit_pii_key`); pre-existing rc-stage DBs must be re-created or migrated.
+
+### JG-RT-028 — verify_chain() failed OPEN on a deleted/truncated audit log (MED, fixed)
+`verify_chain()` read the JSONL chain with `unwrap_or_default()`; a missing or
+empty file walked cleanly and returned `intact=true, entries=0`, driving the
+tamper-evidence health gauge GREEN. An attacker who deletes the log to destroy
+evidence was reported as "intact". (Tamper *within* a populated log was already
+caught — only the absent/truncated case failed open.)
+- **Repro:** `verify_chain_fails_closed_when_log_deleted_after_entries` — logs two
+  entries, deletes the JSONL, observes `intact=true` before the fix.
+- **Fix:** `verify_chain()` cross-checks the walked line count against the durable
+  SQLite `audit_log` row count; a JSONL shorter than the committed count is
+  reported `intact=false`. Test now passes.
+
+### JG-RT-029 — Z3 invariant i32 saturation let an out-of-range value pass a `<=` check (LOW-MED, fixed)
+`PolicyEngine::verify_policy_invariants` scaled operands with `(v * 1e6) as i32`.
+Values whose scaled form exceeded i32 (`|v| ≳ 2147.48`) saturated to `i32::MAX`,
+so two distinct large operands compared equal and an out-of-range value passed a
+`<=`/`>=` check it should fail (fail-open). Reachable via caller-supplied
+`context_vars` (e.g. through the MCP gateway) when an invariant is authored over a
+caller-influenced variable; the daemon-guaranteed risk variables are all bounded
+well inside the range, which limits real-world reach.
+- **Repro:** `invariant_large_value_does_not_saturate_fail_open` and
+  `invariant_two_distinct_huge_values_are_not_conflated` (ts_checker).
+- **Fix:** out-of-range or non-finite operands are now rejected as a DENY
+  (fail-closed) before the cast, instead of being silently clamped.
+
+### JG-RT-030 — weak-RNG clock-seeded fallback undermined key material (MED, fixed)
+`os_random_bytes` (audit salts + the new JG-RT-027 crypto-shred master keys) and
+`os_random_32` (Ed25519 provenance signing seed) both silently downgraded to a
+**deterministic clock-derived value** if `/dev/urandom` could not be opened. Once
+JG-RT-027 landed, this became load-bearing: a predictable master key makes the
+"destroy the key" crypto-shred meaningless (an attacker re-derives it), and a
+predictable signing seed lets an attacker forge Action Manifest signatures.
+- **Reach:** triggered when the CSPRNG is unavailable (minimal/broken container,
+  seccomp, fd exhaustion). Cannot be faithfully reproduced in-process, so this is
+  verified by construction + build, not a failing-first repro.
+- **Fix:** both draws now use `getrandom(2)` first (no fd required, so fd
+  exhaustion cannot force the weak path), then `/dev/urandom`, and **panic
+  fail-closed** if neither is available — never a fabricated value. Guarded by an
+  entropy smoke test (`os_random_bytes_are_high_entropy_not_clock_seeded`).
+
+### JG-RT-031 — external audit-chain validator accepted tail-truncation (MED-HIGH disclosure, fixed)
+`scripts/validate/verify_audit_chain.py` is the tool the public break-it challenge
+tells reviewers to run to "prove it yourself." It genesis-anchors the chain and
+catches insert/delete/reorder/content-tamper *within* the file and fails on an
+empty file — but it had **no tail anchor**. An attacker who truncates the last K
+entries (deleting the records of their own actions) leaves a valid shorter prefix,
+and the script printed `AUDIT CHAIN VERIFIED ✓`. Same fail-open class as
+JG-RT-028, but in the disclosure-critical external validator.
+- **Repro (CONFIRMED):** built a valid 4-entry chain (incl. a "malicious" entry
+  #3) with the script's own `recompute_hash`, dropped the last line → the script
+  still reported `VERIFIED 3 entries — links intact`. Reproduced end-to-end via
+  `main()` (exit 0).
+- **Fix:** tail anchoring, in order — explicit `--expected-head <hash>` /
+  `--min-entries <n>` pins, else an auto cross-check against the signed
+  `<log>.manifests` sidecar (#62): if the chain's highest index is below the
+  manifest's highest signed index, it FAILS with a truncation error and points to
+  `ts_cli manifest verify` for the authoritative Ed25519 check. Absent any anchor
+  the result now carries an explicit WARNING instead of an unqualified ✓, so it can
+  no longer imply completeness it cannot prove.
+- **Regression test:** `scripts/validate/test_verify_audit_chain_tail_truncation.py`
+  (all three anchors + the unanchored-warning path).
+- **Honesty note:** a bare hash chain fundamentally cannot detect tail-truncation
+  without an external anchor; the stdlib count cross-check catches naive truncation
+  and the signed-manifest verifier (`ts_cli manifest verify`) is authoritative. Both
+  are now surfaced to the reviewer.
+
+### JG-RT-032 — system-process immunity granted on spoofable/attacker fields (HIGH userspace, fixed)
+`immunity_reason_for_observation` (main.rs:2281) emits `SIGNAL: ALLOW` and skips
+ALL risk/Z3/policy evaluation for "system processes", logging the action as
+`system_process_immunity`. It decided immunity from two attacker-controlled
+inputs: (a) `observation.command_line[0]` = `/proc/<pid>/cmdline` argv[0], which a
+process sets freely via execve (`argv[0]="bash"`), and (b) the client-supplied
+`proposed_action` payload (`ShellCommand{command:"bash -c ..."}`). Either let an
+authenticated governed agent obtain a rubber-stamp ALLOW with no risk evaluation.
+Total bypass in audit-only / userspace-only deployments (no kernel BPF-LSM floor
+as backstop); with the kernel floor it still defeats userspace mediation, the MCP
+path, and pollutes the audit trail. `path_is_immune` also basename-matches, so a
+renamed on-disk payload (`/home/agent/bash`) is immune — a harder residual, see
+below.
+- **Repro (CONFIRMED):** `immunity_ignores_spoofable_argv0` and
+  `immunity_ignores_client_supplied_proposed_action` — both previously granted
+  immunity, now denied; `immunity_still_honors_real_system_exe` confirms
+  anti-lockout is preserved.
+- **Fix:** immunity is now decided SOLELY by the kernel-attested `/proc/<pid>/exe`
+  path from SO_PEERCRED (`observation_is_immune`), never by `command_line` or the
+  proposed action. If `/proc/exe` is unreadable there is no trusted identity →
+  fail closed (no immunity, normal policy path). Anti-lockout for real system
+  binaries is unchanged (their real exe is in `IMMUNE_EXACT_PATHS`).
+### JG-RT-032b — immunity basename fallback matched agent-writable paths (MED, fixed)
+Residual of JG-RT-032: `path_is_immune` granted immunity to ANY path whose
+*basename* was in `IMMUNE_PROCESS_NAMES`, regardless of directory. So a governed
+agent that dropped a file literally named `bash`/`sh`/`cargo`/`systemd` in a
+writable location (`/home`, `/tmp`, `/dev/shm`) and exec'd it — making its
+kernel-attested `/proc/<pid>/exe` basename match — inherited full system-process
+immunity.
+- **Fix (`system_immunity.rs`):** the bare-basename fallback is now gated to
+  `IMMUNE_EXEC_DIRS` (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/usr/lib`,
+  `/usr/local/bin`, `/usr/local/sbin`). A basename match is honored only when the
+  exe lives under a trusted system root — writing there already requires root.
+  Exact-path and systemd-prefix immunity are unchanged.
+- **Anti-lockout preserved (low risk):** every real base-system binary's
+  `/proc/exe` is under a trusted root, so no desktop component loses immunity;
+  only agent-writable-location matches are dropped. Behavior change: dev tools in
+  `$HOME` (e.g. `~/.cargo/bin/cargo`) lose *automatic* immunity — add them to
+  `IMMUNE_EXACT_PATHS` if needed. **Still recommend a real Xfce/lightdm desktop
+  smoke test before merge**, per the anti-lockout constraint, though this change
+  only narrows immunity for non-system directories.
+- **Tests:** `immunity_denies_basename_match_in_agent_writable_dir`,
+  `immunity_honors_basename_match_in_trusted_system_dir`. ts_cli immunity 9/9.
+
+### JG-RT-L3 — MCP gateway app-layer replay (HIGH, fixed)
+The MCP gateway built `sequence_counter` from the **server clock**
+(`mcp_gateway.rs:394`) and discarded the `validate_sequence` result
+(`:646`, `let _ = lineage_ok;` — comment: "lenient on sequence
+ordering"). There was no `ReplayGuard`. An attacker who intercepted or
+observed any valid JSON-RPC request could retransmit it indefinitely:
+each receive produced a fresh clock-derived seq, so nothing caught the
+replay. The UDS wire daemon had an enforced `ReplayGuard` (JG-RT-002);
+the gateway had none.
+- **Repro (confirmed by source analysis):** Source code unambiguously
+  shows the two gaps; a live gateway replay was not needed to confirm —
+  the absence of `ReplayGuard` and the discarded `validate_sequence`
+  result are structurally definitive.
+- **Fix:** Added `McpReplayGuard` (bounded FIFO, same semantics as the
+  UDS `ReplayGuard`), shared across all gateway connections via
+  `Arc<Mutex<>>`. Nonce: explicit `jg_nonce` (u64) from params if the
+  client supplies one; otherwise SHA-256(agent_id ‖ body) → u64
+  (catches exact-body replays without requiring client changes). Replay
+  detected → 403 `DENY_REPLAY_ATTACK` before governance runs.
+  `let _ = lineage_ok` discard removed; lineage sequence errors now
+  also return 403 `DENY_REPLAY_ATTACK`, mirroring the UDS path.
+  No new deps — `sha2` was already present.
+- **Tests (6 new):**
+  `mcp_replay_guard_catches_replay`, `mcp_replay_guard_allows_distinct_nonces`,
+  `mcp_replay_guard_evicts_at_capacity`, `body_nonce_is_deterministic`,
+  `body_nonce_differs_by_agent`, `body_nonce_differs_by_body`.
+  180+16+13 pass, clippy clean.
+
+### JG-RT-L3b — MCP replay: body-hash fallback was weak (MED, fixed by Fable)
+Cross-agent review (Fable) of the JG-RT-L3 fix (Antigravity), then fixed. The
+explicit `jg_nonce` path was correct, but the default fallback — nonce =
+SHA-256(agent_id ‖ raw_body) — had three problems (existing clients send no
+`jg_nonce`, so the fallback is the common path):
+- **False negative (bypass):** the raw-body hash covered attacker-controlled
+  non-semantic bytes, so replaying a captured request while flipping the JSON-RPC
+  `id` (or adding whitespace) produced a different hash → NOT flagged, yet the
+  dangerous `method`+`params` were replayed. One-byte mutation defeated it.
+- **Lineage regression (confirmed):** `seq = nonce` fed the content hash into
+  lineage `validate_sequence`, which requires *strictly increasing* seq
+  (`governance.rs:978`). A hash is not monotonic, so **~half of legitimate
+  distinct requests were spuriously denied `sequence_replay`** — a real functional
+  break the unit tests didn't exercise.
+- **False positive:** two legitimately byte-identical requests were denied forever
+  (unbounded dedup window).
+- **Fix (`mcp_gateway.rs`):** (1) fallback nonce now hashes the **semantic
+  identity** — `agent_id ‖ method ‖ canonical(params)` with `jg_nonce` removed —
+  so non-semantic mutation no longer evades and key order is canonical; (2) the
+  lineage `seq` is drawn from a **monotonic per-gateway counter**
+  (`next_lineage_seq`), fully decoupled from the replay nonce, so
+  `validate_sequence` never spuriously trips; (3) the replay guard is now
+  **time-windowed** (`JINNGUARD_MCP_REPLAY_WINDOW_SECS`, default 120s) so a
+  legitimate identical request after the window is allowed while a rapid replay is
+  caught. `jg_nonce` remains the explicit strongest-guarantee override.
+- **Tests:** `semantic_nonce_ignores_nonsemantic_bytes` (the bypass regression),
+  `semantic_nonce_differs_by_semantic_content`, `semantic_nonce_excludes_jg_nonce_field`,
+  `mcp_replay_guard_allows_repeat_after_window`,
+  `mcp_lineage_seq_is_strictly_increasing_and_nonzero`. ts_cli 182 pass, clippy clean.
+- **Residual:** content-based dedup still cannot distinguish a legit repeat from a
+  replay across the window boundary without client freshness; strongest guarantee
+  needs `jg_nonce` or mTLS. Documented.
+
+### JG-RT-B1 — BPF ringbuf-full deny path: `barrier_var` consistency (LOW, fixed — all 4 sites)
+Antigravity's B1 added the `barrier_var` guard to `jg_socket_sendmsg.c` (stops
+clang -O2 lowering `cond ? -EPERM : 0` into an unbounded `BPF_NEG` the verifier
+can reject at load → silent enforcement gap). Fable review found **three sibling
+sites with the identical `if (!req) return audit_only ? 0 : -JG_EPERM;`** that were
+NOT fixed: `jg_bprm_check_security.c` (the exec allowlist — a silent load failure
+there disables exec enforcement), `jg_inode_unlink.c`, `jg_inode_create.c`.
+- **Fix:** applied the same `barrier_var` branch pattern to all three, matching
+  `socket_connect`/`sendmsg`. All four now consistent.
+- **Verification:** all four compile clean with `clang -target bpf -O2` here.
+  Compilation is NOT the verifier — the authoritative check is the `build-ebpf`
+  CI gate + the real-kernel matrix load (5.14/6.12/6.17), which this sandbox can't
+  run. Must pass those before merge.
+
+### JG-RT-L6a — startup policy load failed OPEN to a permissive default (MED, fixed)
+`load_policy_from_path` (`main.rs`) returned a **permissive** default
+(`deny_anonymous_agents=false`) whenever the policy was missing, unreadable, or
+malformed at startup — so a corrupted or absent `/etc/jinnguard/policy.yaml`
+silently admitted unregistered agents. Asymmetric with the hot-reload path, which
+keeps the last-good policy on error.
+- **Fix:** the startup fallback now fails **CLOSED**
+  (`deny_anonymous_agents=true`) and logs a loud `[startup][WARN]` distinguishing
+  *missing* from *malformed*. Local dev can restore the old permissive default
+  with `JINNGUARD_PERMISSIVE_STARTUP_DEFAULT=1`. An operator wanting open access
+  still passes `--allow-anonymous`, which layers on top independently.
+- **Tests:** `startup_policy_fallback_fails_closed_on_missing_or_malformed`
+  (missing + malformed both deny; env opt-out restores permissive). ts_cli 185
+  pass, clippy clean.
+
+### JG-RT-M4a — interpreter-bypass heuristic evaded by command prefixes (LOW enterprise / MED userspace-only, fixed)
+The userspace M4 mitigation `proposal_invoked_interpreter` (`main.rs`) inspected
+only `command.split_whitespace().next()`, so a governed agent with an executable
+allowlist could smuggle an interpreter past it behind any prefix that leaves the
+interpreter out of first-token position: exec wrappers (`env python3 -c`,
+`timeout 5 bash -c`, `nohup perl …`, `sudo nice bash -c`), leading environment
+assignments (`FOO=bar python3 -c`), command chaining / piping
+(`run_model; bash -c …`, `… | sh`, `… && python3`), and command substitution
+(`$(python3 -c …)`, backticks). The broker's `DENIED_COMMANDS` substring list did
+not catch these prefix forms either.
+- **Severity is deployment-dependent.** On **enterprise** builds the kernel
+  `jg_bprm_check_security` default-deny exec allowlist keys on the *resolved*
+  `bprm->filename` of **every** execve, so the smuggled interpreter is denied at
+  the kernel floor regardless of how it is spelled — the userspace gap is
+  defence-in-depth only (**LOW**). On **userspace-only / audit-only** builds there
+  is no kernel backstop, so the bypass defeated the sole interpreter mediation
+  (**MED**): a rubber-stamp path plus a polluted audit trail.
+- **Fix (`main.rs`):** replaced the first-token check with `interpreters_in_command`,
+  which (1) splits the command into top-level segments honoring single/double
+  quotes (a `;`/`|`/interpreter-name inside a quoted argument is **not** treated as
+  a command — no false positives), (2) descends one level into `$(...)` and
+  backtick substitution (suppressed inside single quotes, matching the shell),
+  (3) resolves each segment's effective command head by skipping leading
+  `NAME=val` env-assignments and known exec wrappers plus each wrapper's own
+  flag / numeric-duration / assignment args, and (4) reports the first invoked
+  interpreter not on the agent's allowlist. Explicitly-allowlisted interpreters are
+  still permitted even behind a wrapper; unconstrained agents (no allowlist) are
+  unaffected, preserving the M4 scope invariant.
+- **Tests (7 new, `interpreter_bypass_tests`):**
+  `m4a_denies_interpreter_behind_exec_wrappers`,
+  `m4a_denies_interpreter_behind_env_assignment`,
+  `m4a_denies_interpreter_after_command_chaining`,
+  `m4a_denies_interpreter_in_command_substitution`,
+  `m4a_allowed_interpreter_through_wrapper_permitted`,
+  `m4a_quoted_separator_is_not_a_false_positive`,
+  `m4a_reports_first_unlisted_interpreter`. ts_cli 194 pass, clippy clean.
+- **Residual (honest):** this is a userspace heuristic, not a shell parser — exotic
+  wrappers with a leading *path* positional (`flock <lockfile> bash -c`) may not
+  resolve, and it does not model here-docs or `eval "$var"` where the interpreter
+  is chosen at runtime. The kernel bprm allowlist remains the authoritative control
+  on enterprise builds; userspace-only operators should treat interpreter mediation
+  as best-effort and rely on the executable allowlist + risk scoring.
+
+### Leads still open
+- _(none in the reviewed userspace surfaces; see "needs external validation" below)_
+
+### Needs external / non-sandbox validation before merge
+- **BPF verifier load** for JG-RT-B1 (4 hooks) — needs the `build-ebpf` CI gate +
+  real-kernel matrix (5.14/6.12/6.17); compiles clean locally but the verifier
+  cannot run here.
+- **JG-RT-032b desktop smoke** — a real Xfce/lightdm session to confirm no
+  anti-lockout regression (the change only narrows immunity for non-system dirs,
+  so risk is low, but the constraint requires the check).
+- **`deploy/bootstrap.sh`** end-to-end on a bare host + the non-apt distros.
+- **PR #55** CI must be freshly green before merge (no `gh`/network in-sandbox);
+  JG-RT-026 already merged via PR #54.
+
 ## Closeout
 
-- Internal red-team batches JG-RT-001 through JG-RT-026 are fixed or explicitly
-  documented as defense-in-depth residuals.
+- Internal red-team batches JG-RT-001 through JG-RT-032 (plus JG-RT-L3/L3b/L6a/B1
+  and JG-RT-M4a) are fixed or explicitly documented as defense-in-depth residuals.
+  JG-RT-026 (manifest pinned-key) merged to `main` via PR #54; JG-RT-027..032 +
+  JG-RT-L3/L3b + JG-RT-B1 + JG-RT-L6a + JG-RT-M4a (capstone verification round) are
+  on `redteam-verify` (PR #55) with failing-first regression tests.
 - Post-merge real-kernel validation passed on the supported self-hosted matrix:
   Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /
   kernel 5.14. The AlmaLinux timeout accounting fix in PR #33 preserved hard
   failures for fail-open, incorrect verdicts, and denied-side timeouts.
 - No known open findings remain in the reviewed UDS, MCP, lineage, quota, fleet,
-  BPF map-loading, deployment, or CI-permission surfaces.
+  BPF map-loading, deployment, or CI-permission surfaces. BPF/C + Python surfaces
+  scanned in Batch 24 (see above).

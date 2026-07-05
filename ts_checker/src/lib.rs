@@ -121,10 +121,12 @@ impl<'a> PolicyEngine<'a> {
             // …) so those cannot be suppressed by a caller; but an invariant written
             // over a *caller-supplied* custom variable can be bypassed by omitting it.
             // This layer is defense-in-depth (the intent allowlist + kernel exec
-            // enforcement are the primary gates). Likewise, very large caller-supplied
-            // values saturate in the `as i32` scaling below. Recommendation: author
-            // security-relevant invariants only over the daemon-guaranteed variables
-            // above, whose presence and bounded range are not attacker-controlled.
+            // enforcement are the primary gates). Very large caller-supplied values
+            // used to saturate in the `as i32` scaling below; that is now rejected
+            // fail-closed (see the range check before the casts). Recommendation:
+            // still author security-relevant invariants only over the
+            // daemon-guaranteed variables above, whose presence and bounded range
+            // are not attacker-controlled.
             let lhs_val = match context_vars.get(lhs) {
                 Some(&v) => v,
                 None => {
@@ -138,8 +140,30 @@ impl<'a> PolicyEngine<'a> {
                 .parse()
                 .map_err(|_| anyhow!("Cannot parse RHS literal '{}' in invariant", rhs_str))?;
 
-            let lhs_z3 = Real::from_real(ctx, (lhs_val * 1_000_000.0) as i32, 1_000_000);
-            let rhs_z3 = Real::from_real(ctx, (rhs_val * 1_000_000.0) as i32, 1_000_000);
+            // Fail-closed scaling (JG-RT L4): `Real::from_real` takes an i32
+            // numerator, so we scale by 1e6 for fixed-point precision. A value
+            // whose scaled form does not fit in i32 (|v| ≳ 2147.48) previously
+            // *saturated* via `as i32`, conflating distinct large operands to the
+            // same ceiling and letting an out-of-range value pass a `<=`/`>=`
+            // check it should fail. Reject any out-of-range or non-finite operand
+            // as a DENY rather than silently clamp it. The daemon-guaranteed risk
+            // variables are all bounded well within this range; a value past it is
+            // either caller-supplied abuse or a bug — fail closed either way.
+            const SCALE: f64 = 1_000_000.0;
+            let lhs_scaled = lhs_val * SCALE;
+            let rhs_scaled = rhs_val * SCALE;
+            for (name, scaled) in [(lhs, lhs_scaled), (rhs_str.trim(), rhs_scaled)] {
+                if !scaled.is_finite() || scaled > i32::MAX as f64 || scaled < i32::MIN as f64 {
+                    return Err(anyhow!(
+                        "POLICY_INVARIANT_OUT_OF_RANGE: operand '{}' = {} exceeds the \
+                         representable fixed-point range — denying (fail-closed)",
+                        name,
+                        scaled / SCALE
+                    ));
+                }
+            }
+            let lhs_z3 = Real::from_real(ctx, lhs_scaled as i32, 1_000_000);
+            let rhs_z3 = Real::from_real(ctx, rhs_scaled as i32, 1_000_000);
 
             let constraint = match op {
                 "<=" => lhs_z3.le(&rhs_z3),
@@ -256,6 +280,49 @@ mod tests {
         let engine = PolicyEngine::new(&ctx);
         // r=40 + w=11 == 51 > ceiling 50 → constraint unsatisfiable → DENY.
         assert!(engine.verify_state_transition(40, 11, 50).is_err());
+    }
+
+    #[test]
+    fn invariant_large_value_does_not_saturate_fail_open() {
+        // JG-RT verification L4: a caller-supplied value far above the ceiling must
+        // be DENIED. Previously `(v * 1_000_000.0) as i32` saturated both sides to
+        // i32::MAX, so two distinct large values compared EQUAL and a `<=` check
+        // that should fail passed (fail-open). 1e9 clearly violates `x <= 2500`.
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+
+        let invariants = vec!["x <= 2500".to_string()];
+        let context_vars: HashMap<String, f64> =
+            [("x".to_string(), 1_000_000_000.0)].into_iter().collect();
+
+        assert!(
+            engine
+                .verify_policy_invariants(&invariants, &context_vars)
+                .is_err(),
+            "1e9 saturated to the i32 ceiling and passed a `<= 2500` check it must fail (fail-open)"
+        );
+    }
+
+    #[test]
+    fn invariant_two_distinct_huge_values_are_not_conflated() {
+        // The saturation made distinct operands compare equal. After the fix both
+        // out-of-range operands must be rejected (fail-closed), not silently fused.
+        let config = z3::Config::new();
+        let ctx = Context::new(&config);
+        let engine = PolicyEngine::new(&ctx);
+
+        // 3000 and 5000 both * 1e6 overflow i32 and previously became i32::MAX.
+        let invariants = vec!["lhs <= 3000".to_string()];
+        let context_vars: HashMap<String, f64> =
+            [("lhs".to_string(), 5_000.0)].into_iter().collect();
+
+        assert!(
+            engine
+                .verify_policy_invariants(&invariants, &context_vars)
+                .is_err(),
+            "5000 must not pass `<= 3000` via i32-saturation conflation"
+        );
     }
 
     #[test]
