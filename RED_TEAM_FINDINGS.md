@@ -548,9 +548,17 @@ immunity.
   `/proc/exe` is under a trusted root, so no desktop component loses immunity;
   only agent-writable-location matches are dropped. Behavior change: dev tools in
   `$HOME` (e.g. `~/.cargo/bin/cargo`) lose *automatic* immunity — add them to
-  `IMMUNE_EXACT_PATHS` if needed. **Still recommend a real Xfce/lightdm desktop
-  smoke test before merge**, per the anti-lockout constraint, though this change
-  only narrows immunity for non-system directories.
+  `IMMUNE_EXACT_PATHS` if needed.
+- **Desktop smoke test — VALIDATED (2026-07-05):** on a live AlphaOS / Debian 13
+  desktop (kernel 6.12.90, `bpf` active in the running LSM stack alongside
+  apparmor/landlock/yama/tomoyo/ipe/ima/evm), both real-kernel anti-lockout
+  proofs passed with all 10 LSM hooks attached and enforcement confined to the
+  test cgroup — the Xfce/lightdm session was untouched throughout:
+  `test_kernel_ungoverned_host_is_never_locked_out` (host exec allowed outside
+  the governed cgroup, denied inside) and
+  `test_kernel_anti_lockout_governor_reachable_under_all_floors` (control socket +
+  loopback reachable under all egress floors, non-allowlisted socket denied).
+  `2 passed; 0 failed`. Closes the anti-lockout constraint for this change.
 - **Tests:** `immunity_denies_basename_match_in_agent_writable_dir`,
   `immunity_honors_basename_match_in_trusted_system_dir`. ts_cli immunity 9/9.
 
@@ -694,9 +702,10 @@ not catch these prefix forms either.
 - **BPF verifier load** for JG-RT-B1 (4 hooks) — needs the `build-ebpf` CI gate +
   real-kernel matrix (5.14/6.12/6.17); compiles clean locally but the verifier
   cannot run here.
-- **JG-RT-032b desktop smoke** — a real Xfce/lightdm session to confirm no
-  anti-lockout regression (the change only narrows immunity for non-system dirs,
-  so risk is low, but the constraint requires the check).
+- ~~**JG-RT-032b desktop smoke**~~ — DONE (2026-07-05): validated on a live
+  AlphaOS/Debian 13 (kernel 6.12.90) Xfce/lightdm desktop; both real-kernel
+  anti-lockout proofs passed (`2 passed; 0 failed`) with the graphical session
+  untouched. See the JG-RT-032b entry above.
 - **`deploy/bootstrap.sh`** end-to-end on a bare host + the non-apt distros.
 - **PR #55** CI must be freshly green before merge (no `gh`/network in-sandbox);
   JG-RT-026 already merged via PR #54.
