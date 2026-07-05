@@ -644,6 +644,49 @@ keeps the last-good policy on error.
   (missing + malformed both deny; env opt-out restores permissive). ts_cli 185
   pass, clippy clean.
 
+### JG-RT-M4a — interpreter-bypass heuristic evaded by command prefixes (LOW enterprise / MED userspace-only, fixed)
+The userspace M4 mitigation `proposal_invoked_interpreter` (`main.rs`) inspected
+only `command.split_whitespace().next()`, so a governed agent with an executable
+allowlist could smuggle an interpreter past it behind any prefix that leaves the
+interpreter out of first-token position: exec wrappers (`env python3 -c`,
+`timeout 5 bash -c`, `nohup perl …`, `sudo nice bash -c`), leading environment
+assignments (`FOO=bar python3 -c`), command chaining / piping
+(`run_model; bash -c …`, `… | sh`, `… && python3`), and command substitution
+(`$(python3 -c …)`, backticks). The broker's `DENIED_COMMANDS` substring list did
+not catch these prefix forms either.
+- **Severity is deployment-dependent.** On **enterprise** builds the kernel
+  `jg_bprm_check_security` default-deny exec allowlist keys on the *resolved*
+  `bprm->filename` of **every** execve, so the smuggled interpreter is denied at
+  the kernel floor regardless of how it is spelled — the userspace gap is
+  defence-in-depth only (**LOW**). On **userspace-only / audit-only** builds there
+  is no kernel backstop, so the bypass defeated the sole interpreter mediation
+  (**MED**): a rubber-stamp path plus a polluted audit trail.
+- **Fix (`main.rs`):** replaced the first-token check with `interpreters_in_command`,
+  which (1) splits the command into top-level segments honoring single/double
+  quotes (a `;`/`|`/interpreter-name inside a quoted argument is **not** treated as
+  a command — no false positives), (2) descends one level into `$(...)` and
+  backtick substitution (suppressed inside single quotes, matching the shell),
+  (3) resolves each segment's effective command head by skipping leading
+  `NAME=val` env-assignments and known exec wrappers plus each wrapper's own
+  flag / numeric-duration / assignment args, and (4) reports the first invoked
+  interpreter not on the agent's allowlist. Explicitly-allowlisted interpreters are
+  still permitted even behind a wrapper; unconstrained agents (no allowlist) are
+  unaffected, preserving the M4 scope invariant.
+- **Tests (7 new, `interpreter_bypass_tests`):**
+  `m4a_denies_interpreter_behind_exec_wrappers`,
+  `m4a_denies_interpreter_behind_env_assignment`,
+  `m4a_denies_interpreter_after_command_chaining`,
+  `m4a_denies_interpreter_in_command_substitution`,
+  `m4a_allowed_interpreter_through_wrapper_permitted`,
+  `m4a_quoted_separator_is_not_a_false_positive`,
+  `m4a_reports_first_unlisted_interpreter`. ts_cli 194 pass, clippy clean.
+- **Residual (honest):** this is a userspace heuristic, not a shell parser — exotic
+  wrappers with a leading *path* positional (`flock <lockfile> bash -c`) may not
+  resolve, and it does not model here-docs or `eval "$var"` where the interpreter
+  is chosen at runtime. The kernel bprm allowlist remains the authoritative control
+  on enterprise builds; userspace-only operators should treat interpreter mediation
+  as best-effort and rely on the executable allowlist + risk scoring.
+
 ### Leads still open
 - _(none in the reviewed userspace surfaces; see "needs external validation" below)_
 
@@ -660,11 +703,11 @@ keeps the last-good policy on error.
 
 ## Closeout
 
-- Internal red-team batches JG-RT-001 through JG-RT-032 (plus JG-RT-L3/L3b/L6a/B1)
-  are fixed or explicitly documented as defense-in-depth residuals. JG-RT-026
-  (manifest pinned-key) merged to `main` via PR #54; JG-RT-027..032 + JG-RT-L3/L3b
-  + JG-RT-B1 + JG-RT-L6a (capstone verification round) are on `redteam-verify`
-  (PR #55) with failing-first regression tests.
+- Internal red-team batches JG-RT-001 through JG-RT-032 (plus JG-RT-L3/L3b/L6a/B1
+  and JG-RT-M4a) are fixed or explicitly documented as defense-in-depth residuals.
+  JG-RT-026 (manifest pinned-key) merged to `main` via PR #54; JG-RT-027..032 +
+  JG-RT-L3/L3b + JG-RT-B1 + JG-RT-L6a + JG-RT-M4a (capstone verification round) are
+  on `redteam-verify` (PR #55) with failing-first regression tests.
 - Post-merge real-kernel validation passed on the supported self-hosted matrix:
   Debian 13 / kernel 6.12, Ubuntu 24.04 / kernel 6.17, and AlmaLinux 9.8 /
   kernel 5.14. The AlmaLinux timeout accounting fix in PR #33 preserved hard

