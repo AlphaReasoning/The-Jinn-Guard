@@ -302,9 +302,9 @@ Z3 step does and does **not** prove) and Known Limitations below.
 | Bounded SMT checks — risk-ceiling arithmetic + invariant satisfiability | User-space (cooperative) | ✅ Active; *sound on its inputs, not a proof of the risk oracle* — [THREAT_MODEL §8](THREAT_MODEL.md) |
 | Ed25519-signed provenance manifests — offline-verifiable authenticity over the audit ledger (`--manifest-key`; `--verify-manifests`) | User-space | ✅ Active (opt-in, Action Manifest v0) |
 | External transparency-log anchoring of audit checkpoints | User-space | 🚧 Roadmap (JG #62 v2) |
-| Bit-for-bit reproducible builds | Build/release | 🚧 Roadmap (JG #46) |
+| Reproducible builds — rebuild-and-compare (Linux x86_64, pinned toolchain) | Build/release | ✅ Enforced (verified in CI on every push/PR + at release — [RELEASE_INTEGRITY §Reproducible builds](RELEASE_INTEGRITY.md)) |
+| OpenTelemetry/OTLP metric export | User-space | ✅ Active (opt-in — `JINNGUARD_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_*`) |
 | Full cross-mount path *strings* in the audit log (`bpf_d_path`) | Kernel floor | 🚧 Roadmap (enforcement already mount-safe — see Known Limitations) |
-| OpenTelemetry/OTLP metric export | User-space | 🚧 Roadmap (JG #11) |
 
 > **Why this table exists.** An external review noted that earlier wording could read
 > as if user-space semantic verdicts were kernel-enforced. They are two planes: the
