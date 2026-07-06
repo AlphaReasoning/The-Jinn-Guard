@@ -383,21 +383,52 @@ jobs:
   # churn). JINNGUARD_TEST_BINARY must be ABSOLUTE.
   # ─────────────────────────────────────────────────────────────────────────────
   kernel-lsm-real:
-    name: Real-kernel LSM (${{ matrix.distro }} k${{ matrix.kernel }})
+    name: Real-kernel LSM (${{ matrix.distro }} ${{ matrix.arch }} k${{ matrix.kernel }})
     if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
+        # `arch` is carried explicitly so arm64 rows can be added without name
+        # collisions; the step body is arch-agnostic (build deps baked into each
+        # runner image). To add a row: register a self-hosted runner with the
+        # `bpf-lsm` label + the per-host label below, confirm its kernel has
+        # BPF-LSM active (CONFIG_BPF_LSM=y, BTF, `bpf` in /sys/kernel/security/lsm),
+        # then uncomment. Rows for unregistered runners are left commented so a
+        # dispatch never hangs waiting on a runner that does not exist.
         include:
           - distro: Debian 13
+            arch: x86_64
             label: jinn1
             kernel: "6.12"
           - distro: Ubuntu 24.04
+            arch: x86_64
             label: jinn2
             kernel: "6.17"
           - distro: AlmaLinux 9.8
+            arch: x86_64
             label: jinn3
             kernel: "5.14"
+          # --- Planned expansion (uncomment per runner as it comes online) ---
+          # arm64 — biggest reach gain (Graviton/Ampere, or a Libre AML-S905X-CC
+          # board with an Armbian/mainline BPF-LSM kernel):
+          # - distro: Debian 12
+          #   arch: aarch64
+          #   label: jinn4-arm64
+          #   kernel: "6.1"
+          # LTS-kernel fill on x86_64 — covers the bulk of the enterprise installed
+          # base (BPF-LSM behaviour varies more by kernel version than by distro):
+          # - distro: Ubuntu 22.04
+          #   arch: x86_64
+          #   label: jinn-k515
+          #   kernel: "5.15"
+          # - distro: Debian 12
+          #   arch: x86_64
+          #   label: jinn-k61
+          #   kernel: "6.1"
+          # - distro: Rocky 9
+          #   arch: x86_64
+          #   label: jinn-k66
+          #   kernel: "6.6"
     runs-on: [self-hosted, bpf-lsm, "${{ matrix.label }}"]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
