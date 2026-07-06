@@ -284,6 +284,30 @@ Validated on three distributions / three kernel generations: **Debian 13 / kerne
 
 ---
 
+## Platform support
+
+Jinn Guard's **enforcement floor is eBPF-LSM — a Linux-kernel facility.** The
+un-sheddable guarantee (a decision that holds even if the daemon is dead or bypassed)
+exists **only** where BPF-LSM is present. The rest of the stack (audit ledger, SMT
+checks, signed manifests) is portable user-space — but that layer is *cooperative*,
+and it is exactly the part a compromised host can bypass. The kernel floor is what
+backstops it.
+
+| Platform | Kernel floor | User-space governance | Status |
+|---|---|---|---|
+| Linux **x86_64**, kernel ≥5.16 with BPF-LSM (`CONFIG_BPF_LSM=y`, BTF, `bpf` in `lsm=`) | ✅ Full | ✅ Full | **Validated** — Debian 13/6.12, Ubuntu 24.04/6.17, AlmaLinux 9/5.14 |
+| Linux **aarch64 (arm64)**, same kernel reqs | ✅ Expected (BPF-LSM is arch-independent) | ✅ Full | 🚧 Not yet validated |
+| Linux **without** BPF-LSM (old / locked-down kernel) | ❌ None | ✅ Full (cooperative) | Degraded — runs **audit-only**, same posture as safe mode |
+| **Windows / macOS** | ❌ No LSM | ⚠️ User-space layer only | **Not supported as an enforcement host** |
+| 32-bit ARM / non-Linux MCUs | ❌ | ❌ | Out of scope |
+
+> **Why not Windows/macOS?** Neither has a Linux Security Module. Running there would
+> ship only the bypassable user-space governor — the security thesis removed. Windows
+> enforcement would require a *separate* backend (WFP / filesystem minifilters / ETW /
+> eBPF-for-Windows) — a different engine, not a port. It is not on the roadmap.
+
+---
+
 ## What Jinn Guard guarantees today — vs roadmap
 
 A single, deliberately conservative split of **what is enforced now** from **what is

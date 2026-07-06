@@ -51,6 +51,20 @@ boundary, treating the agent as **untrusted**. There are two enforcement planes:
 The **operator** (the human running the host) is trusted and is, by explicit
 design, never subject to kernel denial (see §6).
 
+### Platform assumption (enforcement scope)
+
+The kernel-floor guarantees in this document assume **Linux with BPF-LSM active**
+(`CONFIG_BPF_LSM=y`, kernel BTF, and `bpf` in the active LSM list; validated on
+kernels 5.14–6.17). On a kernel **without** BPF-LSM, Jinn Guard runs **audit-only**:
+all user-space gates (identity, replay, intent, quota, SMT ceiling, tamper-evident
+ledger, signed manifests) still apply, but there is **no un-sheddable floor** — a
+governed process that ignores the daemon is not stopped at the kernel. This is the
+same posture as explicit safe mode. Non-Linux hosts (Windows, macOS) have no LSM and
+are **out of enforcement scope**; only the cooperative user-space layer could run
+there, which is precisely the layer the floor exists to backstop. BPF-LSM itself is
+architecture-independent, so `aarch64` is expected to enforce identically to `x86_64`
+once validated.
+
 ---
 
 ## 2. Assets and security goals
