@@ -5,8 +5,16 @@
 CLANG     ?= clang
 INSTALL   ?= install
 BPFTOOL   ?= bpftool
-ARCH      ?= x86
 OUT       ?= .
+
+# Derive the kernel-style arch name from the build machine so `make` works on
+# x86_64 and aarch64 without a manual override. clang/kernel expect the short
+# names (x86, arm64), not the uname -m values (x86_64, aarch64). Override with
+# `make ARCH=...` for cross-compiles. Defaults to x86 for unknown machines.
+UNAME_M      := $(shell uname -m)
+ARCH_x86_64  := x86
+ARCH_aarch64 := arm64
+ARCH      ?= $(or $(ARCH_$(UNAME_M)),x86)
 
 # Kernel headers
 KDIR      ?= /usr/src/linux-headers-$(shell uname -r)
@@ -43,7 +51,7 @@ LSM_OBJS = $(LSM_SRCS:.c=.o)
 LEGACY_TELEMETRY_OBJS = $(LEGACY_TELEMETRY_SRCS:.bpf.c=.bpf.o)
 INSTALL_DIR = /usr/lib/jinnguard
 
-.PHONY: all clean install check-tools legacy-telemetry
+.PHONY: all clean install check-tools legacy-telemetry regen-vmlinux
 
 all: check-tools $(OUT)/vmlinux.h $(TRACEPOINT_OBJS) $(LSM_OBJS)
 
@@ -51,6 +59,14 @@ $(OUT)/vmlinux.h:
 	@mkdir -p $(OUT)
 	@echo "  GEN     $@"
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+# The committed bpf/vmlinux.h is x86-generated (vendored so CI can compile the
+# LSM objects without BTF on the runner). CO-RE relocates field offsets at load,
+# but on a foreign arch (aarch64) or after a kernel bump, regenerate it from the
+# local BTF: `make -C bpf regen-vmlinux`.
+regen-vmlinux: check-tools
+	@echo "  REGEN   $(OUT)/vmlinux.h from local BTF ($(UNAME_M))"
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(OUT)/vmlinux.h
 
 check-tools:
 	@command -v $(CLANG) >/dev/null 2>&1 || \

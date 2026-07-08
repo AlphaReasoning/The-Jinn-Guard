@@ -183,9 +183,10 @@ else
   printf '  the safety net. cgroup v2 detected.\033[0m\n'
   if ! have bpftool; then c_info "installing bpftool..."; apt-get install -y bpftool >/dev/null 2>&1 || true; fi
   c_info "regenerating vmlinux.h, building + installing LSM objects..."
+  bpfarch=x86; [ "$(uname -m)" = aarch64 ] && bpfarch=arm64
   ( cd bpf && bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null \
     && for f in lsm/jg_socket_connect lsm/jg_socket_sendmsg lsm/jg_bprm_check_security lsm/jg_inode_create lsm/jg_inode_unlink; do
-         clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include -I. -c "$f.c" -o "$f.o" || exit 1; done ) \
+         clang -O2 -g -target bpf -D__TARGET_ARCH_${bpfarch} -I/usr/include -I. -c "$f.c" -o "$f.o" || exit 1; done ) \
     && install -d /usr/lib/jinnguard/lsm \
     && install -m 0644 bpf/lsm/*.o /usr/lib/jinnguard/lsm/ \
     || { c_fail "LSM object build/install failed"; mark T4 FAIL; }

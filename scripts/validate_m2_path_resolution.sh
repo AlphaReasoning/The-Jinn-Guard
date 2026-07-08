@@ -104,11 +104,13 @@ bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$REPO_ROOT/bpf/vmlinux
 ok "regenerated bpf/vmlinux.h from /sys/kernel/btf/vmlinux"
 
 cd "$REPO_ROOT/bpf"
+# Derive the BPF target arch from the host so this runs on aarch64 too.
+bpfarch=x86; [ "$(uname -m)" = aarch64 ] && bpfarch=arm64
 BUILT=()
 for src in lsm/jg_socket_connect.c lsm/jg_socket_sendmsg.c lsm/jg_bprm_check_security.c \
            lsm/jg_inode_create.c lsm/jg_inode_unlink.c; do
   obj="${src%.c}.o"
-  clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include -I. -c "$src" -o "$obj" \
+  clang -O2 -g -target bpf -D__TARGET_ARCH_${bpfarch} -I/usr/include -I. -c "$src" -o "$obj" \
     || die "clang failed to compile $src"
   BUILT+=("$obj")
 done
