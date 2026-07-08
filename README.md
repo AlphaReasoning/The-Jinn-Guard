@@ -338,6 +338,110 @@ Z3 step does and does **not** prove) and Known Limitations below.
 
 ---
 
+## Why kernel enforcement, not a container per agent
+
+The obvious question for anything in this space: Microsoft's Agent Governance
+Toolkit (AGT) already ships per-agent identity (SPIFFE/DID/mTLS), a Merkle
+tamper-evident audit ledger, a fail-closed policy engine (YAML/OPA/Cedar), and a
+Rust SDK. It is MIT-licensed, Microsoft-signed, and widely adopted. So identity,
+ledger, and policy are **not** what sets Jinn Guard apart. AGT has all three, and
+in some respects has them further along.
+
+The difference is where enforcement sits. AGT enforces at the application
+middleware layer: the policy engine and the agent run inside the same process
+boundary, and its stated production recommendation for OS-level isolation is "run
+each agent in a separate container." Jinn Guard enforces per action in the kernel,
+outside the agent's process, and refuses the container as the isolation unit. That
+is the only superiority claim made here, and it is narrow: **kernel per-action
+enforcement welded to per-agent identity and a hash-chained ledger, on a single
+Linux host, without Kubernetes.** Everything below defends that specific bundle.
+
+### A container isolates a process tree, not an action
+
+A container draws a boundary around a process tree. That is a real control and it
+is orthogonal to what Jinn Guard does, not a substitute for it. A namespace and
+cgroup boundary cannot emit a per-action allow/deny verdict, and it has no notion
+of *which agent* took the action. "This container may open sockets" is not the
+same statement as "agent `fabric_swarm_production_01`, identity bound to UID 10001
+via `SO_PEERCRED`, may `connect()` to this destination and not that one." The
+container grants a capability once, at the tree level. Jinn Guard's BPF-LSM hooks
+render a verdict at each `execve`/`connect`/`sendmsg`/`inode_create`/`inode_unlink`,
+scoped to the governed cgroup, bound to a cryptographic `agent_id`. That binding is
+the point: the verdict names who acted.
+
+### A container leaves no per-action, attributable trace
+
+Container isolation is enforcement without a record. When a process inside the
+container acts, the boundary does not write a per-action, tamper-evident entry
+tied to the agent identity that requested it. You get container-level logs, not
+"agent X was denied action Y at sequence N, and here is the hash that chains it to
+the prior decision." Jinn Guard's audit ledger is per action and hash-chained
+(each entry carries the SHA-256 of the previous), so the trace is both attributable
+and tamper-evident. AGT ships a comparable Merkle ledger. The distinction is again
+placement: because Jinn Guard's ledger is fed by kernel hooks rather than an
+in-process middleware call, the entry survives a subprocess the agent library never
+saw.
+
+### One container per agent breaks at the seams
+
+The "container per agent" model assumes the agent is one cooperating process. Real
+agent workloads violate that assumption three ways:
+
+- The agent spawns subprocesses. A tool call that shells out, forks a helper, or
+  launches a language runtime produces syscalls the middleware never mediated.
+- The agent executes generated code. Model output that runs is a process the
+  policy library did not wrap and cannot introspect from inside its own boundary.
+- Many agents share a host. One container per agent multiplies boundaries, but the
+  syscalls from every one of them still terminate at the same kernel.
+
+In all three, the enforcement question is "did this action happen," and the only
+component positioned to answer for every process, spawned or generated or
+co-tenant, is a kernel hook. A per-process middleware sees the calls routed through
+it. A BPF-LSM hook sees the calls, because the syscall path runs through the LSM
+whether or not the agent cooperated.
+
+### The shared process boundary is the actual gap
+
+AGT enforces in the same process as the agent. That is stated plainly in its own
+design: policy engine and agent share a process boundary. The consequence is that a
+compromised agent sits between the policy and its own verification. Code that has
+taken over the process can act before the in-process check, around it, or against
+the library evaluating it, because attacker code and policy code are the same
+address space. This is not a knock on AGT's engineering. It is what "enforce at the
+middleware layer" costs.
+
+Kernel enforcement removes the agent from that path. The BPF-LSM hook runs in the
+kernel, on the syscall boundary, after the process has already lost the ability to
+reach it. A compromised agent can still *attempt* anything. It cannot relocate the
+hook, and it cannot forge the identity binding, which is derived from `SO_PEERCRED`
+and the kernel keyring rather than declared by the caller. The verdict is rendered
+somewhere the agent does not control. That is the whole argument for putting it in
+the kernel.
+
+### Performance: the verdict must be an in-kernel lookup
+
+Per-operation BPF-LSM enforcement adds low-single-digit microseconds when the
+verdict is an in-kernel map lookup. For agent workloads that overhead is
+effectively free, and not by rounding. Every tool call an agent makes is gated
+behind an LLM inference that costs on the order of hundreds of milliseconds to
+seconds. That is five to six orders of magnitude more than the entire syscall
+sequence the enforcement decision sits on. The governance layer is not on the
+critical path in any measurable sense.
+
+That "free" holds under one hard constraint: **the in-kernel verdict must be a
+precomputed map lookup, not a userspace roundtrip, and never an on-path solve.**
+The moment enforcement blocks on userspace, per-syscall latency stops being
+microseconds. This is why the kernel floor in Jinn Guard is deterministic and
+map-driven: the BPF-LSM hook consults precomputed cgroup-scoped decision maps and
+returns. The heavier work, semantic risk assessment and the bounded SMT invariant
+checks, runs in the user-space gate, off the kernel hot path, and is documented as
+a separate, cooperative plane (see [What Jinn Guard guarantees today](#what-jinn-guard-guarantees-today--vs-roadmap)
+and [THREAT_MODEL §8](THREAT_MODEL.md)). Anything that would put a solver or a
+userspace call on the syscall path does not belong in the kernel floor, and is not
+there.
+
+---
+
 ## Known Limitations
 
 > **Advisory registry:** the canonical list of `JG-ADV-*` IDs, status, and fix commits lives in [`SECURITY/ADVISORIES.md`](SECURITY/ADVISORIES.md).
