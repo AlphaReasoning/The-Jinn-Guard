@@ -5184,7 +5184,7 @@ mod identity_tracking_tests {
 /// spawns, from ever *acquiring* the dropped capabilities post-compromise.
 pub mod capability_hardening {
     /// `(name, capability number)` to drop from the bounding set. These are
-    /// capabilities the daemon provably never needs after BPF load.
+    /// capabilities the daemon never needs after BPF load.
     pub const DROP_FROM_BOUNDING_SET: &[(&str, i32)] = &[
         ("CAP_NET_ADMIN", 12),
         ("CAP_NET_RAW", 13),
