@@ -34,3 +34,8 @@ validation/
 fleet-secret*
 fleet.key
 *.bundle-cache.json
+
+# GTM/distribution playbook — belongs in the private fleet repo or local notes, not the public tree
+LAUNCH_CHECKLIST.md
+# local outreach notes split out of the old checklist — never commit
+LAUNCH_OUTREACH.local.md
