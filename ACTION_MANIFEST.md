@@ -19,10 +19,10 @@ This document is the original scoping; **as-built deviations** from it:
 - **Canonical form** is the pinned sorted-key compact serializer with reference
   vectors (module tests); RFC 8785 JCS adoption is a forward-compatible v1 option.
 
-Original scoping follows. Inline follow-up to the independent calibration audit's
-C2PA readiness gap map (`analysis/analysis-report/C2PA_READINESS_GAP_MAP.md`).
+Original scoping follows. Inline follow-up to the commissioned claim-calibration
+review's C2PA readiness gap map (`docs/calibration-review-2026-06/C2PA_READINESS_GAP_MAP.md`).
 
-This document scopes the one **net-new capability** the audit identified: linking
+This document scopes the one **net-new capability** the review identified: linking
 the runtime decision ledger to a portable, externally-verifiable provenance format.
 Everything else the audit flagged was claim wording and validation portability,
 closed in PR #50.

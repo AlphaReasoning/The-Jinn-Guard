@@ -60,7 +60,7 @@ quota gates → risk + Z3 math ceiling → audit). Across **10,000 requests**:
 | **257 µs** (P50) | **366 µs** (P95) | **463 µs** (P99) | 1.9 ms |
 
 > **In plain English:** a complete security decision takes about **a quarter of a
-> millisecond** — faster than the blink of an eye (~100 ms) by ~400×.
+> millisecond**.
 
 ### 🚀 How much can it handle?
 

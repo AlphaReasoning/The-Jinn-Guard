@@ -54,8 +54,8 @@ Operability and review-driven hardening (moving toward pilot-ready).
   plane — the deterministic kernel floor (holds even if the daemon is dead or
   bypassed) vs the cooperative user-space semantic/risk/SMT gate — from roadmap
   items (per-action signed manifests JG #62, transparency anchoring, reproducible
-  builds JG #46, OTLP export JG #11). Directly answers an independent review note
-  that earlier wording could read as if user-space verdicts were kernel-enforced.
+  builds JG #46, OTLP export JG #11). Directly answers an external claim-calibration
+  review note that earlier wording could read as if user-space verdicts were kernel-enforced.
 - **Z3 wording calibrated across docs + code.** Removed every phrasing that could
   read as formal/temporal proof. The README `ts_checker` row now reads "bounded
   risk-ceiling + declarative-invariant satisfiability checks (sound on its
