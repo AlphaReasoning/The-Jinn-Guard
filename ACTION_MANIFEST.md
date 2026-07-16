@@ -20,7 +20,7 @@ This document is the original scoping; **as-built deviations** from it:
   vectors (module tests); RFC 8785 JCS adoption is a forward-compatible v1 option.
 
 Original scoping follows. Inline follow-up to the commissioned claim-calibration
-review's C2PA readiness gap map (`analysis/analysis-report/C2PA_READINESS_GAP_MAP.md`).
+review's C2PA readiness gap map (`docs/calibration-review-2026-06/C2PA_READINESS_GAP_MAP.md`).
 
 This document scopes the one **net-new capability** the review identified: linking
 the runtime decision ledger to a portable, externally-verifiable provenance format.
